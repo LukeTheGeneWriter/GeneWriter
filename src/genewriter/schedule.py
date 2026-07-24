@@ -38,6 +38,13 @@ scores, and this is also where the schedule format pays for itself: stack
 several cheap "growth" steps before one precision checkpoint (as in the
 `repeat` block in the example above) and the exact refresh only runs on
 however many individuals are left at that checkpoint, not every generation.
+
+Every exact refresh -- "input"'s seeding and "kill_off"/"select"/"flatten"'s
+pre-step refresh -- can be routed through gpu_change_vector's population-
+batched computation instead of the per-individual loop: pass
+`xp=numpy`/`xp=cupy` to run_schedule() (see ScheduleContext.xp). "growth"
+itself is unaffected either way -- its cheap parent-diffing isn't a batching
+target.
 """
 
 import random
@@ -53,6 +60,7 @@ from .ga import (
     refresh_change_vectors,
     replicate_and_mutate_random,
     save_gen,
+    seed_population,
     select_survivors,
 )
 
@@ -83,6 +91,22 @@ class ScheduleContext:
     save_dir: str = None
     run_name: str = "run"
     step_count: int = field(default=0)
+    # Array module (numpy or cupy) to batch "input"'s seeding and every
+    # exact refresh (kill_off/select/flatten) through
+    # gpu_change_vector.batch_calculate_change_vectors() instead of a
+    # per-individual Python loop. None (default) keeps the original
+    # per-individual path. "growth" is unaffected either way -- its new
+    # genotypes are cheaply diffed from their parent, not batched.
+    xp: object = None
+    # Diagnostic-only, no effect on results: `progress` prints each step's
+    # kind, timing, and resulting population size as it runs (see
+    # run_steps()); `progress_every` is passed through to
+    # seed_population()/refresh_change_vectors() for finer-grained
+    # every-N-individuals progress inside "input"/"kill_off"/"select"/
+    # "flatten". Both default off/None -- silent, matching original
+    # behavior.
+    progress: bool = False
+    progress_every: int = None
 
 
 @register_step("input")
@@ -90,11 +114,24 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     """Add `count` freshly-generated random seed genotypes to the
     population (merging into any genotype already present rather than
     replacing the population), the way a training run's initial batch of
-    samples is drawn."""
+    samples is drawn.
+
+    Uses ga.seed_population() -- one batched (or per-individual, per
+    ctx.xp) pass over the new seeds -- rather than one merge_replicate()
+    call per seed; this is the step where a large ctx.xp batch pays off
+    most, since none of these genotypes has a parent to cheaply diff
+    against."""
     count = params["count"]
+    new_seeds = [generate_seed(ctx.aa_seq) for _ in range(count)]
+    new_index = seed_population(new_seeds, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
+
     pop_index = {tuple(p.codons): p for p in pop}
-    for _ in range(count):
-        merge_replicate(pop_index, generate_seed(ctx.aa_seq), ctx.analysis_objects, ctx.locvec)
+    for key, new_sol in new_index.items():
+        existing = pop_index.get(key)
+        if existing is not None:
+            existing.number += new_sol.number
+        else:
+            pop_index[key] = new_sol
     return list(pop_index.values())
 
 
@@ -116,15 +153,30 @@ def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
     directed_fraction = params.get("directed_fraction", 0.5)
     lookahead = params.get("lookahead", True)
 
+    if ctx.progress_every:
+        import time as _time
+        _t0 = _time.perf_counter()
+
     pop_index = {tuple(p.codons): p for p in pop}
-    for p in pop:
+    for i, p in enumerate(pop):
         if random.random() < directed_fraction:
+            # This, not anything xp/GPU-batching touches, is the known
+            # per-individual hotspot at real scale: `lookahead=True` scores
+            # every synonymous alternative at the chosen position via
+            # diff_change_vector() -- many small numpy calls per individual,
+            # dispatch-overhead-bound rather than compute-bound. See
+            # ga.run_ga's identical instrumentation and Handoff.md for
+            # measured throughput (~20 individuals/s vs. ~1600/s for the
+            # batched refresh path on real hardware).
             reps = directed_evolution(
                 p.codons, p.change_vecs, ctx.weights, ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
                 nreplicates=rate, lookahead=lookahead,
             )
         else:
             reps = replicate_and_mutate_random(p.codons, ctx.aa_seq, nreplicates=rate, mutation_rate=mutation_chance)
+        if ctx.progress_every and (i + 1) % ctx.progress_every == 0:
+            from .ga import _progress_print
+            _progress_print("schedule growth", i + 1, len(pop), _t0)
         for rep in reps:
             merge_replicate(pop_index, rep, ctx.analysis_objects, ctx.locvec, parent=p)
 
@@ -142,7 +194,7 @@ def _step_kill_off(pop: list, ctx: ScheduleContext, params: dict) -> list:
     See ga.kill_off(). Refreshes change vectors exactly first -- see module
     docstring."""
     percent_cut = params.get("percent_cut", 30)
-    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec)
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
     return kill_off(pop, ctx.weights, percent_cut=percent_cut)
 
 
@@ -152,7 +204,7 @@ def _step_select(pop: list, ctx: ScheduleContext, params: dict) -> list:
     ga.select_survivors(). Refreshes change vectors exactly first -- see
     module docstring."""
     target_size = params["target_size"]
-    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec)
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
     return select_survivors(pop, ctx.weights, target_size)
 
 
@@ -162,7 +214,7 @@ def _step_flatten(pop: list, ctx: ScheduleContext, params: dict) -> list:
     `recursion_limit` (default 3). See ga.flatten_generation(). Refreshes
     change vectors exactly first -- see module docstring."""
     recursion_limit = params.get("recursion_limit", 3)
-    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec)
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
     return flatten_generation(pop, ctx.aa_seq, ctx.analysis_objects, ctx.locvec, recursion_limit)
 
 
@@ -196,7 +248,15 @@ def run_steps(pop: list, ctx: ScheduleContext, schedule: list) -> list:
         executor = _STEP_REGISTRY.get(kind)
         if executor is None:
             raise ValueError(f"Unknown schedule step kind {kind!r}. Registered kinds: {sorted(_STEP_REGISTRY)}")
-        pop = executor(pop, ctx, step)
+
+        if ctx.progress:
+            import time as _time
+            print(f"[schedule] {kind} {step} starting, pop={len(pop)}", flush=True)
+            t0 = _time.perf_counter()
+            pop = executor(pop, ctx, step)
+            print(f"[schedule] {kind} done: pop={len(pop)} in {_time.perf_counter() - t0:.2f}s", flush=True)
+        else:
+            pop = executor(pop, ctx, step)
     return pop
 
 
@@ -208,13 +268,25 @@ def run_schedule(
     locvec: list = None,
     save_dir: str = None,
     run_name: str = "run",
+    xp=None,
+    progress: bool = False,
+    progress_every: int = None,
 ) -> list:
     """Run a declarative schedule end to end and return the final population.
 
     schedule: list of step dicts, e.g. [{"kind": "input", "count": 50000},
         {"kind": "growth", "rate": 4}, ...] -- see module docstring, and
         registered_steps() for the currently-available kinds.
+    xp: array module (numpy or cupy) to batch "input"'s seeding and every
+        exact refresh ("kill_off"/"select"/"flatten") through
+        gpu_change_vector.batch_calculate_change_vectors() -- see
+        ScheduleContext.xp. None (default) keeps the original
+        per-individual path.
+    progress / progress_every: diagnostic-only step-level and
+        individual-level progress logging -- see ScheduleContext. Both
+        default off/None, matching the original silent behavior.
     """
     ctx = ScheduleContext(aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects,
-                           locvec=locvec, save_dir=save_dir, run_name=run_name)
+                           locvec=locvec, save_dir=save_dir, run_name=run_name, xp=xp,
+                           progress=progress, progress_every=progress_every)
     return run_steps([], ctx, schedule)

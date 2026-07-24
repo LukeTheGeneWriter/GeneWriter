@@ -1,3 +1,5 @@
+import pytest
+
 from genewriter import ga
 from genewriter.change_vector import calculate_change_vector
 from genewriter.classes import Proposed_Solution
@@ -324,3 +326,70 @@ def test_refresh_change_vectors_recomputes_exactly(aa_seq, analysis_objects):
 
     result = ga.refresh_change_vectors(pop, analysis_objects)
     assert result[0].change_vecs == calculate_change_vector(sol, analysis_objects)
+
+
+def test_seed_population_matches_per_individual_calculate_change_vector(aa_seq, analysis_objects):
+    seeds = [ga.generate_seed(aa_seq) for _ in range(5)]
+    pop_index = ga.seed_population(seeds, analysis_objects)
+    for sol in seeds:
+        assert pop_index[tuple(sol)].change_vecs == calculate_change_vector(sol, analysis_objects)
+
+
+def test_seed_population_merges_duplicate_seeds(aa_seq, analysis_objects):
+    sol = ga.generate_seed(aa_seq)
+    pop_index = ga.seed_population([sol, sol, sol], analysis_objects)
+    assert len(pop_index) == 1
+    assert pop_index[tuple(sol)].number == 3
+
+
+def test_seed_population_with_numpy_xp_matches_per_individual_path(aa_seq, analysis_objects):
+    """seed_population(xp=np) must compute the exact same change vectors as
+    the default per-individual path -- see gpu_change_vector.py's own
+    call-by-call equivalence tests for why the underlying batched math is
+    trusted; this just confirms the wiring passes xp through correctly."""
+    import numpy as np
+
+    seeds = [ga.generate_seed(aa_seq) for _ in range(6)]
+    per_individual = ga.seed_population(seeds, analysis_objects)
+    batched = ga.seed_population(seeds, analysis_objects, xp=np)
+
+    assert set(per_individual) == set(batched)
+    for key in per_individual:
+        assert per_individual[key].number == batched[key].number
+        for term, values in per_individual[key].change_vecs.items():
+            batched_values = batched[key].change_vecs[term]
+            assert len(values) == len(batched_values)
+            for a, b in zip(values, batched_values):
+                assert a == pytest.approx(b, abs=1e-6)
+
+
+def test_refresh_change_vectors_with_numpy_xp_matches_per_individual_path(aa_seq, analysis_objects):
+    import numpy as np
+
+    pop = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {}) for _ in range(4)]
+    pop_default = [Proposed_Solution(list(p.codons), p.number, {}) for p in pop]
+
+    ga.refresh_change_vectors(pop, analysis_objects)
+    ga.refresh_change_vectors(pop_default, analysis_objects, xp=np)
+
+    for a, b in zip(pop, pop_default):
+        for term, values in a.change_vecs.items():
+            for x, y in zip(values, b.change_vecs[term]):
+                assert x == pytest.approx(y, abs=1e-6)
+
+
+def test_refresh_change_vectors_with_xp_handles_empty_population(analysis_objects):
+    import numpy as np
+
+    assert ga.refresh_change_vectors([], analysis_objects, xp=np) == []
+
+
+def test_run_ga_with_numpy_xp_does_not_crash(aa_seq, analysis_objects, weights):
+    import numpy as np
+
+    seeds = [ga.generate_seed(aa_seq) for _ in range(4)]
+    final_pop = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=3, target_size=8, xp=np)
+    assert len(final_pop) <= 8
+    for p in final_pop:
+        assert isinstance(p, Proposed_Solution)
+        assert len(p.codons) == len(aa_seq)

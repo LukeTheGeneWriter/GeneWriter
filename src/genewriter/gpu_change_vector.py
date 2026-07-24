@@ -328,7 +328,7 @@ def _np_sliding_sum(bool_arr_1d, span):
     return sliding_window_view(bool_arr_1d.astype(np.int64), span).sum(axis=1)
 
 
-def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: list = None, xp=np) -> list:
+def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: list = None, xp=np, progress_every: int = None) -> list:
     """Compute change vectors for a whole population in one batched pass.
 
     pop_codons: list of P individuals, each a list of N codon strings (same
@@ -337,6 +337,14 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
     xp: array module to compute with -- numpy (default, still much faster
         than the per-individual Python loop) or cupy (genuinely on the
         GPU). Pass the cupy module object, not a string.
+    progress_every: if set, print elapsed-time progress every this-many
+        individuals through the Kmer loop below (plus one line marking when
+        the batched rare/usage/cpb/gc section finishes) -- diagnostic only,
+        no effect on the returned values. Kmer is the one term *not*
+        batched (see module docstring), so at large population sizes it is
+        the most likely place this function appears to hang; this is here
+        to make that visible instead of guessed at. None (default): silent,
+        matching the original behavior exactly.
 
     Returns a list of P dicts, one per individual, in the same shape
     calculate_change_vector() returns for a single individual -- so this is
@@ -352,6 +360,10 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
     if locvec is None:
         locvec = ['I'] * N
 
+    if progress_every:
+        import time as _time
+        _t0 = _time.perf_counter()
+
     codon_idx = encode_population(xp, pop_codons)
 
     rare = batch_rare_codon_term(xp, codon_idx, analysis_objects.rare_codon)
@@ -363,6 +375,13 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
     usage_np = usage if xp is np else xp.asnumpy(usage)
     cpb_np = cpb if xp is np else xp.asnumpy(cpb)
     gc_np = gc if xp is np else xp.asnumpy(gc)
+
+    if progress_every:
+        print(f"  [batch_calculate_change_vectors] batched terms (RareCodons/CodonUsage/"
+              f"CodonPairBias/GC) for {len(pop_codons)} individuals done in "
+              f"{_time.perf_counter() - _t0:.2f}s -- starting per-individual Kmer loop "
+              f"(the known unbatched hotspot)", flush=True)
+        _t_kmer0 = _time.perf_counter()
 
     from .change_vector import _kmer_term
 
@@ -376,4 +395,15 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
             'GC': gc_np[p].tolist(),
             'Kmer': kmer_vals,
         })
+        if progress_every and (p + 1) % progress_every == 0:
+            elapsed = _time.perf_counter() - _t_kmer0
+            rate = (p + 1) / elapsed if elapsed > 0 else float('inf')
+            remaining = (len(pop_codons) - (p + 1)) / rate if rate > 0 else float('inf')
+            print(f"  [batch_calculate_change_vectors] Kmer {p + 1}/{len(pop_codons)} "
+                  f"({rate:.1f} indiv/s, ~{remaining:.0f}s remaining)", flush=True)
+
+    if progress_every:
+        print(f"  [batch_calculate_change_vectors] Kmer loop done in "
+              f"{_time.perf_counter() - _t_kmer0:.2f}s", flush=True)
+
     return results

@@ -58,6 +58,7 @@ import random
 from .change_vector import AnalysisObjects, calculate_change_vector, diff_change_vector, require_weights, score_changevec
 from .classes import Proposed_Solution
 from .codon_tables import generate_codon_vec
+from .gpu_change_vector import batch_calculate_change_vectors
 
 _MAX_FINITE_WEIGHT = 1e12
 
@@ -104,16 +105,98 @@ def merge_replicate(
         pop_index[key] = Proposed_Solution(sol, 1, vecs)
 
 
-def refresh_change_vectors(pop: list, analysis_objects: AnalysisObjects, locvec: list = None) -> list:
+def _progress_print(label: str, i: int, total: int, t0: float) -> None:
+    import time as _time
+    elapsed = _time.perf_counter() - t0
+    rate = i / elapsed if elapsed > 0 else float('inf')
+    remaining = (total - i) / rate if rate > 0 else float('inf')
+    print(f"  [{label}] {i}/{total} ({rate:.1f} indiv/s, ~{remaining:.0f}s remaining)", flush=True)
+
+
+def seed_population(seeds: list, analysis_objects: AnalysisObjects, locvec: list = None, xp=None, progress_every: int = None) -> dict:
+    """Build a pop_index (dict keyed by tuple(codons) -> Proposed_Solution)
+    from a batch of fresh genotypes that have no parent to diff against --
+    e.g. run_ga's initial seeds, or schedule.py's "input" step. Duplicate
+    seeds are merged (counted) exactly like repeated merge_replicate() calls
+    would, but as one pass over the unique genotypes rather than one
+    calculate_change_vector() call per seed (including duplicates).
+
+    xp: array module (numpy or cupy) to batch the exact computation through
+    gpu_change_vector.batch_calculate_change_vectors() instead of the
+    per-individual Python loop -- None (default) keeps the original
+    per-individual path. This is where batching actually pays off for
+    seeding: a fresh population of tens of thousands of individuals used to
+    mean tens of thousands of separate calculate_change_vector() calls with
+    no diffing available to cheapen any of them.
+    progress_every: if set, print elapsed-time progress every this-many
+        individuals -- diagnostic only (see gpu_change_vector.py's
+        batch_calculate_change_vectors, which this passes it through to
+        when xp is set). None (default): silent.
+    """
+    counts = {}
+    order = []
+    for sol in seeds:
+        key = tuple(sol)
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+
+    unique_codons = [list(key) for key in order]
+    if xp is not None:
+        vecs_list = batch_calculate_change_vectors(unique_codons, analysis_objects, locvec, xp=xp, progress_every=progress_every)
+    else:
+        if progress_every:
+            import time as _time
+            t0 = _time.perf_counter()
+        vecs_list = []
+        for i, codons in enumerate(unique_codons):
+            vecs_list.append(calculate_change_vector(codons, analysis_objects, locvec))
+            if progress_every and (i + 1) % progress_every == 0:
+                _progress_print("seed_population", i + 1, len(unique_codons), t0)
+
+    return {
+        key: Proposed_Solution(codons, counts[key], vecs)
+        for key, codons, vecs in zip(order, unique_codons, vecs_list)
+    }
+
+
+def refresh_change_vectors(pop: list, analysis_objects: AnalysisObjects, locvec: list = None, xp=None, progress_every: int = None) -> list:
     """Recompute every individual's change vector exactly (in place) rather
     than trusting whatever approximate diff it may have accumulated during
     growth. Meant to be called right before a step that makes a survival
     decision based on those scores (kill_off, select_survivors) or that
     otherwise warrants a clean baseline (flatten_generation) -- see
     schedule.py's kill_off/select/flatten steps, which always do this
-    first."""
-    for p in pop:
+    first.
+
+    xp: array module (numpy or cupy) to batch this refresh through
+    gpu_change_vector.batch_calculate_change_vectors() instead of the
+    per-individual Python loop -- None (default) keeps the original
+    per-individual path (no dependency on gpu_change_vector.py's numpy
+    import if a caller never opts in). Both paths compute exactly the same
+    thing -- see tests/test_gpu_change_vector.py's call-by-call equivalence
+    check -- so this is a pure performance choice, not a behavior change.
+    All of `pop` must share one sequence length (true within a single GA
+    run: synonymous substitutions only), same requirement as
+    batch_calculate_change_vectors().
+    progress_every: if set, print elapsed-time progress every this-many
+        individuals -- diagnostic only. None (default): silent.
+    """
+    if xp is not None and pop:
+        pop_codons = [p.codons for p in pop]
+        vecs_list = batch_calculate_change_vectors(pop_codons, analysis_objects, locvec, xp=xp, progress_every=progress_every)
+        for p, vecs in zip(pop, vecs_list):
+            p.change_vecs = vecs
+        return pop
+
+    if progress_every:
+        import time as _time
+        t0 = _time.perf_counter()
+    for i, p in enumerate(pop):
         p.change_vecs = calculate_change_vector(p.codons, analysis_objects, locvec)
+        if progress_every and (i + 1) % progress_every == 0:
+            _progress_print("refresh_change_vectors", i + 1, len(pop), t0)
     return pop
 
 
@@ -385,6 +468,9 @@ def run_ga(
     flatten_recursion_limit: int = 3,
     lookahead: bool = True,
     refresh_every: int = 5,
+    xp=None,
+    progress: bool = False,
+    progress_every: int = None,
 ) -> list:
     """Run the genetic algorithm and return the final population.
 
@@ -418,19 +504,48 @@ def run_ga(
         each exact reset. Set to 1 for always-exact selection (same
         behavior/cost as before diffing existed), or 0/None to never force
         a reset (fastest, but drift is unbounded over a long run).
+    xp: array module (numpy or cupy) to batch the initial seeding and every
+        exact refresh through gpu_change_vector.batch_calculate_change_vectors()
+        instead of a per-individual Python loop -- see seed_population() /
+        refresh_change_vectors(). None (default) keeps the original
+        per-individual path. Growth's own per-offspring diffing is
+        unaffected either way -- diff_change_vector is already cheap enough
+        not to need batching.
+    progress: if True, print per-generation timing (seeding, growth,
+        refresh, select, each separately) plus population size before/after
+        -- diagnostic only, meant for tracking down which phase a slow or
+        seemingly-hung real-scale run is actually spending its time in.
+        False (default): silent, identical to the original behavior.
+    progress_every: passed through to seed_population()/refresh_change_vectors()
+        for finer-grained (every-N-individuals) progress within those calls
+        -- see their docstrings. Independent of `progress` above (you can
+        have generation-level timing without individual-level, or vice
+        versa); None (default): no individual-level progress either way.
     """
-    pop_index = {}
-    for seed in seeds:
-        merge_replicate(pop_index, seed, analysis_objects, locvec)
+    import time as _time
+
+    if progress:
+        print(f"[run_ga] seeding {len(seeds)} initial solutions (xp={_xp_label(xp)})...", flush=True)
+        _t0 = _time.perf_counter()
+    pop_index = seed_population(seeds, analysis_objects, locvec, xp=xp, progress_every=progress_every)
     pop = list(pop_index.values())
+    if progress:
+        print(f"[run_ga] seeded: {len(seeds)} seeds -> {len(pop)} distinct in {_time.perf_counter() - _t0:.2f}s", flush=True)
 
     if target_size is None:
         target_size = len(pop)
 
     for gen in range(num_gens):
+        if progress:
+            print(f"[run_ga] generation {gen + 1}/{num_gens} starting, pop={len(pop)}", flush=True)
+
         if flatten_every and gen > 0 and gen % flatten_every == 0:
-            pop = refresh_change_vectors(pop, analysis_objects, locvec)
+            if progress:
+                _t0 = _time.perf_counter()
+            pop = refresh_change_vectors(pop, analysis_objects, locvec, xp=xp, progress_every=progress_every)
             pop = flatten_generation(pop, aa_seq, analysis_objects, locvec, flatten_recursion_limit)
+            if progress:
+                print(f"[run_ga]   flatten: pop={len(pop)} in {_time.perf_counter() - _t0:.2f}s", flush=True)
 
         # Dedup against the *whole generation's* output, not just the
         # pre-generation population: two different individuals' offspring
@@ -440,8 +555,10 @@ def run_ga(
         # per-rep `next((q for q in pop if q.codons == rep), None)` scan,
         # which only ever checked the pre-generation pop -- fixed as a
         # side effect of switching to a dict keyed by codons).
+        if progress:
+            _t0 = _time.perf_counter()
         pop_index = {tuple(p.codons): p for p in pop}
-        for p in pop:
+        for i, p in enumerate(pop):
             if random.random() < 0.5:
                 reps = replicate_and_mutate_random(p.codons, aa_seq)
             else:
@@ -450,12 +567,31 @@ def run_ga(
                 )
             for rep in reps:
                 merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
+            if progress_every and (i + 1) % progress_every == 0:
+                _progress_print("run_ga growth", i + 1, len(pop), _t0)
 
         pop = list(pop_index.values())
+        if progress:
+            print(f"[run_ga]   growth: pop={len(pop)} in {_time.perf_counter() - _t0:.2f}s", flush=True)
+
         if refresh_every and gen % refresh_every == 0:
-            pop = refresh_change_vectors(pop, analysis_objects, locvec)
+            if progress:
+                _t0 = _time.perf_counter()
+            pop = refresh_change_vectors(pop, analysis_objects, locvec, xp=xp, progress_every=progress_every)
+            if progress:
+                print(f"[run_ga]   refresh: pop={len(pop)} in {_time.perf_counter() - _t0:.2f}s", flush=True)
+
+        if progress:
+            _t0 = _time.perf_counter()
         pop = select_survivors(pop, weights, target_size)
+        if progress:
+            print(f"[run_ga]   select: pop={len(pop)} in {_time.perf_counter() - _t0:.2f}s", flush=True)
+
         if save_dir:
             save_gen(pop, gen, save_dir, run_name)
 
     return pop
+
+
+def _xp_label(xp) -> str:
+    return "none (per-individual)" if xp is None else getattr(xp, "__name__", str(xp))
