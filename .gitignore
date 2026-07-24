@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Raw reference-gene data pulled from the Colab Drive folders -- large,
+# regenerable from NCBI, and not meant to live in git.
+Gene_Obj_Samples/

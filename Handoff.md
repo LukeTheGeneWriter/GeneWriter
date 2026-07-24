@@ -1,178 +1,93 @@
-GeneWriter — Session Handoff
+GeneWriter — Session Handoff (v2)
 
-Purpose: context transfer from a chat session into Claude Code, where on-device paths work. Date: 2026-07-23 Author of record: Luke (LukeTheGeneWriter)
+Purpose: context transfer for whoever (human or Claude) picks this up next. Date: 2026-07-24. Supersedes the original Handoff.md (2026-07-23) — that one was design intent from a chat session with the notebooks never actually read; everything below has been read, run, and tested against the real code.
 
-0. Read this first (Claude Code)
+0. Read this first
 
-This document is design context, not a spec to implement top to bottom. Nothing here has been validated against the actual code, because the notebooks were never visible in the originating session — only described. Profile before optimizing. Read the notebooks before refactoring.
+Unlike v1, this document describes code that exists, runs, and is tested — not a proposal. Where it says something works, it means `pytest` passes on it. Where it says something isn't done, it isn't started. The original 14 notebooks are still in the repo root, unmodified, and are now considered historical/reference material — the live code is `src/genewriter/`.
 
-Where this document and the code disagree, the code wins. Flag the disagreement rather than silently conforming to either.
+1. Environment — read before doing anything else
 
-1. Locations
-Thing	Where	Status
-Colab notebooks	C:\Users\lukef\OneDrive\Desktop\GeneWriter	Local, not yet reviewed
-Target repo	https://github.com/LukeTheGeneWriter/GeneWriter	Returned 404 externally — private or renamed
-CUDA folder	https://github.com/LukeTheGeneWriter/CUDA_RNAFold	Public, 64 commits, ViennaRNA autotools tree
-Open question on CUDA_RNAFold
+**There is no usable Python on native Windows on this machine.** `python`/`python3` resolve to a Microsoft Store stub, not a real interpreter. All development and testing happens via **WSL (Ubuntu)**. From the repo root:
 
-GitHub's language breakdown reports C 72.3% / C++ 6.9% / Shell / Makefile / PostScript / TeX — no CUDA. Linguist does detect .cu. So either kernels aren't committed, they're gitignored, or they live inside .c/.cpp. First thing to check on-device: git status, .gitignore, and whether kernel work exists only in the working tree.
+```
+wsl -d Ubuntu -e bash -lc "cd '/mnt/c/Users/lukef/OneDrive/Desktop/GeneWriter' && python3 -m pytest -q"
+```
 
-2. What the pipeline does
+`pyproject.toml` sets `pythonpath = ["src"]`, so no install step is needed. WSL's `python3` had no `pip`; it was bootstrapped via `curl -sS https://bootstrap.pypa.io/get-pip.py | python3 - --user --break-system-packages` (Debian's externally-managed-environment guard blocks a plain `pip install`; no `apt`/`venv`/`ensurepip`/`sudo` available non-interactively). `numpy`/`pytest`/`cupy-cuda12x` and friends are all installed the same way.
 
-A genetic algorithm searching synonymous codon space for CDS that express well in a target cell.
+**A real CUDA toolchain is set up and verified working**, including a compiled-and-run `.cu` file on the actual GPU (NVIDIA RTX 3050 Laptop, 4GB, Ampere sm_86). GPU driver passthrough (`libcuda.so`) was already present via WSL2's paravirtualization — no setup needed, just `PATH=/usr/lib/wsl/lib:$PATH nvidia-smi` to see it (driver 566.14, CUDA 12.7). The rest (`nvcc`, `gcc`/`g++`, `cupy`) came from pip + user-space Miniforge (conda-forge), no root needed anywhere:
 
-Current understood flow:
+```
+curl -sSL -o /tmp/miniforge.sh https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
+bash /tmp/miniforge.sh -b -p $HOME/miniforge3
+$HOME/miniforge3/bin/conda install -y -n base -c conda-forge gcc gxx
+$HOME/miniforge3/bin/conda install -y -n base -c nvidia -c conda-forge cuda-nvcc=12.9
+# plus: pip install --user --break-system-packages cupy-cuda12x nvidia-curand-cu12 nvidia-cuda-nvrtc-cu12
+```
+Add `$HOME/miniforge3/bin` to PATH for `nvcc`/`gcc`/`g++`. Note pip's own `nvidia-cuda-nvcc-cu12` wheel does *not* ship the real `nvcc` driver binary (only `ptxas` + NVVM) — that's what the conda-forge/nvidia-channel install is for.
 
-GA over codon space — fitness spans codon usage, GC content, and related sequence metrics
-Clustering of surviving CDS
-RNA folding to eliminate undesirable secondary structure
-SpliceAI post-processing to eliminate CDS with cryptic/interwoven splice signals
-Optional intron insertion for RNA half-life and to carry intronic elements
+Full detail on both of the above (exact failure modes hit, exact fix commands) is saved in this project's Claude memory (`dev_environment.md`) — check there before re-deriving any of it.
 
-Tiered-cascade ordering (cheap filters first) is already correct and should be preserved.
+2. What's actually in the repo
 
-3. Licensing — OWNER HANDLING THIS
-
-Luke is handling licensing and publicity himself. Do not restructure license files.
-
-Recorded for context only: CUDA_RNAFold carries an MIT LICENSE alongside the inherited ViennaRNA COPYING. ViennaRNA's terms permit research, educational, and commercial use and modification provided derived works are not redistributed for a fee beyond media costs, and that credit is given to the authors and the Institute for Theoretical Chemistry, University of Vienna; commercial inclusion requires contacting the authors. MIT's sublicense/sell grant conflicts with that.
-
-Not legal advice. Owner's call, owner's action item.
-
-4. Repo structure (proposed)
+```
 GeneWriter/
+├── *.ipynb                    # 14 original notebooks, historical/reference only now
+├── Gene_Obj_Samples/           # gitignored: ~6 real NCBI gene JSONs, user-provided, for local dev/testing
+├── pyproject.toml
 ├── src/genewriter/
-│   ├── genetic_code.py        # codon tables, aa maps, usage tables per organism
-│   ├── encoding.py            # seq <-> uint8 codon-index arrays (SoA layout)
-│   ├── objectives/            # ONE module per fitness term; Python reference impl
-│   │   ├── cai.py
-│   │   ├── gc.py              # global + windowed
-│   │   ├── cpg.py
-│   │   ├── codon_pair_bias.py
-│   │   ├── uracil.py
-│   │   ├── motifs.py          # restriction sites, homopolymers, repeats
-│   │   ├── folding.py         # wraps CUDA_RNAFold
-│   │   └── splice.py          # wraps SpliceAI
-│   ├── change_vector.py       # position-wise mutation propensity (see §5)
-│   ├── ga/                    # selection, crossover, mutation, NSGA-II
-│   ├── cascade.py             # tiered filter orchestration
-│   ├── cluster.py
-│   ├── cache/                 # tiered cache (see §7)
-│   └── kernels/               # bindings to native code
-├── native/
-│   ├── src/*.c  *.cu
-│   └── CMakeLists.txt
-├── tests/
-│   ├── golden/                # frozen input -> output vectors
-│   └── test_parity.py         # python vs C vs CUDA agreement
-├── notebooks/                 # thin; import from src only
-└── benchmarks/
+│   ├── codon_tables.py         # codon<->AA, codon<->index encoding, precomputed per-codon lookup tables
+│   ├── classes.py              # canonical dataclasses (from GeneClassesCloud.ipynb)
+│   ├── change_vector.py        # the pluggable, vectorized change-vector scoring system
+│   ├── gpu_change_vector.py    # population-batched change-vector computation (numpy or cupy backend)
+│   ├── ga.py                   # GA primitives: growth, selection, flatten, kill_off, diffing
+│   ├── schedule.py             # declarative JSON-able GA schedules (the pipeline-config system)
+│   ├── gene_io.py              # load NaturalGene objects from RefGenes-style JSON
+│   ├── baseline.py             # compute the 5 *Analysis baseline dataclasses from loaded genes
+│   └── standards_io.py         # load precomputed Standards/*.json baselines
+└── tests/                      # 138 tests, all passing
+```
 
-Core discipline: objectives/ holds the Python reference implementation and remains the source of truth. Native implementations must reproduce it on the golden vectors. Never delete the Python version once C exists — it is the oracle.
+3. What works, is tested, and is real
 
-5. Change vector (main new design work)
+- **Full GA pipeline**: seed generation → growth (random mutation + directed evolution) → selection (kill_off / select_survivors / flatten) → repeat, driven either by the simple `ga.run_ga()` convenience function or by a declarative `schedule.py` pipeline (JSON-able step list, matching an ML-training-config shape). Verified end-to-end against real sample gene data.
+- **Change-vector scoring**: all 5 original terms (RareCodons, CodonUsage, CodonPairBias, GC, Kmer) ported, bug-fixed, and vectorized with numpy. Pluggable via `@register_term`/`@register_step` decorators — a new objective (uracil minimization, a future RNA-folding signal, etc.) just needs the right function signature, no core code changes.
+- **Approximate incremental diffing** (`diff_change_vector`): a child's change vector is estimated from its parent's by recomputing only a local excerpt, instead of a full recompute — exact for 2 of 5 terms (no global dependency), approximate for the other 3 (which fold in a population-wide aggregate). `refresh_change_vectors` forces an exact recompute; wired in automatically before every `kill_off`/`select`/`flatten` step in `schedule.py` (population-decision steps), on a configurable cadence in `run_ga`.
+- **Lookahead toggle**: `directed_evolution(..., lookahead=False)` skips the expensive "score every synonymous alternative" step.
+- **Population-batched GPU computation** (`gpu_change_vector.py`): 4 of 5 terms (not Kmer — see §5) computed for an entire population in one batched pass, on CPU (numpy) or the real GPU (cupy) via the same code. Verified correct against the per-individual implementation and, separately, GPU-vs-CPU-backend agreement on real hardware.
+- **Data pipeline**: load real NCBI gene JSON → compute baseline statistics → feed the GA. Verified against ~6 real sample genes in `Gene_Obj_Samples/` (not committed; ask the user for a copy, or point at their Colab Drive `RefGenes/NHGeneBodySupp/`).
 
-Position-wise mutation propensity: each codon gets a score; higher score means higher probability of being selected for mutation. Terms include rare codons, codon overuse, local GC, CpG dinucleotides, codon pair bias, uracil content.
+Every claim above has a corresponding test in `tests/`. Read the module docstrings for the "why" behind each design choice and each historical bug fix — they're written to be self-sufficient; this document is a map, not a replacement.
 
-Mutation count per offspring is stochastic (1–4) to escape local minima.
+4. Correctness process worth knowing about
 
-Design decisions to carry over
+Two real regressions were caught during this session, both by writing a direct comparison against a known-correct reference rather than by code review alone:
+- `tests/test_windowed_average.py` — the shared windowing helper, checked against the original pure-Python loop across 550 randomized cases.
+- `tests/test_change_vector_reference.py` — all 5 terms, checked against the pre-vectorization implementation (kept verbatim in the test file) across 40 randomized cases. This is what caught a real off-by-one in the RareCodons term that had shipped silently for two turns.
+- `tests/test_gpu_change_vector.py` / `test_gpu_change_vector_cuda.py` — the batched implementation, checked against the per-individual one (numpy backend), then the GPU backend checked against the numpy backend on real hardware. This is what caught a GC-term polarity bug.
 
-Normalize before weighting. Terms have incompatible scales; raw summation lets the widest-range term dominate. Z-score or rank-normalize each term across positions within the sequence, then apply weights.
+If you're extending any of these systems, extend the corresponding reference test rather than trusting a rewrite by inspection — it has a proven catch rate on this exact codebase.
 
-Validate against realized Δfitness. Highest-value experiment available. Sample positions, actually mutate them, measure fitness change, correlate against predicted score — per term. Turns weight tuning into measurement. Fit once per target organism, cache the weights.
+5. What's NOT done — the honest gap list
 
-Neighborhood-scoped incremental updates. Codon pair bias spans adjacent pairs; local GC spans a window. Mutating codon i dirties roughly [i-w, i+w]. Global recompute is wasteful; stale is wrong. Dirty-window scatter-add — good CUDA kernel (coalesced, bounded, low divergence).
+- **Kmer batching**: not implemented. Its substring→score lookup is a hash-map operation over arbitrary-length k-mer strings, not a natural fit for array vectorization without re-encoding k-mers as base-4 integers first. `batch_calculate_change_vectors()` currently falls back to the per-individual (already-vectorized, but not batched/GPU) implementation for this one term, which measurably dilutes the batched pipeline's overall speedup (Kmer was ~34% of per-individual runtime in one real-gene benchmark).
+- **The GPU batched path is not wired into the actual GA loop.** `run_ga()` and `schedule.py`'s steps still call the per-individual `calculate_change_vector`/`diff_change_vector`. `gpu_change_vector.py` is built, tested, and benchmarked standalone, but nothing in the GA machinery calls it yet. This is the natural next step if the GPU work is going to pay for itself in an actual run.
+- **RNA folding, SpliceAI, intron insertion**: still entirely unimplemented, exactly as v1 of this handoff flagged. No code exists for any of these anywhere in the repo. Per the original pipeline description (still accurate) these come after the GA/codon-optimization stage.
+- **Real-scale (tens of thousands of individuals) has not been run end-to-end.** The GPU batching was benchmarked up to population=10,000 on the 4 batchable terms in isolation (see §6) — a full schedule run (growth + selection + Kmer) at that scale has not been attempted; Kmer's unbatched cost would likely dominate.
+- **Custom CUDA kernels**: not written. Everything GPU-side so far is CuPy (numpy-compatible array ops, JIT-compiled via NVRTC under the hood) — no hand-written `.cu` kernels in the actual pipeline (only in a standalone verification script proving the toolchain works). The biggest remaining CUDA opportunity is almost certainly RNA folding once it exists (O(n³) DP, the Handoff's own §8-9 already covers this) — bigger than anything left to gain on the already-fast change-vector terms.
+- **Flagged-for-later items** (recorded in Claude memory as `future_work_items.md`, not started): n-gram/graph-based population seeding from real codon usage patterns (using the F/T/I/S location tags to restrict to intron-safe interior windows), uracil minimization as a new term, and a precomputed per-codon GC lookup — this last one is now partially done as a side effect of the GPU work (`codon_tables.GC_FLAGS_BY_INDEX`), but not yet wired into the per-individual `_gc_term`.
 
-Gumbel-top-k for the multi-mutation draw. Independent softmax draws produce duplicate positions. Gumbel noise on log-weights + top-k is exactly weighted sampling without replacement — branchless, parallel-friendly.
+6. Performance numbers on record (so nobody re-derives these from scratch)
 
-Adaptive k. Skew toward 1 (geometric / truncated Poisson). Tie to acceptance rate: falling acceptance → raise k to escape; high acceptance → lower k to refine.
+All measured on the real MS4A18 gene (398 residues) against the toy 6-gene sample baseline, this WSL environment, this RTX 3050.
 
-Rare-codon survival. Stochastic survival alone is weak — high-signal positions get resampled and eventually hit. Stronger: temperature on the softmax (near-uniform early, sharp late); tabu list on recently-mutated positions; explicit freeze masks.
+- `calculate_change_vector()` (one individual, all 5 terms): 389ms → 5.7ms after numpy vectorization (~68x).
+- `diff_change_vector()` (one child, default margin): 41ms → 2.8ms after vectorization (~15x on top of the diffing approximation itself).
+- The 4 batchable terms only (RareCodons/CodonUsage/CodonPairBias/GC), population loop vs batched:
+  - population=1,000: numpy 9.1x, GPU 6.7x (GPU loses to fixed overhead at this scale)
+  - population=10,000: numpy 17.9x, **GPU 24.8x** (GPU wins once there's enough work to amortize transfer/launch overhead)
 
-Biological caveat — do not skip
+7. Everything below this line is unchanged from Handoff v1
 
-Rare codons are not uniformly bad. The 5′ ramp and deliberate translational pause sites support co-translational folding. A naive "rare = change me" signal destroys them.
-
-Exclude roughly the first 30–50 codons from the rare-codon penalty
-Treat the 5′ region under a separate objective — it wants weak local structure for initiation, which runs directly against global MFE minimization
-Unresolved
-
-Is the change vector a heuristic proposal inside a selection-based GA, or is there accept/reject on fitness? If the latter, this is Metropolis–Hastings with a non-uniform proposal, and without the q(x|x')/q(x'|x) correction the stationary distribution is biased toward whatever the change vector prefers rather than toward fitness. Determine which from the code before extending it.
-
-6. Fitness function — open concerns
-
-Multi-objective handling. If objectives are currently collapsed into a single weighted scalar, consider NSGA-II and a Pareto front instead. CAI, GC, MFE, and splice score genuinely conflict, and a weighted sum forces choosing λ before the tradeoff surface is known.
-
-MFE may be the wrong target. MFE describes one structure; equilibrium has many. mRNA generally wants conformational flexibility during ribosomal unwinding — MFE minimization produces steep energy landscapes. Consider ensemble free energy or local accessibility near the start codon instead of a global MFE threshold. Related: lower MFE correlates with reduced translation initiation efficiency, so a hard "most stable wins" filter can select against expression.
-
-Two sequences, not one. Once introns are inserted:
-
-splice signals are a property of the pre-mRNA (unspliced)
-folding and codon metrics are properties of the mature mRNA (spliced)
-
-Easy to conflate when both live in one seq variable. Verify the current code doesn't.
-
-SpliceAI context. SpliceAI is context-dependent and was trained with large genomic flanks. Scoring a bare CDS produces numbers that don't describe the real construct. Embed the CDS in the intended vector/genomic context with the full input window populated. If the current code pads with Ns or scores naked CDS, that is a correctness bug and takes priority over any performance work.
-
-7. Caching (2 TB cloud available)
-
-Tier it. In-process LRU (hot) → local SSD (warm) → cloud (cold/archival + cross-run reuse). A cloud round-trip is tens of ms; GPU folding of a 1 kb sequence may be single-digit ms — the cache can be slower than recomputing. Cloud is for provenance and cross-session reuse, not inner loop.
-
-Config hash in the key. Energy model version, parameter set, temperature, dangling-ends mode, SpliceAI model version. Without it, results from before and after a parameter change mix silently.
-
-128-bit hash (blake3 / xxh128). 64-bit begins colliding around a few billion entries, which is inside the plausible range here.
-
-Shard columnar (Parquet) by hash prefix. Not one object per sequence — 2 TB of tiny objects is expensive to store and painful to list.
-
-Cache the expensive things only: MFE + structure, SpliceAI scores. Codon arithmetic is cheaper to recompute than to fetch.
-
-8. Performance strategy
-
-Expected bottleneck is folding, not codon arithmetic. CAI/GC/CpG/homopolymer scans over a few thousand sequences are microseconds; folding is O(n³) per sequence.
-
-Coarse-grained beats fine-grained here. A GA has a population of independent sequences — one sequence per thread block, batched across the generation, keeps SMs busy without fighting the anti-diagonal dependency structure of the Zuker recurrence. Much easier than intra-sequence wavefront parallelization. (Existing CUDA_RNAFold work may already do this — check before rebuilding.)
-
-Check LinearFold-style O(n) beam search for the screening pass, with exact folding reserved for survivors. An algorithmic complexity reduction on the first filter dwarfs a 10–20× constant factor.
-
-Don't rewrite SpliceAI. Already a GPU model. Wins are batching, resident weights, fp16.
-
-Clustering (if k-mer or edit-distance based) is a pairwise distance matrix — friendliest possible CUDA target, good first kernel.
-
-Suggested order for the C/CUDA work
-Scalar codon metrics → C. Low stakes, immediately testable, teaches the binding boundary and SoA layout without algorithmic difficulty.
-Pairwise distances → CUDA. Tiled, shared memory, coalesced.
-Batched folding → CUDA. The real prize, attempted once the test harness exists.
-Two gotchas
-
-Reduction order changes results. Floating-point addition isn't associative, so parallel reduction won't bit-match Python's sum(). In a GA this compounds: a 1e-12 difference flips a selection comparison and two "identical" runs diverge into different populations. Fix reduction order or use compensated summation if reproducibility matters. Parity tests assert on tolerance, not equality.
-
-Memoize fitness on sequence hash. GAs regenerate duplicate offspring constantly. A hash map in front of the folding call often beats the kernel you were about to write.
-
-9. Benchmark target
-
-LinearDesign solves the CAI+MFE subproblem exactly — it encodes synonymous codon choices as a DFA, models folding with an SCFG, and applies lattice parsing over their weighted intersection, optimizing MFE − λ·|p|·log(CAI) in O(n³). It uses the same thermodynamic energy model as ViennaRNA, so MFE values are directly comparable.
-
-It cannot express splice constraints, intron insertion, GC windows, or motif avoidance — so it does not replace the GA. But it provides a ground-truth optimum:
-
-Run the GA with all objectives except CAI and MFE disabled. It should recover the LinearDesign optimum. If it doesn't, there is a convergence or fitness-scaling bug, and no amount of CUDA will fix that.
-
-Worth wiring into CI as a regression test once the GA is modular enough to disable objectives.
-
-10. Colab deployment
-
-Eventual runtime target is Colab, called from CLI with precompiled binaries.
-
-Fat binary, -gencode covering sm_70 / 75 / 80 / 89 plus PTX for forward compatibility. Colab allocates T4, L4, A100, occasionally V100 — don't discover an arch mismatch post-allocation.
-Ship prebuilt wheel or tarball to Drive, extract at session start. Compiling on Colab burns paid GPU-hours.
-Checkpoint GA state to Drive every N generations with clean resume. Colab sessions die routinely; this is not optional for long runs.
-11. Immediate next steps
-Confirm repo visibility and whether CUDA kernels are actually committed (git status, .gitignore)
-Read the notebooks. Do not refactor yet.
-Profile. Establish where time actually goes before touching anything.
-Audit for the correctness issues in §6 — SpliceAI context and pre-/post-splicing sequence conflation both outrank performance work.
-Extract objectives into modules, build golden test vectors from current Python behavior
-Then, and only then, start the C port in the order given in §8
-12. Notes on provenance
-
-Sections 5–10 are design recommendations from a chat session, developed from a verbal description of the pipeline. None of it has been checked against the code. Treat every claim about what the current implementation does as a hypothesis to verify, not a fact.
+Still accurate, still not double-checked against code (because the relevant code still doesn't exist): licensing (owner's call, don't touch license files), the CUDA_RNAFold repo open question (language-breakdown mismatch, worth checking `git status`/`.gitignore` there directly), the change-vector design discussion in v1 §5 (Metropolis-Hastings question still unresolved — is the GA's selection step doing proper accept/reject, or is the change vector just a heuristic proposal? worth settling before doing much more GA-tuning work), the fitness-function open concerns in v1 §6 (multi-objective/Pareto vs weighted-sum, MFE-as-wrong-target, pre-/post-splicing sequence conflation, SpliceAI context), the caching design in v1 §7 (not built yet — nothing to cache until folding/SpliceAI exist), the Colab deployment notes in v1 §10, and the LinearDesign benchmark-target idea in v1 §9. Read v1 (in git history, this commit's parent) for the full text of all of these if picking that work up.
