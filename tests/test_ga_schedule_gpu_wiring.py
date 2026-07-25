@@ -116,6 +116,62 @@ def test_run_ga_numpy_xp_matches_gpu_xp_final_population(aa_seq, analysis_object
         assert by_codons_np[key].number == by_codons_gpu[key].number
 
 
+def test_merge_replicates_batch_gpu_matches_cpu(aa_seq, analysis_objects):
+    new_solutions = [ga.generate_seed(aa_seq) for _ in range(6)]
+    # Duplicate one entry so the dedup-within-batch path is exercised too.
+    new_solutions.append(new_solutions[0])
+
+    pop_index_cpu = {}
+    ga.merge_replicates_batch(pop_index_cpu, new_solutions, analysis_objects, None, xp=np)
+    pop_index_gpu = {}
+    ga.merge_replicates_batch(pop_index_gpu, new_solutions, analysis_objects, None, xp=cp)
+
+    assert set(pop_index_cpu) == set(pop_index_gpu)
+    for key in pop_index_cpu:
+        assert pop_index_cpu[key].number == pop_index_gpu[key].number
+        _assert_change_vecs_close(pop_index_cpu[key].change_vecs, pop_index_gpu[key].change_vecs)
+
+
+def test_directed_evolution_batch_vecs_out_gpu_matches_cpu(aa_seq, analysis_objects, weights):
+    import random
+
+    individuals = []
+    for _ in range(5):
+        codons = ga.generate_seed(aa_seq)
+        individuals.append(Proposed_Solution(codons, 1, calculate_change_vector(codons, analysis_objects)))
+
+    random.seed(99)
+    vecs_out_cpu = {}
+    reps_cpu = ga.directed_evolution_batch(individuals, weights, aa_seq, analysis_objects, xp=np, vecs_out=vecs_out_cpu)
+
+    random.seed(99)
+    vecs_out_gpu = {}
+    reps_gpu = ga.directed_evolution_batch(individuals, weights, aa_seq, analysis_objects, xp=cp, vecs_out=vecs_out_gpu)
+
+    for ind in individuals:
+        assert reps_cpu[id(ind)] == reps_gpu[id(ind)]
+    assert set(vecs_out_cpu) == set(vecs_out_gpu)
+    for key in vecs_out_cpu:
+        _assert_change_vecs_close(vecs_out_cpu[key], vecs_out_gpu[key])
+
+
+def test_flatten_round_gpu_matches_cpu(aa_seq, analysis_objects):
+    pop_cpu = [Proposed_Solution(ga.generate_seed(aa_seq), 5, {}) for _ in range(4)]
+    for p in pop_cpu:
+        p.change_vecs = calculate_change_vector(p.codons, analysis_objects)
+    pop_gpu = [Proposed_Solution(list(p.codons), p.number, dict(p.change_vecs)) for p in pop_cpu]
+
+    import random
+    random.seed(77)
+    result_cpu = ga._flatten_round(pop_cpu, aa_seq, analysis_objects, xp=np)
+    random.seed(77)
+    result_gpu = ga._flatten_round(pop_gpu, aa_seq, analysis_objects, xp=cp)
+
+    cpu_by_codons = {tuple(p.codons): p.number for p in result_cpu}
+    gpu_by_codons = {tuple(p.codons): p.number for p in result_gpu}
+    assert cpu_by_codons == gpu_by_codons
+
+
 def test_run_schedule_numpy_xp_matches_gpu_xp(aa_seq, analysis_objects, weights):
     import random
 

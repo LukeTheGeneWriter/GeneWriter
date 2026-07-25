@@ -7,6 +7,20 @@ from genewriter.classes import Proposed_Solution
 from genewriter.codon_tables import generate_codon_vec
 
 
+def _assert_change_vecs_close(a: dict, b: dict, tol=1e-6):
+    """Batched (numpy) and per-individual computation of the same term can
+    differ by float rounding (different reduction order -- see
+    tests/test_gpu_change_vector.py, which uses the same tolerance-based
+    comparison rather than exact equality for this reason), so a plain ==
+    is too strict here."""
+    assert set(a) == set(b)
+    for term, values in a.items():
+        other = b[term]
+        assert len(values) == len(other)
+        for x, y in zip(values, other):
+            assert x == pytest.approx(y, abs=tol)
+
+
 def test_generate_seed_produces_valid_codons_for_every_residue(aa_seq):
     sol = ga.generate_seed(aa_seq)
     assert len(sol) == len(aa_seq)
@@ -423,6 +437,194 @@ def test_merge_replicate_increments_existing_entry_regardless_of_parent(aa_seq, 
     ga.merge_replicate(pop_index, sol, analysis_objects)
     ga.merge_replicate(pop_index, sol, analysis_objects)  # same genotype again
     assert pop_index[tuple(sol)].number == 2
+
+
+def test_merge_replicate_exact_stores_the_given_vecs_without_recomputing(aa_seq, analysis_objects, monkeypatch):
+    """merge_replicate_exact() must never call calculate_change_vector() or
+    diff_change_vector() -- the whole point is that its caller already has
+    the exact vecs in hand (see directed_evolution_batch(vecs_out=...))."""
+    import genewriter.ga as ga_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("merge_replicate_exact should not compute anything")
+
+    monkeypatch.setattr(ga_module, "calculate_change_vector", _boom)
+    monkeypatch.setattr(ga_module, "diff_change_vector", _boom)
+
+    sol = ga.generate_seed(aa_seq)
+    vecs = {'RareCodons': [0.0] * len(sol), 'CodonUsage': [0.0] * len(sol),
+            'CodonPairBias': [0.0] * len(sol), 'GC': [0.0] * len(sol), 'Kmer': [0.0] * len(sol)}
+    pop_index = {}
+    ga.merge_replicate_exact(pop_index, sol, vecs)
+    assert pop_index[tuple(sol)].change_vecs == vecs
+    assert pop_index[tuple(sol)].number == 1
+
+
+def test_merge_replicate_exact_increments_existing_entry(aa_seq, analysis_objects):
+    sol = ga.generate_seed(aa_seq)
+    vecs = calculate_change_vector(sol, analysis_objects)
+    pop_index = {}
+    ga.merge_replicate_exact(pop_index, sol, vecs)
+    ga.merge_replicate_exact(pop_index, sol, vecs)  # same genotype again
+    assert pop_index[tuple(sol)].number == 2
+    assert pop_index[tuple(sol)].change_vecs == vecs
+
+
+def test_merge_replicates_batch_matches_calculate_change_vector(aa_seq, analysis_objects):
+    """Every genuinely-new genotype's batched vecs must exactly match a
+    direct calculate_change_vector() call -- same correctness oracle
+    tests/test_gpu_change_vector.py uses for batch_calculate_change_vectors
+    itself."""
+    new_solutions = [ga.generate_seed(aa_seq) for _ in range(6)]
+
+    pop_index = {}
+    ga.merge_replicates_batch(pop_index, new_solutions, analysis_objects, None, xp=np)
+
+    assert len(pop_index) <= len(new_solutions)
+    for sol in new_solutions:
+        key = tuple(sol)
+        assert key in pop_index
+        expected = calculate_change_vector(sol, analysis_objects)
+        _assert_change_vecs_close(pop_index[key].change_vecs, expected)
+
+
+def test_merge_replicates_batch_dedups_within_batch_and_against_existing_pop(aa_seq, analysis_objects):
+    sol = ga.generate_seed(aa_seq)
+    other = ga.generate_seed(aa_seq)
+    while other == sol:
+        other = ga.generate_seed(aa_seq)
+
+    # sol already present in pop_index (count 3) before the batch call.
+    pop_index = {}
+    ga.merge_replicate(pop_index, sol, analysis_objects)
+    ga.merge_replicate(pop_index, sol, analysis_objects)
+    ga.merge_replicate(pop_index, sol, analysis_objects)
+    assert pop_index[tuple(sol)].number == 3
+
+    # sol drawn twice more, other drawn once, all in the same batch call.
+    new_solutions = [sol, sol, other]
+    ga.merge_replicates_batch(pop_index, new_solutions, analysis_objects, None, xp=np)
+
+    assert pop_index[tuple(sol)].number == 5  # 3 existing + 2 new draws
+    assert pop_index[tuple(other)].number == 1
+
+
+def test_merge_replicates_batch_noop_for_empty_input(aa_seq, analysis_objects):
+    pop_index = {}
+    ga.merge_replicates_batch(pop_index, [], analysis_objects, None, xp=np)
+    assert pop_index == {}
+
+
+def test_directed_evolution_batch_vecs_out_matches_calculate_change_vector(aa_seq, analysis_objects, weights):
+    """vecs_out should be populated with each returned replicate's exact
+    change vector -- the same value a direct calculate_change_vector() call
+    on that replicate's codons would give, not an approximation."""
+    individuals = [_make_individual(aa_seq, analysis_objects) for _ in range(4)]
+    vecs_out = {}
+    results = ga.directed_evolution_batch(
+        individuals, weights, aa_seq, analysis_objects, nreplicates=5, xp=np, vecs_out=vecs_out,
+    )
+
+    any_reps = False
+    for ind in individuals:
+        for rep in results[id(ind)]:
+            any_reps = True
+            assert tuple(rep) in vecs_out
+            expected = calculate_change_vector(rep, analysis_objects)
+            _assert_change_vecs_close(vecs_out[tuple(rep)], expected)
+    assert any_reps, "expected at least one replicate for this test to be meaningful"
+
+
+def test_directed_evolution_batch_without_vecs_out_is_unchanged(aa_seq, analysis_objects, weights):
+    """Omitting vecs_out (every pre-existing call site) must behave exactly
+    as before this parameter was added."""
+    individuals = [_make_individual(aa_seq, analysis_objects) for _ in range(4)]
+    results = ga.directed_evolution_batch(individuals, weights, aa_seq, analysis_objects, nreplicates=5, xp=np)
+    for ind in individuals:
+        for rep in results[id(ind)]:
+            assert len(rep) == len(ind.codons)
+
+
+def test_run_ga_growth_batching_matches_reference_merge_path(aa_seq, analysis_objects, weights):
+    """Old-path-vs-new-path equivalence check: with xp set, growth's storage
+    now goes through merge_replicate_exact()/merge_replicates_batch()
+    instead of one merge_replicate() (diff_change_vector) call per
+    replicate. Both must produce the identical final population (same
+    genotypes, same counts) given the same RNG seed -- the dedup-by-genotype
+    semantics must be preserved exactly across the refactor, same
+    correctness bar as test_ga_schedule_gpu_wiring.py's numpy-vs-cupy
+    checks."""
+    import random
+
+    from genewriter.ga import directed_evolution_batch, replicate_and_mutate_random
+
+    def _reference_run_ga_one_generation(seeds):
+        """Old growth storage: one merge_replicate() call per replicate,
+        kept verbatim here (not imported) so a future rewrite of run_ga's
+        internals can't silently drift this reference along with it."""
+        pop_index = ga.seed_population(seeds, analysis_objects, xp=np)
+        pop = list(pop_index.values())
+        pop_index = {tuple(p.codons): p for p in pop}
+
+        is_random = [random.random() < 0.5 for _ in pop]
+        random_individuals = [p for p, r in zip(pop, is_random) if r]
+        directed_individuals = [p for p, r in zip(pop, is_random) if not r]
+
+        for p in random_individuals:
+            for rep in replicate_and_mutate_random(p.codons, aa_seq):
+                ga.merge_replicate(pop_index, rep, analysis_objects, None, parent=p)
+
+        batch_reps = directed_evolution_batch(directed_individuals, weights, aa_seq, analysis_objects, xp=np)
+        for p in directed_individuals:
+            for rep in batch_reps[id(p)]:
+                ga.merge_replicate(pop_index, rep, analysis_objects, None, parent=p)
+
+        return list(pop_index.values())
+
+    seeds = [ga.generate_seed(aa_seq) for _ in range(6)]
+
+    random.seed(4242)
+    reference_pop = _reference_run_ga_one_generation(seeds)
+
+    random.seed(4242)
+    new_pop = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=1, target_size=len(reference_pop) + 100, xp=np)
+
+    ref_by_codons = {tuple(p.codons): p.number for p in reference_pop}
+    new_by_codons = {tuple(p.codons): p.number for p in new_pop}
+    assert ref_by_codons == new_by_codons
+
+
+def test_flatten_round_with_xp_matches_calculate_change_vector(aa_seq, analysis_objects):
+    """New-neighbor vecs computed via the batched xp path must exactly
+    match calculate_change_vector() -- same oracle as the growth-batching
+    tests above."""
+    pop = [Proposed_Solution(ga.generate_seed(aa_seq), 5, {}) for _ in range(4)]
+    for p in pop:
+        p.change_vecs = calculate_change_vector(p.codons, analysis_objects)
+
+    result = ga._flatten_round(pop, aa_seq, analysis_objects, xp=np)
+    for p in result:
+        expected = calculate_change_vector(p.codons, analysis_objects)
+        _assert_change_vecs_close(p.change_vecs, expected)
+
+
+def test_flatten_round_with_xp_conserves_total_replicate_count(aa_seq, analysis_objects):
+    pop = [Proposed_Solution(ga.generate_seed(aa_seq), 5, {}) for _ in range(4)]
+    for p in pop:
+        p.change_vecs = calculate_change_vector(p.codons, analysis_objects)
+    total_before = sum(p.number for p in pop)
+
+    result = ga._flatten_round(pop, aa_seq, analysis_objects, xp=np)
+    total_after = sum(p.number for p in result)
+    assert total_after == total_before
+
+
+def test_run_ga_with_flatten_every_and_xp_does_not_crash(aa_seq, analysis_objects, weights):
+    seeds = [ga.generate_seed(aa_seq) for _ in range(4)]
+    final_pop = ga.run_ga(
+        aa_seq, seeds, weights, analysis_objects, num_gens=4, target_size=8, flatten_every=2, xp=np,
+    )
+    assert len(final_pop) <= 8
 
 
 def test_refresh_change_vectors_recomputes_exactly(aa_seq, analysis_objects):

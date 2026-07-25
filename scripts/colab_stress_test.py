@@ -167,11 +167,17 @@ CONFIG = dict(
     # ------------------------------------------------------------------
     # Change-vector term weights -- one entry per registered term. Must
     # cover every name in change_vector.registered_terms() (currently
-    # RareCodons, CodonUsage, CodonPairBias, GC, Kmer) or run_ga/run_schedule
-    # will raise. Positive weight = term counts normally; 0 = term computed
-    # but ignored in scoring; negative = invert the term's pressure.
+    # RareCodons, CodonUsage, CodonPairBias, GC, Kmer, Uracil) or
+    # run_ga/run_schedule will raise. Positive weight = term counts
+    # normally; 0 = term computed but ignored in scoring; negative = invert
+    # the term's pressure. Uracil defaults to 0.0 (off) here -- unlike the
+    # other 5 terms it isn't a natural-gene-baseline comparison, just a raw
+    # "opportunity to remove a U" count (see change_vector._uracil_term's
+    # docstring), and it scores *higher* for more removable U -- so a
+    # *negative* weight is what actually pushes uracil content down if you
+    # enable it.
     # ------------------------------------------------------------------
-    WEIGHTS=dict(RareCodons=1.0, CodonUsage=1.0, CodonPairBias=1.0, GC=1.0, Kmer=1.0),
+    WEIGHTS=dict(RareCodons=1.0, CodonUsage=1.0, CodonPairBias=1.0, GC=1.0, Kmer=1.0, Uracil=0.0),
 
     # ------------------------------------------------------------------
     # Step 2: batched change-vector GPU benchmark

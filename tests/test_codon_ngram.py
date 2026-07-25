@@ -173,7 +173,7 @@ def test_sample_codon_ngram_seed_output_is_valid_input_to_calculate_change_vecto
     )
     seed = sample_codon_ngram_seed(aa_seq, empty_model, rng=random.Random(2))
     result = calculate_change_vector(seed, analysis_objects)
-    assert set(result.keys()) == {'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer'}
+    assert set(result.keys()) == {'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer', 'Uracil'}
 
 
 def test_save_and_load_codon_ngram_model_round_trips(tmp_path):

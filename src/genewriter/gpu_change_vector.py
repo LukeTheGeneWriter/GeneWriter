@@ -38,7 +38,7 @@ its memory-scaling caveat at large k.
 
 import numpy as np
 
-from .change_vector import _zscore, calculate_change_vector
+from .change_vector import _zscore, calculate_change_vector, registered_terms
 from .codon_tables import (
     AA_CODONS,
     CODON_FREQ_BY_INDEX,
@@ -57,6 +57,16 @@ from .codon_tables import (
 
 _WINDOW_BUCKET_NAMES = ('ExonL50', 'Exon', 'ExonR50')
 _LOCATION_BUCKET_NAMES = ('ExonL50', 'Exon', 'ExonR50', 'Splice')
+
+# The only terms this module has a hand-written batched (xp-array)
+# implementation for. Unlike change_vector.py's @register_term registry,
+# there is no generic way to "batch" an arbitrary custom term -- each one
+# needs its own array-based reimplementation, written here by hand. Any
+# registered term NOT in this set (e.g. change_vector.Uracil, added without
+# ever touching this file) is still computed correctly by
+# batch_calculate_change_vectors() -- see its per-individual fallback loop
+# -- just not accelerated.
+_NATIVELY_BATCHED_TERMS = frozenset({'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer'})
 
 # Per-codon-index "best synonym frequency for this codon's amino acid" --
 # the batched counterpart of change_vector.dist_from_optimal(), which only
@@ -466,15 +476,35 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
 
     Returns a list of P dicts, one per individual, in the same shape
     calculate_change_vector() returns for a single individual -- so this is
-    a drop-in replacement for `[calculate_change_vector(sol, ...) for sol
-    in pop_codons]`, just computed as one batch instead of P separate calls.
+    a genuine drop-in replacement for `[calculate_change_vector(sol, ...)
+    for sol in pop_codons]`, just computed as one batch instead of P
+    separate calls -- including any custom term registered via
+    change_vector.register_term() after this module was written (see the
+    fallback loop below), not just the 5 built-ins.
 
-    All 5 terms are batched, including Kmer (see batch_kmer_term() and this
-    module's docstring for how -- it used to fall back to a per-individual
-    Python loop, which is why progress_every used to report throughput
-    "through the Kmer loop" specifically; that per-individual fallback is
-    gone, so a slow call now means something else -- rerun with
-    progress_every set to see which term's batched pass is slow).
+    All 5 built-in terms are natively batched, including Kmer (see
+    batch_kmer_term() and this module's docstring for how -- it used to
+    fall back to a per-individual Python loop, which is why progress_every
+    used to report throughput "through the Kmer loop" specifically; that
+    per-individual fallback is gone, so a slow call now means something
+    else -- rerun with progress_every set to see which term's batched pass
+    is slow).
+
+    Any OTHER registered term (see _NATIVELY_BATCHED_TERMS) has no
+    hand-written batched implementation here -- there's no generic way to
+    "batch" an arbitrary (sol, analysis_objects, locvec) -> list[float]
+    function the way change_vector.calculate_change_vector() genuinely is
+    generic over the registry. Caught by test_gpu_change_vector.py's
+    per-individual-vs-batched comparison the moment a 6th term (Uracil) was
+    registered: the batched path was silently dropping it entirely whenever
+    xp was set, even though weights['Uracil'] might be nonzero -- a real
+    correctness gap, not just a test mismatch, since every batch-computed
+    change vector (seeding, refresh, growth's new-genotype storage) would
+    have silently never scored that term. Fixed with a per-individual
+    fallback loop, below, for any such term -- still correct (unlike
+    dropping it), just not accelerated. Extend _NATIVELY_BATCHED_TERMS with
+    a real xp-array implementation if a custom term also needs to be fast
+    at scale.
     """
     if not pop_codons:
         return []
@@ -517,7 +547,7 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
     gc_np = gc if xp is np else xp.asnumpy(gc)
     kmer_np = kmer if xp is np else xp.asnumpy(kmer)
 
-    return [
+    results = [
         {
             'RareCodons': rare_np[p].tolist(),
             'CodonUsage': usage_np[p].tolist(),
@@ -527,3 +557,17 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
         }
         for p in range(len(pop_codons))
     ]
+
+    # Any registered term without a hand-written batched implementation
+    # (see _NATIVELY_BATCHED_TERMS and this function's docstring) -- a
+    # per-individual Python loop, but still correct, which a silent
+    # omission would not be.
+    extra_terms = {name: fn for name, fn in registered_terms().items() if name not in _NATIVELY_BATCHED_TERMS}
+    if extra_terms:
+        for sol, entry in zip(pop_codons, results):
+            for name, fn in extra_terms.items():
+                entry[name] = fn(sol, analysis_objects, locvec)
+        if progress_every:
+            _mark(f"extra terms ({', '.join(sorted(extra_terms))})")
+
+    return results

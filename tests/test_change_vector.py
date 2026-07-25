@@ -16,7 +16,7 @@ def test_calculate_change_vector_runs_and_covers_every_position(aa_seq, analysis
     sol = _random_solution(aa_seq)
     vecs = calculate_change_vector(sol, analysis_objects)
 
-    assert set(vecs.keys()) == {'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer'}
+    assert set(vecs.keys()) == {'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer', 'Uracil'}
     for term, values in vecs.items():
         assert len(values) == len(sol), f"{term} produced {len(values)} scores for {len(sol)} codons"
         assert all(isinstance(v, float) for v in values)
@@ -101,3 +101,32 @@ def test_rare_codon_term_never_produces_nan_from_unobserved_window(aa_seq, analy
     sol = _random_solution(aa_seq)
     vecs = calculate_change_vector(sol, analysis_objects)
     assert not any(math.isnan(v) for v in vecs['RareCodons'])
+
+
+def test_uracil_term_counts_removable_u_bases(analysis_objects):
+    """'CTT'/'CTC'/'CTA'/'CTG'/'TTA'/'TTG' all encode Leu -- every base
+    position varies across that synonym set, so a 'T' at base 1 (TTA/TTG)
+    counts as removable. 'TGG' (Trp) has only one codon, so nothing about
+    it is variable -- its Ts must score 0 regardless of how many there
+    are."""
+    from genewriter.change_vector import _uracil_term
+
+    sol = ['TTA', 'TGG']  # Leu (variable, 1 removable T), Trp (invariable, 2 Ts but 0 removable)
+    scores = _uracil_term(sol, analysis_objects, ['I', 'I'])
+    assert scores == [1.0, 0.0]
+
+
+def test_uracil_term_zero_for_no_t_bases(analysis_objects):
+    from genewriter.change_vector import _uracil_term
+
+    sol = ['GCC']  # Ala, no T bases at all
+    assert _uracil_term(sol, analysis_objects, ['I']) == [0.0]
+
+
+def test_uracil_term_counts_multiple_variable_t_bases_in_one_codon(analysis_objects):
+    """Ser's 6 synonymous codons (TCT/TCC/TCA/TCG/AGT/AGC) disagree at every
+    position, so TCT's base 1 (T) and base 3 (T) are both variable-and-U --
+    only base 2 (C) doesn't count, since it isn't U regardless of variability."""
+    from genewriter.change_vector import _uracil_term
+
+    assert _uracil_term(['TCT'], analysis_objects, ['I']) == [2.0]

@@ -24,9 +24,9 @@ def temp_term():
         change_vector._TERM_REGISTRY.pop(name, None)
 
 
-def test_registered_terms_includes_the_five_builtins():
+def test_registered_terms_includes_the_six_builtins():
     names = set(registered_terms())
-    assert names == {'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer'}
+    assert names == {'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer', 'Uracil'}
 
 
 def test_custom_term_is_picked_up_by_calculate_change_vector(aa_seq, analysis_objects, temp_term):

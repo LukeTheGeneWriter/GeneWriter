@@ -75,7 +75,9 @@ from numpy.lib.stride_tricks import sliding_window_view
 from .classes import CodonAnalysis, CodonPairBiasAnalysis, GCAnalysis, KmerAnalysis, RareCodonAnalysis
 from .codon_tables import (
     CODON_FREQS_LIT,
+    CODON_TO_INDEX,
     CODON_TO_VARIABLE_FLAGS,
+    GC_FLAGS_BY_INDEX,
     RARE_CODONS_LIT,
     TAG_TO_BUCKET,
     TAG_TO_WINDOW_BUCKET,
@@ -338,10 +340,16 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
     # tagged_gc1/2/3 use 1 for G/C). That's what the original notebook
     # computed; preserved as-is rather than "fixed", per this module's
     # policy of flagging behavior questions instead of silently resolving
-    # them (see module docstring).
-    gc1_mean = np.mean([0 if c[0] in 'GC' else 1 for c in sol])
-    gc2_mean = np.mean([0 if c[1] in 'GC' else 1 for c in sol])
-    gc3_mean = np.mean([0 if c[2] in 'GC' else 1 for c in sol])
+    # them (see module docstring). Computed via the precomputed
+    # GC_FLAGS_BY_INDEX table (1=G/C, normal polarity) and inverted here,
+    # rather than re-inspecting each codon's characters -- mirrors
+    # gpu_change_vector.py's batch_gc_term, which already solved this same
+    # "precompute per-codon GC" item the same way (see codon_tables.py's
+    # GC_FLAGS_BY_INDEX comment).
+    gc_flags = np.asarray(GC_FLAGS_BY_INDEX, dtype=float)[[CODON_TO_INDEX[c] for c in sol]]
+    gc1_mean = 1.0 - gc_flags[:, 0].mean()
+    gc2_mean = 1.0 - gc_flags[:, 1].mean()
+    gc3_mean = 1.0 - gc_flags[:, 2].mean()
 
     def z_for(loc: str, tagged: dict, value: float) -> float:
         arr = np.asarray(tagged[loc], dtype=float)
@@ -468,6 +476,42 @@ def _kmer_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, win
     if not per_k_vecs:
         return [0.0] * len(sol)
     return [sum(vec[i] for vec in per_k_vecs) for i in range(len(sol))]
+
+
+@register_term('Uracil')
+def _uracil_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list) -> list:
+    """Per-position count of removable uracil (T, since sol is DNA-alphabet
+    codons -- what would be U in the transcribed mRNA): how many of a
+    codon's bases are both 'T' and actually variable via some synonymous
+    swap (codon_tables.CODON_TO_VARIABLE_FLAGS -- the same "does a synonym
+    actually differ here" gate _gc_term uses), in [0, 3] per position.
+
+    Unlike every other term here, this is deliberately NOT a natural-gene-
+    baseline z-score (no UracilAnalysis dataclass, no change to
+    AnalysisObjects) -- future_work_items describes uracil minimization as
+    a flat "reduce U content" objective, not a "match real genes" one, so
+    there's no natural distribution to compare against. `analysis_objects`
+    is accepted (matching every registered term's required signature) but
+    unused.
+
+    Design call, flagged rather than silently resolved (per this module's
+    stated policy): the score returned is a *positive* "opportunity to
+    remove a U here" count, consistent with every other term scoring "this
+    position is worth mutating" rather than "this position is good."
+    kill_off()/select_survivors()/directed_evolution() all treat a higher
+    weighted score as more in need of mutation -- so a *negative*
+    weights['Uracil'] is what actually pushes uracil content down; a
+    positive weight would instead bias the GA toward mutating away from
+    low-U positions (preserving or growing U content). Pick the sign
+    deliberately when configuring weights, not by assuming this docstring's
+    framing implies one.
+    """
+    scores = []
+    for codon in sol:
+        v1, v2, v3 = CODON_TO_VARIABLE_FLAGS[codon]
+        count = (v1 if codon[0] == 'T' else 0) + (v2 if codon[1] == 'T' else 0) + (v3 if codon[2] == 'T' else 0)
+        scores.append(float(count))
+    return scores
 
 
 @dataclass

@@ -107,6 +107,71 @@ def merge_replicate(
         pop_index[key] = Proposed_Solution(sol, 1, vecs)
 
 
+def merge_replicate_exact(pop_index: dict, sol: list, vecs: dict) -> None:
+    """Like merge_replicate(), but for a genotype whose exact change vector
+    is already known -- no diffing or computing needed, just the same
+    dedup-by-genotype-key bookkeeping. Intended consumer:
+    directed_evolution_batch(vecs_out=...), which already computes each
+    replicate's exact change vector while choosing the best synonymous
+    alternative -- recomputing it again via merge_replicate()'s
+    diff_change_vector() would both waste that work and be less accurate
+    than the exact result already in hand.
+    """
+    key = tuple(sol)
+    existing = pop_index.get(key)
+    if existing is not None:
+        existing.number += 1
+    else:
+        pop_index[key] = Proposed_Solution(sol, 1, vecs)
+
+
+def merge_replicates_batch(
+    pop_index: dict,
+    new_solutions: list,
+    analysis_objects: AnalysisObjects,
+    locvec: list,
+    xp,
+    progress_every: int = None,
+) -> None:
+    """Batched counterpart of merge_replicate() for genotypes with no
+    precomputed vecs and no parent to diff against usefully in bulk (e.g. a
+    generation's random-mutation replicates from replicate_and_mutate_random()) --
+    mirrors seed_population()'s dedup-then-batch shape rather than one
+    diff_change_vector() Python call per replicate.
+
+    Duplicates within new_solutions itself, and genotypes already present in
+    pop_index, are merged (counted) exactly like repeated merge_replicate()
+    calls would be -- only genuinely new, unique genotypes get a
+    batch_calculate_change_vectors() call, and that call happens once for
+    all of them together rather than once each.
+
+    xp: array module (numpy or cupy) for the batched pass -- required, not
+    optional, like directed_evolution_batch(): this function only exists
+    for its batching, callers decide whether to use it at all (vs.
+    merge_replicate() in a loop) by choosing to call it.
+    """
+    counts = {}
+    order = []
+    for sol in new_solutions:
+        key = tuple(sol)
+        existing = pop_index.get(key)
+        if existing is not None:
+            existing.number += 1
+            continue
+        if key not in counts:
+            counts[key] = 0
+            order.append(key)
+        counts[key] += 1
+
+    if not order:
+        return
+
+    unique_codons = [list(key) for key in order]
+    vecs_list = batch_calculate_change_vectors(unique_codons, analysis_objects, locvec, xp=xp, progress_every=progress_every)
+    for key, codons, vecs in zip(order, unique_codons, vecs_list):
+        pop_index[key] = Proposed_Solution(codons, counts[key], vecs)
+
+
 def _progress_print(label: str, i: int, total: int, t0: float) -> None:
     import time as _time
     elapsed = _time.perf_counter() - t0
@@ -326,6 +391,7 @@ def directed_evolution_batch(
     nreplicates: int = 10,
     xp=None,
     progress_every: int = None,
+    vecs_out: dict = None,
 ) -> dict:
     """Batched counterpart of directed_evolution(lookahead=True) across
     MULTIPLE individuals at once.
@@ -370,18 +436,28 @@ def directed_evolution_batch(
     excerpt-estimated ones), numerically different results.
 
     Performance reality check, found by profiling rather than assumed:
-    this function's own batched scoring is now fast (measured: 1.45s for
+    this function's own batched scoring is fast (measured: 1.45s for
     ~10,000 candidates across ~1,000 individuals on real gene data, this
-    RTX 3050 -- see Handoff.md sec 6), but the *caller's* merge_replicate()
-    loop that stores each accepted replicate -- one diff_change_vector()
-    call per replicate, unaffected by anything batched here or in
-    gpu_change_vector.py -- now dominates growth's total time instead
-    (measured: ~12s for that same ~10,000 replicates in the same run).
-    Net growth speedup end-to-end is therefore a modest ~3x, not the
-    25-48x batch_calculate_change_vectors() itself achieves -- batching
-    merge_replicate's storage diffing across a generation the way
-    seed_population()/refresh_change_vectors() already do is the natural
-    next step if growth needs to be faster than that, and is NOT done.
+    RTX 3050 -- see Handoff.md sec 6), but a naive caller storing each
+    accepted replicate one at a time via merge_replicate() -- one
+    diff_change_vector() call per replicate -- previously dominated
+    growth's total time instead (measured: ~12s for that same ~10,000
+    replicates in the same run, capping net growth speedup at a modest
+    ~3x despite the 25-48x batch_calculate_change_vectors() itself
+    achieves). That storage step is no longer naive: pass `vecs_out` (see
+    below) and use merge_replicate_exact() instead of merge_replicate() to
+    store each replicate's already-known exact vecs directly, skipping the
+    redundant diff_change_vector() recompute entirely -- see
+    ga.run_ga()/schedule.py's "growth" step for the wiring.
+
+    vecs_out: if given, populated (mutated in place) with
+        {tuple(new_sol): vecs} for every returned replicate -- the exact
+        change vector this function already computed while scoring that
+        candidate, which the caller would otherwise have to recompute (via
+        merge_replicate()'s diff_change_vector() approximation) despite it
+        being sitting right here. See merge_replicate_exact(), the intended
+        consumer. None (default): behaves exactly as before this parameter
+        existed -- purely additive, no existing caller needs to change.
 
     Returns {id(individual): [new_sol, ...]}, matching what looping
     directed_evolution() per individual would return (list length up to
@@ -431,12 +507,12 @@ def directed_evolution_batch(
 
     vecs_list = batch_calculate_change_vectors(candidates, analysis_objects, locvec, xp=xp, progress_every=progress_every)
 
-    best_alt = {}  # (key, position) -> (best_alt, best_score)
+    best_alt = {}  # (key, position) -> (best_alt, best_score, vecs)
     for (key, position, alt), vecs in zip(candidate_owner, vecs_list):
         score = score_changevec(vecs, weights)
         current = best_alt.get((key, position))
         if current is None or score < current[1]:
-            best_alt[(key, position)] = (alt, score)
+            best_alt[(key, position)] = (alt, score, vecs)
 
     results = {}
     for ind in individuals:
@@ -450,6 +526,8 @@ def directed_evolution_batch(
             new_sol = sol.copy()
             new_sol[position] = entry[0]
             reps.append(new_sol)
+            if vecs_out is not None:
+                vecs_out[tuple(new_sol)] = entry[2]
         results[key] = reps
     return results
 
@@ -503,7 +581,7 @@ def select_survivors(pop: list, weights: dict, target_size: int) -> list:
     return [p for i, p in enumerate(pop) if i not in victim_indices]
 
 
-def _flatten_round(pop: list, aa_seq: str, analysis_objects: AnalysisObjects, locvec: list = None) -> list:
+def _flatten_round(pop: list, aa_seq: str, analysis_objects: AnalysisObjects, locvec: list = None, xp=None) -> list:
     """One round of flatten_generation's cash-in: every individual's
     round-start replicate count is redistributed, one unit at a time, onto
     a randomly-drawn single-mutation neighbor (incrementing it if already
@@ -514,6 +592,15 @@ def _flatten_round(pop: list, aa_seq: str, analysis_objects: AnalysisObjects, lo
     exactly one unit added somewhere else). flatten_generation's *final*
     collapse-to-1 step is not part of this -- that intentionally changes
     the total to match the distinct-individual count, by design.
+
+    xp: array module (numpy or cupy) to batch every brand-new neighbor's
+    change vector into one batch_calculate_change_vectors() call at the end
+    of the round, instead of one calculate_change_vector() call per new
+    neighbor as they're drawn -- the identical one-exact-call-per-new-
+    genotype shape merge_replicates_batch() batches for growth (see its
+    docstring), except every neighbor here is already exact (no diffing),
+    so batching it is a pure speed win with no accuracy trade-off. None
+    (default) keeps the original per-neighbor exact loop unchanged.
     """
     pop = list(pop)
     by_codons = {tuple(p.codons): p for p in pop}
@@ -523,6 +610,8 @@ def _flatten_round(pop: list, aa_seq: str, analysis_objects: AnalysisObjects, lo
     # individual's draws this same round, contradicting the "only cashes in
     # its round-start count" contract.
     starting_counts = {tuple(p.codons): p.number for p in pop}
+    pending_counts = {}  # key -> cash-in count, for brand-new genotypes not yet given a change vector
+    pending_order = []
     for p in list(pop):
         cash_in = starting_counts[tuple(p.codons)]
         if cash_in <= 0:
@@ -537,11 +626,24 @@ def _flatten_round(pop: list, aa_seq: str, analysis_objects: AnalysisObjects, lo
             existing = by_codons.get(key)
             if existing is not None:
                 existing.number += 1
+            elif xp is not None:
+                if key not in pending_counts:
+                    pending_counts[key] = 0
+                    pending_order.append(neighbor)
+                pending_counts[key] += 1
             else:
                 vecs = calculate_change_vector(neighbor, analysis_objects, locvec)
                 new_ind = Proposed_Solution(neighbor, 1, vecs)
                 by_codons[key] = new_ind
                 pop.append(new_ind)
+
+    if xp is not None and pending_order:
+        vecs_list = batch_calculate_change_vectors(pending_order, analysis_objects, locvec, xp=xp)
+        for neighbor, vecs in zip(pending_order, vecs_list):
+            new_ind = Proposed_Solution(neighbor, pending_counts[tuple(neighbor)], vecs)
+            by_codons[tuple(neighbor)] = new_ind
+            pop.append(new_ind)
+
     return [p for p in pop if p.number > 0]
 
 
@@ -551,6 +653,7 @@ def flatten_generation(
     analysis_objects: AnalysisObjects,
     locvec: list = None,
     recursion_limit: int = 3,
+    xp=None,
 ) -> list:
     """Trade replicate-count concentration for search breadth.
 
@@ -564,10 +667,14 @@ def flatten_generation(
 
     An individual with no viable neighbors (e.g. every position is a
     single-codon amino acid) is left untouched rather than cashed in.
+
+    xp: array module (numpy or cupy), passed through to _flatten_round() to
+    batch new-neighbor change-vector computation -- see its docstring. None
+    (default) keeps the original per-neighbor path.
     """
     pop = list(pop)
     for _ in range(recursion_limit):
-        pop = _flatten_round(pop, aa_seq, analysis_objects, locvec)
+        pop = _flatten_round(pop, aa_seq, analysis_objects, locvec, xp=xp)
 
     for p in pop:
         p.number = 1
@@ -671,16 +778,14 @@ def run_ga(
         batched across the whole generation instead of
         diff_change_vector()'s cheaper-per-call-but-many-calls excerpt
         approximation -- measurably more accurate, numerically different
-        results. seeding and refresh_change_vectors see a large real-scale
-        speedup from this (25-48x measured, see Handoff.md sec 6 -- Kmer is
-        batched too, not just the other 4 terms). growth's own end-to-end
-        speedup is more modest (~3x measured): its best-alternative scoring
-        is now cheap, but merge_replicate()'s per-replicate storage diffing
-        (unaffected by xp, still one diff_change_vector() call per accepted
-        replicate) is now what dominates growth's cost instead -- see
-        directed_evolution_batch()'s docstring. lookahead=False growth is
-        unaffected by xp either way -- it was already cheap (no
-        per-alternative scoring to batch).
+        results. Storage of both directed and random-mutation replicates is
+        now batched too when xp is set (merge_replicate_exact()/
+        merge_replicates_batch(), instead of one merge_replicate() ->
+        diff_change_vector() call per replicate) -- this used to be
+        growth's actual dominant cost once scoring itself got fast (see
+        Handoff.md sec 5/6), not touched by xp until now. lookahead=False
+        growth is unaffected by xp either way -- it was already cheap (no
+        per-alternative scoring or exact storage to batch).
     progress: if True, print per-generation timing (seeding, growth,
         refresh, select, each separately) plus population size before/after
         -- diagnostic only, meant for tracking down which phase a slow or
@@ -713,7 +818,7 @@ def run_ga(
             if progress:
                 _t0 = _time.perf_counter()
             pop = refresh_change_vectors(pop, analysis_objects, locvec, xp=xp, progress_every=progress_every)
-            pop = flatten_generation(pop, aa_seq, analysis_objects, locvec, flatten_recursion_limit)
+            pop = flatten_generation(pop, aa_seq, analysis_objects, locvec, flatten_recursion_limit, xp=xp)
             if progress:
                 print(f"[run_ga]   flatten: pop={len(pop)} in {_time.perf_counter() - _t0:.2f}s", flush=True)
 
@@ -737,21 +842,31 @@ def run_ga(
             # keeps the same one-random.random()-per-individual-in-pop-order
             # sequence as the per-individual path below; what changes is
             # that directed individuals' replicates are all scored in one
-            # batched pass instead of individually.
+            # batched pass instead of individually, AND (below) storage of
+            # both kinds of replicate is now batched too instead of one
+            # merge_replicate() call each -- see merge_replicate_exact()/
+            # merge_replicates_batch()'s docstrings: after Kmer batching,
+            # this per-replicate storage diffing became growth's actual
+            # dominant cost (12.25s vs. 1.45s scoring for ~10,000
+            # candidates -- Handoff.md sec 5/6), not anything scoring
+            # touches.
             is_random = [random.random() < 0.5 for _ in pop]
             random_individuals = [p for p, r in zip(pop, is_random) if r]
             directed_individuals = [p for p, r in zip(pop, is_random) if not r]
 
+            random_reps = []
             for p in random_individuals:
-                for rep in replicate_and_mutate_random(p.codons, aa_seq):
-                    merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
+                random_reps.extend(replicate_and_mutate_random(p.codons, aa_seq))
+            merge_replicates_batch(pop_index, random_reps, analysis_objects, locvec, xp, progress_every=progress_every)
 
+            vecs_out = {}
             batch_reps = directed_evolution_batch(
                 directed_individuals, weights, aa_seq, analysis_objects, locvec, xp=xp, progress_every=progress_every,
+                vecs_out=vecs_out,
             )
             for p in directed_individuals:
                 for rep in batch_reps[id(p)]:
-                    merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
+                    merge_replicate_exact(pop_index, rep, vecs_out[tuple(rep)])
         else:
             for i, p in enumerate(pop):
                 if random.random() < 0.5:

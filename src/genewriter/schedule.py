@@ -46,18 +46,18 @@ batched computation instead of the per-individual loop: pass
 25-48x speedup on real hardware for that path (see Handoff.md sec 6 -- all
 5 terms are batched now, including Kmer).
 
-"growth" benefits less than that number might suggest. When xp is set and
-a "growth" step's `lookahead` is True (the default), *choosing* each
-replicate's best synonymous alternative is also batched (see
+"growth" used to benefit less than that number might suggest. When xp is
+set and a "growth" step's `lookahead` is True (the default), *choosing*
+each replicate's best synonymous alternative is also batched (see
 ga.directed_evolution_batch()) -- this was originally the actual real-scale
 bottleneck (~20-27 individuals/sec, tens of times slower per individual
-than the batched refresh path). But "growth"'s new-genotype *storage* is
-still unbatched: each accepted replicate's change_vecs is still diffed
-from its parent one at a time (merge_replicate()), untouched by xp -- and
-once the alternative-scoring itself got fast, that per-replicate storage
-diffing became the new dominant cost, capping growth's real end-to-end
-speedup at ~3x measured (see directed_evolution_batch()'s docstring and
-Handoff.md sec 6), not the 25-48x the refresh path sees.
+than the batched refresh path). "growth"'s new-genotype *storage* is now
+batched too when xp is set (ga.merge_replicate_exact()/
+ga.merge_replicates_batch(), instead of diffing each accepted replicate
+from its parent one at a time via merge_replicate()) -- once the
+alternative-scoring itself got fast, that per-replicate storage diffing had
+become the new dominant cost (see directed_evolution_batch()'s docstring
+and Handoff.md sec 5/6 for the profiling that found it).
 """
 
 import random
@@ -71,6 +71,8 @@ from .ga import (
     generate_seed,
     kill_off,
     merge_replicate,
+    merge_replicate_exact,
+    merge_replicates_batch,
     refresh_change_vectors,
     replicate_and_mutate_random,
     save_gen,
@@ -174,8 +176,10 @@ def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
     docstring. When ctx.xp is set and lookahead=True, *which* synonymous
     alternative gets chosen is instead decided by a batched exact
     recompute across every directed individual in this step at once (see
-    ga.directed_evolution_batch()) -- this is the real bottleneck at
-    real scale, not the diffed storage step -- see module docstring."""
+    ga.directed_evolution_batch()), and storage of both directed and
+    random-mutation replicates is batched too (see
+    ga.merge_replicate_exact()/ga.merge_replicates_batch()) -- see module
+    docstring."""
     rate = params.get("rate", 10)
     mutation_chance = params.get("mutation_chance", 0.05)
     directed_fraction = params.get("directed_fraction", 0.5)
@@ -192,17 +196,19 @@ def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
         directed_individuals = [p for p, d in zip(pop, is_directed) if d]
         random_individuals = [p for p, d in zip(pop, is_directed) if not d]
 
+        random_reps = []
         for p in random_individuals:
-            for rep in replicate_and_mutate_random(p.codons, ctx.aa_seq, nreplicates=rate, mutation_rate=mutation_chance):
-                merge_replicate(pop_index, rep, ctx.analysis_objects, ctx.locvec, parent=p)
+            random_reps.extend(replicate_and_mutate_random(p.codons, ctx.aa_seq, nreplicates=rate, mutation_rate=mutation_chance))
+        merge_replicates_batch(pop_index, random_reps, ctx.analysis_objects, ctx.locvec, ctx.xp, progress_every=ctx.progress_every)
 
+        vecs_out = {}
         batch_reps = directed_evolution_batch(
             directed_individuals, ctx.weights, ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
-            nreplicates=rate, xp=ctx.xp, progress_every=ctx.progress_every,
+            nreplicates=rate, xp=ctx.xp, progress_every=ctx.progress_every, vecs_out=vecs_out,
         )
         for p in directed_individuals:
             for rep in batch_reps[id(p)]:
-                merge_replicate(pop_index, rep, ctx.analysis_objects, ctx.locvec, parent=p)
+                merge_replicate_exact(pop_index, rep, vecs_out[tuple(rep)])
     else:
         if ctx.progress_every:
             import time as _time
@@ -262,11 +268,16 @@ def _step_select(pop: list, ctx: ScheduleContext, params: dict) -> list:
 @register_step("flatten")
 def _step_flatten(pop: list, ctx: ScheduleContext, params: dict) -> list:
     """Trade replicate-count concentration for neighborhood breadth.
-    `recursion_limit` (default 3). See ga.flatten_generation(). Refreshes
-    change vectors exactly first -- see module docstring."""
+    `recursion_limit` (default 3). See ga.flatten_generation(), which this
+    threads ctx.xp into -- when set, every new neighbor genotype created
+    this step gets its change vector via one batched
+    batch_calculate_change_vectors() call instead of one
+    calculate_change_vector() call each (see ga._flatten_round()'s
+    docstring). Refreshes change vectors exactly first -- see module
+    docstring."""
     recursion_limit = params.get("recursion_limit", 3)
     pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
-    return flatten_generation(pop, ctx.aa_seq, ctx.analysis_objects, ctx.locvec, recursion_limit)
+    return flatten_generation(pop, ctx.aa_seq, ctx.analysis_objects, ctx.locvec, recursion_limit, xp=ctx.xp)
 
 
 @register_step("save")

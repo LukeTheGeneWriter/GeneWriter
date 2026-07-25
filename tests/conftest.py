@@ -172,4 +172,7 @@ def analysis_objects(rare_codon_analysis, codon_usage_analysis, codon_pair_bias_
 
 @pytest.fixture
 def weights():
-    return {'RareCodons': 1.0, 'CodonUsage': 1.0, 'CodonPairBias': 1.0, 'GC': 1.0, 'Kmer': 1.0}
+    # Uracil defaults to 0.0 (computed but ignored in scoring) so adding the
+    # term doesn't perturb any existing test's selection/scoring outcome --
+    # tests targeting the term itself use a nonzero weight deliberately.
+    return {'RareCodons': 1.0, 'CodonUsage': 1.0, 'CodonPairBias': 1.0, 'GC': 1.0, 'Kmer': 1.0, 'Uracil': 0.0}
