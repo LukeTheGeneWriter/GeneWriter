@@ -111,7 +111,8 @@ CONFIG = dict(
     ORGANISM="human",
 
     # ------------------------------------------------------------------
-    # Which real gene/isoform to run against
+    # Which real gene/isoform to run against -- only used when
+    # TARGET_MODE="gene" (see below).
     # ------------------------------------------------------------------
     # geneID (int, matches NaturalGene.geneID) to target, or None to just
     # use the first protein-coding isoform found in GENE_OBJ_DIR.
@@ -119,6 +120,49 @@ CONFIG = dict(
     # Which isoform of that gene (index into its protein-coding isoforms,
     # in the order gene_io.protein_coding_isoforms() yields them). 0 = first.
     ISOFORM_INDEX=0,
+
+    # ------------------------------------------------------------------
+    # Optimization target: a real gene/isoform ("gene", default -- uses
+    # GENE_ID/ISOFORM_INDEX above) or an arbitrary user-supplied protein
+    # sequence ("custom" -- bypasses gene lookup entirely, GENE_OBJ_DIR
+    # doesn't even need to exist).
+    # ------------------------------------------------------------------
+    TARGET_MODE="gene",
+    # Required if TARGET_MODE="custom". Validated via
+    # codon_tables.validate_aa_sequence() -- every character must be one of
+    # the 20 standard amino acids; '*' (stop codon) anywhere raises, since
+    # this convention's aa_seq never carries a trailing stop symbol.
+    CUSTOM_AA_SEQ=None,
+    # Per-position 'F'/'T'/'I'/'S' exon-location tags for CUSTOM_AA_SEQ, or
+    # None -> all 'I' (generic interior coding sequence -- same default
+    # calculate_change_vector itself uses when it has no real exon-boundary
+    # information). Must match len(CUSTOM_AA_SEQ) if given.
+    CUSTOM_LOCVEC=None,
+
+    # ------------------------------------------------------------------
+    # Initial-population seeding strategy -- affects RUN_GA_OPTIONS'
+    # `seeds` list and (when RUN_MODE="schedule") the "input" step's
+    # ctx.seed_fn.
+    # ------------------------------------------------------------------
+    # "uniform" (ga.generate_seed -- pure random synonymous choice per
+    # residue, unchanged default) or "ngram" (codon_ngram.
+    # sample_codon_ngram_seed -- samples from codon usage patterns learned
+    # from real genes, conditioned on local amino-acid context, restricted
+    # to interior ('I'-tagged) codon windows by default). IMPORTANT: the
+    # ngram model is only scientifically meaningful once
+    # GeneDataSourcing.ipynb's check_cds_against_protein fix (already
+    # applied to the notebook) has ALSO been used to regenerate the actual
+    # gene JSON data -- against data generated before that fix, "ngram"
+    # will run without error but won't have learned anything meaningful
+    # (see codon_ngram.py's module docstring).
+    SEED_STRATEGY="uniform",
+    # Path to a precomputed CodonNgramModel JSON (via codon_ngram.
+    # save_codon_ngram_model/load_codon_ngram_model). None builds one on
+    # the fly from GENE_OBJ_DIR when SEED_STRATEGY="ngram" -- slow-ish for
+    # a large gene set, same caveat as COMPUTE_LOCAL_BASELINES.
+    NGRAM_MODEL_PATH=None,
+    NGRAM_CONTEXT_ORDERS=(6, 5, 4, 3, 2, 1),
+    NGRAM_MIN_OBSERVATIONS=5,
 
     # ------------------------------------------------------------------
     # Change-vector term weights -- one entry per registered term. Must
@@ -344,10 +388,27 @@ def load_gene_data(cfg):
 
 
 def pick_target(cfg, genes):
-    """Returns (aa_seq, locvec) for the configured GENE_ID/ISOFORM_INDEX --
-    locvec is the real 'F'/'T'/'I'/'S' location tag per residue, taken
-    straight from the chosen isoform's codon list rather than defaulted to
-    all-'I'."""
+    """Returns (aa_seq, locvec) for either a custom sequence
+    (TARGET_MODE="custom", bypasses gene lookup entirely -- `genes` is
+    accepted but never touched) or the configured GENE_ID/ISOFORM_INDEX
+    (TARGET_MODE="gene", default) -- locvec is the real 'F'/'T'/'I'/'S'
+    location tag per residue, taken straight from the chosen isoform's
+    codon list rather than defaulted to all-'I'."""
+    if cfg["TARGET_MODE"] == "custom":
+        from genewriter.codon_tables import validate_aa_sequence
+
+        if not cfg["CUSTOM_AA_SEQ"]:
+            raise ValueError("TARGET_MODE='custom' requires CUSTOM_AA_SEQ to be set")
+        aa_seq = validate_aa_sequence(cfg["CUSTOM_AA_SEQ"])
+        locvec = cfg["CUSTOM_LOCVEC"] if cfg["CUSTOM_LOCVEC"] is not None else ["I"] * len(aa_seq)
+        if len(locvec) != len(aa_seq):
+            raise ValueError(f"CUSTOM_LOCVEC length ({len(locvec)}) must match CUSTOM_AA_SEQ length ({len(aa_seq)})")
+        print(f"Target: custom sequence, {len(aa_seq)} residues (no gene lookup)")
+        return aa_seq, locvec
+
+    if cfg["TARGET_MODE"] != "gene":
+        raise ValueError(f"Unknown TARGET_MODE: {cfg['TARGET_MODE']!r} (must be 'gene' or 'custom')")
+
     from genewriter.gene_io import protein_coding_isoforms
 
     candidates = list(protein_coding_isoforms(genes))
@@ -479,7 +540,40 @@ def _resolve_pipeline_xp(cfg, xp_gpu):
     raise ValueError(f"Unknown PIPELINE_XP_BACKEND: {backend!r} (must be 'gpu', 'numpy', or 'none')")
 
 
-def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu):
+def _build_seed_fn(cfg, genes):
+    """Returns a callable aa_seq -> list[codon_str] per SEED_STRATEGY.
+    "uniform" (default) is ga.generate_seed, unchanged. "ngram" loads (if
+    NGRAM_MODEL_PATH is set) or builds (from genes, otherwise) a
+    CodonNgramModel and returns a partial around
+    codon_ngram.sample_codon_ngram_seed -- see that module's docstring for
+    why this is only scientifically meaningful against gene data generated
+    after GeneDataSourcing.ipynb's check_cds_against_protein fix."""
+    if cfg["SEED_STRATEGY"] == "uniform":
+        from genewriter.ga import generate_seed
+        return generate_seed
+
+    if cfg["SEED_STRATEGY"] == "ngram":
+        import functools
+
+        from genewriter.codon_ngram import (
+            build_codon_ngram_model, load_codon_ngram_model, sample_codon_ngram_seed,
+        )
+
+        if cfg["NGRAM_MODEL_PATH"]:
+            model = load_codon_ngram_model(cfg["NGRAM_MODEL_PATH"])
+            print(f"Loaded codon n-gram model from {cfg['NGRAM_MODEL_PATH']}")
+        else:
+            print("Building codon n-gram model from GENE_OBJ_DIR (SEED_STRATEGY='ngram', "
+                  "no NGRAM_MODEL_PATH set)...")
+            model = build_codon_ngram_model(
+                genes, organism=cfg["ORGANISM"], context_orders=cfg["NGRAM_CONTEXT_ORDERS"],
+            )
+        return functools.partial(sample_codon_ngram_seed, model=model, min_observations=cfg["NGRAM_MIN_OBSERVATIONS"])
+
+    raise ValueError(f"Unknown SEED_STRATEGY: {cfg['SEED_STRATEGY']!r} (must be 'uniform' or 'ngram')")
+
+
+def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
     from genewriter.change_vector import registered_terms, require_weights
     require_weights(registered_terms().keys(), cfg["WEIGHTS"])
 
@@ -487,8 +581,10 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu):
     xp_label = "none (per-individual)" if xp is None else getattr(xp, "__name__", str(xp))
     print(f"\n=== Step 3: running actual pipeline (mode={cfg['RUN_MODE']!r}, xp={xp_label}) ===")
 
+    seed_fn = _build_seed_fn(cfg, genes)
+
     if cfg["RUN_MODE"] == "run_ga":
-        from genewriter.ga import generate_seed, run_ga
+        from genewriter.ga import run_ga
 
         opts = dict(cfg["RUN_GA_OPTIONS"])
         opts["locvec"] = locvec  # override the placeholder None with the real tags
@@ -496,7 +592,7 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu):
         opts["progress"] = cfg["PROGRESS"]
         opts["progress_every"] = cfg["PROGRESS_EVERY"]
         num_seeds = opts.pop("num_seeds", 200)
-        seeds = [generate_seed(aa_seq) for _ in range(num_seeds)]
+        seeds = [seed_fn(aa_seq) for _ in range(num_seeds)]
 
         t0 = time.perf_counter()
         final_pop = run_ga(aa_seq, seeds, cfg["WEIGHTS"], analysis_objects, **opts)
@@ -509,7 +605,7 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu):
         final_pop = run_schedule(
             aa_seq, cfg["WEIGHTS"], analysis_objects, cfg["SCHEDULE"],
             locvec=locvec, save_dir=cfg["SCHEDULE_SAVE_DIR"], run_name=cfg["SCHEDULE_RUN_NAME"], xp=xp,
-            progress=cfg["PROGRESS"], progress_every=cfg["PROGRESS_EVERY"],
+            progress=cfg["PROGRESS"], progress_every=cfg["PROGRESS_EVERY"], seed_fn=seed_fn,
         )
         elapsed = time.perf_counter() - t0
 
@@ -536,7 +632,7 @@ def main(cfg=CONFIG):
         run_batch_benchmark(cfg, aa_seq, locvec, analysis_objects, xp_gpu, gpu_label)
 
     if cfg["RUN_PIPELINE"]:
-        run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu)
+        run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes)
 
 
 if __name__ == "__main__":
@@ -559,4 +655,4 @@ if __name__ == "__main__":
 #   # cell 2 (seconds -- re-run freely while iterating on GENE_ID etc.)
 #   CONFIG["GENE_ID"] = 326
 #   aa_seq, locvec = pick_target(CONFIG, genes)
-#   run_pipeline(CONFIG, aa_seq, locvec, analysis_objects, xp_gpu)
+#   run_pipeline(CONFIG, aa_seq, locvec, analysis_objects, xp_gpu, genes)

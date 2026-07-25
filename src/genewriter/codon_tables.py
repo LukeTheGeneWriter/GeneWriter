@@ -76,6 +76,46 @@ def generate_codon_vec(aa_seq: str) -> list:
     return [codon_choices_for_aa(aa) for aa in aa_seq.upper()]
 
 
+# The 20 standard single-letter amino acid codes -- AA_CODONS' keys minus
+# '*' (the stop-codon entry). Shared by aa_motif_index.py's query
+# validation and any caller accepting a custom protein sequence (e.g.
+# scripts/colab_stress_test.py's custom-target input), so both reject the
+# same characters the same way instead of maintaining separate validators
+# that could silently drift apart.
+STANDARD_AMINO_ACIDS = frozenset(AA_CODONS) - {'*'}
+
+
+def validate_aa_sequence(aa_seq: str) -> str:
+    """Uppercase and validate aa_seq as a codon-optimization-ready protein
+    sequence -- every character must be in STANDARD_AMINO_ACIDS.
+
+    '*' is rejected explicitly rather than silently stripped or allowed
+    mid-sequence: GeneWriter's aa_seq convention (matching NaturalGene
+    isoforms' associatedProtein.aaSeq, which never carries a trailing stop
+    symbol) has no place for it, and guessing "strip a trailing '*'" would
+    be silently resolving an ambiguous input rather than failing loud -- a
+    caller whose source sequence has a trailing stop marker must strip it
+    themselves before calling this.
+
+    Raises ValueError naming the first invalid character and its 0-based
+    position (a distinct message for '*', since that's a specific,
+    explainable rejection rather than "not a recognized amino acid").
+    Raises ValueError on an empty string.
+    """
+    if not aa_seq:
+        raise ValueError("aa_seq must not be empty")
+    aa_seq = aa_seq.upper()
+    for i, ch in enumerate(aa_seq):
+        if ch == '*':
+            raise ValueError(
+                f"aa_seq contains '*' (stop codon) at position {i} -- this convention's aa_seq "
+                f"never carries a stop symbol; strip it from your input before calling this."
+            )
+        if ch not in STANDARD_AMINO_ACIDS:
+            raise ValueError(f"Invalid amino acid {ch!r} at position {i}: must be one of {sorted(STANDARD_AMINO_ACIDS)}")
+    return aa_seq
+
+
 def _variable_flags(codon: str) -> tuple:
     """Which of a codon's 3 bases can even change under a synonymous swap.
 

@@ -24,6 +24,29 @@ def test_step_input_adds_the_requested_number_of_seeds(ctx):
     assert all(isinstance(p, Proposed_Solution) for p in result)
 
 
+def test_step_input_uses_default_seed_fn_when_unset(ctx, aa_seq):
+    # Regression guard: ctx.seed_fn defaults to None -> generate_seed,
+    # unchanged behavior -- every produced genotype must be a well-formed
+    # random seed for aa_seq (same shape ga.generate_seed produces).
+    result = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
+    for p in result:
+        assert len(p.codons) == len(aa_seq)
+
+
+def test_step_input_uses_custom_seed_fn_when_provided(aa_seq, analysis_objects, weights):
+    fixed_sol = [c[0] for c in generate_codon_vec(aa_seq)]
+    custom_ctx = sched.ScheduleContext(
+        aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects,
+        seed_fn=lambda aa_seq: list(fixed_sol),
+    )
+    result = sched.run_steps([], custom_ctx, [{"kind": "input", "count": 5}])
+    # All 5 draws are the identical fixed genotype -- should merge into one
+    # Proposed_Solution with number=5, not 5 distinct (random) entries.
+    assert len(result) == 1
+    assert result[0].codons == fixed_sol
+    assert result[0].number == 5
+
+
 def test_step_input_merges_into_existing_population_rather_than_replacing_it(ctx, aa_seq, analysis_objects):
     existing_sol = [c[0] for c in generate_codon_vec(aa_seq)]
     existing = Proposed_Solution(existing_sol, 7, calculate_change_vector(existing_sol, analysis_objects))

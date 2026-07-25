@@ -2,7 +2,16 @@ import random
 
 import pytest
 
-from genewriter.classes import CodonAnalysis, CodonPairBiasAnalysis, GCAnalysis, KmerAnalysis, RareCodonAnalysis
+from genewriter.classes import (
+    CodonAnalysis,
+    CodonPairBiasAnalysis,
+    GCAnalysis,
+    IsoformGeneBody,
+    KmerAnalysis,
+    NaturalGene,
+    ProteinObj,
+    RareCodonAnalysis,
+)
 from genewriter.change_vector import AnalysisObjects
 from genewriter.codon_tables import CODON_FREQS_LIT, CODON_TO_AA, generate_codon_vec
 
@@ -12,6 +21,51 @@ AA_SEQ = "MAVLDEFGHIKPQRSTWYCN" * 2  # 40 residues, all 20 standard amino acids 
 def random_solution(aa_seq, seed=0):
     rng = random.Random(seed)
     return [rng.choice(choices) for choices in generate_codon_vec(aa_seq)]
+
+
+def make_synthetic_isoform(aa_seq: str, codon_choice_fn, loc_tags: list, isoform_number: str = "1") -> IsoformGeneBody:
+    """Build an IsoformGeneBody with codons[i] guaranteed to correspond to
+    aa_seq[i] by construction -- codon_choice_fn(aa, i) picks the codon for
+    each position (e.g. `lambda aa, i: codon_choices_for_aa(aa)[0]` for a
+    deterministic "always first synonym" fixture, or something
+    randomized+seeded). loc_tags: list[str] of 'F'/'T'/'I'/'S', same length
+    as aa_seq.
+
+    This is the ONLY sanctioned way tests get codons<->aaSeq alignment --
+    never trust it from a loaded JSON file (GeneDataSourcing.ipynb's
+    check_cds_against_protein bug broke that alignment for every gene JSON
+    generated before the fix; regenerating that data is a separate,
+    out-of-session step, so no local sample data can be trusted for this
+    either)."""
+    assert len(loc_tags) == len(aa_seq), "loc_tags must be the same length as aa_seq"
+    codons = [[codon_choice_fn(aa, i), loc_tags[i]] for i, aa in enumerate(aa_seq)]
+    return IsoformGeneBody(
+        isoformNumber=isoform_number,
+        associatedProtein=ProteinObj(aaSeq=aa_seq, protWeight=0.0, associatedGeneID=0),
+        fullSequence="",
+        mRNASeq="",
+        codons=codons,
+        relativeAbundance=1.0,
+        geneBody=[],
+    )
+
+
+def make_synthetic_gene(gene_id: int, isoforms: list, gene_name: str = "SYN") -> NaturalGene:
+    """Wrap a list of IsoformGeneBody (e.g. from make_synthetic_isoform)
+    into a NaturalGene, filling in required-but-unused fields with dummy
+    values -- protein_coding_isoforms() and everything downstream of it
+    only ever reads .isoforms/.geneID/.geneName."""
+    return NaturalGene(
+        isoforms=isoforms,
+        geneID=gene_id,
+        geneName=gene_name,
+        organism="test",
+        DNASequence="",
+        spliceAIDonor=[],
+        spliceAIReceptor=[],
+        energetics={},
+        chromosome=0,
+    )
 
 
 @pytest.fixture

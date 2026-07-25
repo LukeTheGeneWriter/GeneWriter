@@ -1,3 +1,5 @@
+import pytest
+
 from genewriter.codon_tables import (
     AA_CODONS,
     CODON_FREQ_BY_INDEX,
@@ -10,9 +12,11 @@ from genewriter.codon_tables import (
     IS_RARE_BY_INDEX,
     RARE_CODON_INDICES,
     RARE_CODONS_LIT,
+    STANDARD_AMINO_ACIDS,
     VARIABLE_FLAGS_BY_INDEX,
     decode_codons,
     encode_codons,
+    validate_aa_sequence,
 )
 
 
@@ -78,3 +82,30 @@ def test_index_tables_agree_with_their_dict_counterparts_for_every_codon():
 def test_rare_codon_indices_matches_is_rare_by_index():
     from_indices = {i for i in range(64) if IS_RARE_BY_INDEX[i]}
     assert from_indices == set(RARE_CODON_INDICES)
+
+
+def test_standard_amino_acids_is_aa_codons_minus_stop():
+    assert STANDARD_AMINO_ACIDS == set(AA_CODONS) - {'*'}
+    assert len(STANDARD_AMINO_ACIDS) == 20
+    assert '*' not in STANDARD_AMINO_ACIDS
+
+
+def test_validate_aa_sequence_accepts_and_uppercases_valid_sequence():
+    assert validate_aa_sequence("mklker") == "MKLKER"
+    assert validate_aa_sequence("MKLKER") == "MKLKER"
+
+
+def test_validate_aa_sequence_rejects_invalid_character_with_position():
+    with pytest.raises(ValueError, match=r"'X'.*position 3"):
+        validate_aa_sequence("MKLXER")
+
+
+def test_validate_aa_sequence_rejects_star_anywhere():
+    for seq in ("*MKLKER", "MKL*KER", "MKLKER*"):
+        with pytest.raises(ValueError, match=r"\*"):
+            validate_aa_sequence(seq)
+
+
+def test_validate_aa_sequence_rejects_empty_string():
+    with pytest.raises(ValueError, match="empty"):
+        validate_aa_sequence("")

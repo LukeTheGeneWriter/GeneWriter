@@ -130,6 +130,34 @@ class KmerAnalysis:
 
 
 @dataclass
+class AAMotifIndex:
+    """Amino-acid subsequence ("motif") occurrence counts across a
+    proteome, for a fixed range of lengths -- see aa_motif_index.py.
+    Unlike KmerAnalysis, this is unrestricted by codon location tag (the
+    report tool built on this answers "how common is this motif overall",
+    not a codon-choice model)."""
+    organism: str
+    transcriptome: str
+    k_values: tuple
+    motif_counts: dict   # motif_counts[str(k)][motif_str] -> occurrence count
+    total_windows: dict  # total_windows[str(k)] -> windows scanned, for a future frequency-rate use
+
+
+@dataclass
+class CodonNgramModel:
+    """Codon-choice distribution conditioned on local amino-acid context,
+    learned from natural genes' interior ('I'-tagged) codon positions by
+    default -- see codon_ngram.py. context_orders is descending
+    (longest-first); context_counts[str(k)][aa_context] -> {codon: count},
+    where aa_context is the k-length AA substring ending at (and
+    including) the position being predicted."""
+    organism: str
+    transcriptome: str
+    context_orders: tuple
+    context_counts: dict
+
+
+@dataclass
 class EnergeticAnalysis:
     organism: str
     transcriptome: str

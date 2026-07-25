@@ -121,6 +121,13 @@ class ScheduleContext:
     # behavior.
     progress: bool = False
     progress_every: int = None
+    # Callable aa_seq -> list[codon_str], used by the "input" step to
+    # generate each new seed genotype. None (default) uses ga.generate_seed
+    # -- unchanged behavior. Pass e.g.
+    # functools.partial(codon_ngram.sample_codon_ngram_seed, model=model)
+    # to seed from a trained CodonNgramModel instead -- same opt-in pattern
+    # as xp above.
+    seed_fn: object = None
 
 
 @register_step("input")
@@ -134,9 +141,12 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     ctx.xp) pass over the new seeds -- rather than one merge_replicate()
     call per seed; this is the step where a large ctx.xp batch pays off
     most, since none of these genotypes has a parent to cheaply diff
-    against."""
+    against. Seeds come from ctx.seed_fn (ga.generate_seed by default --
+    see ScheduleContext.seed_fn) rather than a hardcoded call, so a trained
+    codon_ngram.CodonNgramModel can be substituted."""
     count = params["count"]
-    new_seeds = [generate_seed(ctx.aa_seq) for _ in range(count)]
+    seed_fn = ctx.seed_fn or generate_seed
+    new_seeds = [seed_fn(ctx.aa_seq) for _ in range(count)]
     new_index = seed_population(new_seeds, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
 
     pop_index = {tuple(p.codons): p for p in pop}
@@ -312,6 +322,7 @@ def run_schedule(
     xp=None,
     progress: bool = False,
     progress_every: int = None,
+    seed_fn=None,
 ) -> list:
     """Run a declarative schedule end to end and return the final population.
 
@@ -326,8 +337,11 @@ def run_schedule(
     progress / progress_every: diagnostic-only step-level and
         individual-level progress logging -- see ScheduleContext. Both
         default off/None, matching the original silent behavior.
+    seed_fn: callable aa_seq -> list[codon_str] used by "input" to generate
+        new seeds -- see ScheduleContext.seed_fn. None (default) uses
+        ga.generate_seed.
     """
     ctx = ScheduleContext(aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects,
                            locvec=locvec, save_dir=save_dir, run_name=run_name, xp=xp,
-                           progress=progress, progress_every=progress_every)
+                           progress=progress, progress_every=progress_every, seed_fn=seed_fn)
     return run_steps([], ctx, schedule)
