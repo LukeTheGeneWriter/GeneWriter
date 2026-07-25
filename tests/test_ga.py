@@ -1,7 +1,8 @@
+import numpy as np
 import pytest
 
 from genewriter import ga
-from genewriter.change_vector import calculate_change_vector
+from genewriter.change_vector import calculate_change_vector, score_changevec
 from genewriter.classes import Proposed_Solution
 from genewriter.codon_tables import generate_codon_vec
 
@@ -107,6 +108,112 @@ def test_directed_evolution_lookahead_false_never_calls_the_expensive_scorer(aa_
 
     monkeypatch.setattr(ga_module, "diff_change_vector", _boom)
     ga.directed_evolution(sol, vecs, weights, aa_seq, analysis_objects, nreplicates=5, lookahead=False)
+
+
+def _make_individual(aa_seq, analysis_objects):
+    codons = ga.generate_seed(aa_seq)
+    return Proposed_Solution(codons, 1, calculate_change_vector(codons, analysis_objects))
+
+
+def test_directed_evolution_batch_produces_valid_replicates(aa_seq, analysis_objects, weights):
+    individuals = [_make_individual(aa_seq, analysis_objects) for _ in range(4)]
+    results = ga.directed_evolution_batch(individuals, weights, aa_seq, analysis_objects, nreplicates=5, xp=np)
+
+    valid_codons = {c for choices in generate_codon_vec(aa_seq) for c in choices}
+    for ind in individuals:
+        reps = results[id(ind)]
+        assert len(reps) <= 5
+        for rep in reps:
+            assert len(rep) == len(ind.codons)
+            assert all(c in valid_codons for c in rep)
+            diffs = [i for i in range(len(rep)) if rep[i] != ind.codons[i]]
+            assert len(diffs) == 1, "expected exactly one synonymous substitution per replicate"
+
+
+def test_directed_evolution_batch_picks_the_true_best_alternative(aa_seq, analysis_objects, weights):
+    """Unlike directed_evolution()'s diff_change_vector-based local-excerpt
+    approximation, the batched path scores each candidate with a full exact
+    recompute -- verify each returned replicate's substitution really is
+    the lowest-scoring synonymous alternative at that position, checked
+    independently via calculate_change_vector() rather than trusting the
+    same code path under test."""
+    ind = _make_individual(aa_seq, analysis_objects)
+    codons = ind.codons
+
+    results = ga.directed_evolution_batch([ind], weights, aa_seq, analysis_objects, nreplicates=8, xp=np)
+    reps = results[id(ind)]
+    assert reps, "expected at least one replicate for this test to be meaningful"
+
+    codon_vec = generate_codon_vec(aa_seq)
+    for rep in reps:
+        diffs = [i for i in range(len(rep)) if rep[i] != codons[i]]
+        assert len(diffs) == 1
+        position = diffs[0]
+        chosen_codon = rep[position]
+
+        alternatives = [c for c in codon_vec[position] if c != codons[position]]
+        scores = {}
+        for alt in alternatives:
+            candidate = codons.copy()
+            candidate[position] = alt
+            scores[alt] = score_changevec(calculate_change_vector(candidate, analysis_objects), weights)
+        assert scores[chosen_codon] == min(scores.values())
+
+
+def test_directed_evolution_batch_memoizes_repeated_position_draws(aa_seq, analysis_objects, weights):
+    """Two replicate slots that land on the same position must pick the
+    same alternative -- the whole point of memoizing by (individual,
+    position) instead of rescoring per replicate slot."""
+    codons = ga.generate_seed(aa_seq)
+    n = len(codons)
+    # aa_seq[0] is Met (single codon, never drawable as a *useful* mutation
+    # target); make position 1 overwhelmingly dominate the weighted draw so
+    # repeated replicate slots are virtually guaranteed to land on it.
+    vecs = {'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+            'CodonPairBias': [0.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n}
+    vecs['RareCodons'][1] = 1e6
+    ind = Proposed_Solution(codons, 1, vecs)
+
+    results = ga.directed_evolution_batch([ind], weights, aa_seq, analysis_objects, nreplicates=10, xp=np)
+    reps = results[id(ind)]
+    position_1_reps = [rep for rep in reps if rep[1] != codons[1]]
+    assert len(position_1_reps) >= 2, "expected the dominant position to be drawn more than once"
+    assert len({rep[1] for rep in position_1_reps}) == 1
+
+
+def test_directed_evolution_batch_skips_positions_without_synonymous_alternatives(analysis_objects, weights):
+    # 'M' and 'W' are each encoded by exactly one codon -- no synonymous
+    # substitution is possible anywhere, same case as
+    # test_nearest_neighbors_empty_for_single_codon_amino_acids.
+    codons = ['ATG', 'TGG']
+    ind = Proposed_Solution(codons, 1, calculate_change_vector(codons, analysis_objects))
+
+    results = ga.directed_evolution_batch([ind], weights, 'MW', analysis_objects, nreplicates=5, xp=np)
+    assert results[id(ind)] == []
+
+
+def test_run_ga_with_xp_and_lookahead_uses_batched_growth(aa_seq, analysis_objects, weights, monkeypatch):
+    """xp set + lookahead=True (the default) must route growth through
+    directed_evolution_batch(), not directed_evolution() -- the whole point
+    of threading xp into run_ga's growth loop (see Handoff.md sec 6)."""
+    import genewriter.ga as ga_module
+
+    calls = []
+    original = ga_module.directed_evolution_batch
+
+    def _spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("directed_evolution (per-individual) should not be called when xp is set and lookahead=True")
+
+    monkeypatch.setattr(ga_module, "directed_evolution_batch", _spy)
+    monkeypatch.setattr(ga_module, "directed_evolution", _boom)
+
+    seeds = [ga.generate_seed(aa_seq) for _ in range(4)]
+    ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=2, target_size=8, xp=np)
+    assert calls, "run_ga with xp set and lookahead=True never used the batched growth path"
 
 
 def test_nearest_neighbors_differ_by_exactly_one_codon(aa_seq):

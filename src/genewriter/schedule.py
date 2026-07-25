@@ -42,9 +42,22 @@ however many individuals are left at that checkpoint, not every generation.
 Every exact refresh -- "input"'s seeding and "kill_off"/"select"/"flatten"'s
 pre-step refresh -- can be routed through gpu_change_vector's population-
 batched computation instead of the per-individual loop: pass
-`xp=numpy`/`xp=cupy` to run_schedule() (see ScheduleContext.xp). "growth"
-itself is unaffected either way -- its cheap parent-diffing isn't a batching
-target.
+`xp=numpy`/`xp=cupy` to run_schedule() (see ScheduleContext.xp). Measured
+25-48x speedup on real hardware for that path (see Handoff.md sec 6 -- all
+5 terms are batched now, including Kmer).
+
+"growth" benefits less than that number might suggest. When xp is set and
+a "growth" step's `lookahead` is True (the default), *choosing* each
+replicate's best synonymous alternative is also batched (see
+ga.directed_evolution_batch()) -- this was originally the actual real-scale
+bottleneck (~20-27 individuals/sec, tens of times slower per individual
+than the batched refresh path). But "growth"'s new-genotype *storage* is
+still unbatched: each accepted replicate's change_vecs is still diffed
+from its parent one at a time (merge_replicate()), untouched by xp -- and
+once the alternative-scoring itself got fast, that per-replicate storage
+diffing became the new dominant cost, capping growth's real end-to-end
+speedup at ~3x measured (see directed_evolution_batch()'s docstring and
+Handoff.md sec 6), not the 25-48x the refresh path sees.
 """
 
 import random
@@ -53,6 +66,7 @@ from dataclasses import dataclass, field
 from .change_vector import AnalysisObjects
 from .ga import (
     directed_evolution,
+    directed_evolution_batch,
     flatten_generation,
     generate_seed,
     kill_off,
@@ -147,38 +161,65 @@ def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
 
     Cheap: every new genotype's change vector is approximated by diffing
     against its parent rather than fully recomputed -- see module
-    docstring."""
+    docstring. When ctx.xp is set and lookahead=True, *which* synonymous
+    alternative gets chosen is instead decided by a batched exact
+    recompute across every directed individual in this step at once (see
+    ga.directed_evolution_batch()) -- this is the real bottleneck at
+    real scale, not the diffed storage step -- see module docstring."""
     rate = params.get("rate", 10)
     mutation_chance = params.get("mutation_chance", 0.05)
     directed_fraction = params.get("directed_fraction", 0.5)
     lookahead = params.get("lookahead", True)
 
-    if ctx.progress_every:
-        import time as _time
-        _t0 = _time.perf_counter()
-
     pop_index = {tuple(p.codons): p for p in pop}
-    for i, p in enumerate(pop):
-        if random.random() < directed_fraction:
-            # This, not anything xp/GPU-batching touches, is the known
-            # per-individual hotspot at real scale: `lookahead=True` scores
-            # every synonymous alternative at the chosen position via
-            # diff_change_vector() -- many small numpy calls per individual,
-            # dispatch-overhead-bound rather than compute-bound. See
-            # ga.run_ga's identical instrumentation and Handoff.md for
-            # measured throughput (~20 individuals/s vs. ~1600/s for the
-            # batched refresh path on real hardware).
-            reps = directed_evolution(
-                p.codons, p.change_vecs, ctx.weights, ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
-                nreplicates=rate, lookahead=lookahead,
-            )
-        else:
-            reps = replicate_and_mutate_random(p.codons, ctx.aa_seq, nreplicates=rate, mutation_rate=mutation_chance)
-        if ctx.progress_every and (i + 1) % ctx.progress_every == 0:
-            from .ga import _progress_print
-            _progress_print("schedule growth", i + 1, len(pop), _t0)
-        for rep in reps:
-            merge_replicate(pop_index, rep, ctx.analysis_objects, ctx.locvec, parent=p)
+
+    if ctx.xp is not None and lookahead:
+        # Batched growth path -- see ga.directed_evolution_batch() and this
+        # module's docstring. Classification keeps the same
+        # one-random.random()-per-individual-in-pop-order sequence as the
+        # per-individual path below.
+        is_directed = [random.random() < directed_fraction for _ in pop]
+        directed_individuals = [p for p, d in zip(pop, is_directed) if d]
+        random_individuals = [p for p, d in zip(pop, is_directed) if not d]
+
+        for p in random_individuals:
+            for rep in replicate_and_mutate_random(p.codons, ctx.aa_seq, nreplicates=rate, mutation_rate=mutation_chance):
+                merge_replicate(pop_index, rep, ctx.analysis_objects, ctx.locvec, parent=p)
+
+        batch_reps = directed_evolution_batch(
+            directed_individuals, ctx.weights, ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
+            nreplicates=rate, xp=ctx.xp, progress_every=ctx.progress_every,
+        )
+        for p in directed_individuals:
+            for rep in batch_reps[id(p)]:
+                merge_replicate(pop_index, rep, ctx.analysis_objects, ctx.locvec, parent=p)
+    else:
+        if ctx.progress_every:
+            import time as _time
+            _t0 = _time.perf_counter()
+        for i, p in enumerate(pop):
+            if random.random() < directed_fraction:
+                # This, not anything xp/GPU-batching touches (unless xp is
+                # set -- see above), is the known per-individual hotspot at
+                # real scale: `lookahead=True` scores every synonymous
+                # alternative at the chosen position via diff_change_vector()
+                # -- many small numpy calls per individual, dispatch-
+                # overhead-bound rather than compute-bound. See
+                # ga.run_ga's identical instrumentation and Handoff.md sec 6
+                # for measured throughput (~20-27 individuals/s here vs.
+                # 25-48x faster for the batched refresh path on real
+                # hardware).
+                reps = directed_evolution(
+                    p.codons, p.change_vecs, ctx.weights, ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
+                    nreplicates=rate, lookahead=lookahead,
+                )
+            else:
+                reps = replicate_and_mutate_random(p.codons, ctx.aa_seq, nreplicates=rate, mutation_rate=mutation_chance)
+            if ctx.progress_every and (i + 1) % ctx.progress_every == 0:
+                from .ga import _progress_print
+                _progress_print("schedule growth", i + 1, len(pop), _t0)
+            for rep in reps:
+                merge_replicate(pop_index, rep, ctx.analysis_objects, ctx.locvec, parent=p)
 
     result = list(pop_index.values())
     ctx.step_count += 1

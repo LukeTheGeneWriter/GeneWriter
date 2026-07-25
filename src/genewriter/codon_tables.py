@@ -125,6 +125,16 @@ CODON_FREQ_BY_INDEX = [CODON_FREQS_LIT[codon] for codon in CODON_LIST]
 VARIABLE_FLAGS_BY_INDEX = [CODON_TO_VARIABLE_FLAGS[codon] for codon in CODON_LIST]
 GC_FLAGS_BY_INDEX = [tuple(1 if base in 'GC' else 0 for base in codon) for codon in CODON_LIST]
 
+# Base-4 digit per nucleotide (A/C/G/T -> 0..3) -- the encoding
+# gpu_change_vector.batch_kmer_term() uses to turn each k-mer window into a
+# single integer in [0, 4**k) for array-indexed lookup, instead of hashing
+# the k-mer substring itself (the previously-unbatchable part of the Kmer
+# term -- see that function's docstring). Per-codon-index so a batch's
+# per-nucleotide base-4 digits are one fancy-index lookup, same pattern as
+# GC_FLAGS_BY_INDEX above.
+NT_TO_BASE4 = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+NT_BASE4_BY_CODON_INDEX = [[NT_TO_BASE4[base] for base in codon] for codon in CODON_LIST]
+
 
 def encode_codons(codons) -> list:
     """Map an iterable of codon strings to their integer indices (see

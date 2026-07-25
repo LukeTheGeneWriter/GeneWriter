@@ -15,22 +15,28 @@ toggleable in CONFIG:
      schedule.run_schedule) against a real gene, so you can sanity-check a
      real run at whatever scale, not just the isolated batched-term math.
 
-UPDATE: the GPU batched path IS now wired into the actual GA loop (ga.py's
-seed_population()/refresh_change_vectors(xp=...), threaded through
-run_ga(xp=...) and schedule.run_schedule(xp=...)/ScheduleContext.xp) --
-step 3 below passes PIPELINE_XP through to whichever entry point it calls,
-so USE_GPU=True now genuinely changes step 3's speed too, not just step 2's
-benchmark. Two things worth knowing before reading a step-3 number:
-  - Only the whole-population *exact* recomputes route through xp: initial
-    seeding, and kill_off/select/flatten's pre-step refresh (run_ga's
-    periodic refresh_every, too). "growth" itself still scores each new
-    genotype by cheap per-parent diffing either way -- see ga.py's
-    directed_evolution/replicate_and_mutate_random docstrings -- so a
-    growth-heavy schedule with few refresh checkpoints will show a smaller
-    GPU win than one that refreshes often (see SCHEDULE below).
-  - Kmer still isn't batched (see gpu_change_vector.py), so it still runs
-    per-individual inside every xp-routed call in step 3 too, same caveat
-    as step 2's benchmark.
+UPDATE 3: Kmer is now batched too (gpu_change_vector.batch_kmer_term()) --
+all 5 terms route through array-based batching, no per-individual Python
+loop left anywhere in batch_calculate_change_vectors(). This is a large
+real win for step 2's benchmark and for "input"/"kill_off"/"select"/
+"flatten" (25-48x measured on real hardware, see Handoff.md sec 6, up from
+~9-25x when Kmer still fell back to a per-individual loop).
+
+"growth" (ga.directed_evolution_batch(), when xp is set and lookahead=True,
+the default) benefits far less than that number suggests, for a reason
+that only became visible after Kmer was batched: growth's own
+alternative-scoring is now fast (measured: 1.45s for ~10,000 candidates on
+real hardware), but merge_replicate()'s per-accepted-replicate storage
+diffing -- one diff_change_vector() call per new genotype, entirely
+untouched by any of this session's batching work -- is now what dominates
+growth's cost instead (measured: ~12s for that same ~10,000 replicates).
+Net effect: growth's real end-to-end speedup is a modest ~3x, not 25-48x,
+and xp=cupy still measures roughly the same as xp=numpy for growth
+specifically (the remaining bottleneck is a Python loop, not batched math,
+so the array backend doesn't matter). Batching merge_replicate's storage
+diffing across a generation the way seed_population()/
+refresh_change_vectors() already batch theirs is the next real lever for
+growth specifically, and is NOT started.
 """
 
 import glob
@@ -162,13 +168,15 @@ CONFIG = dict(
     # Diagnostic-only progress logging for step 3 (no effect on the run's
     # results) -- turn this on before assuming a slow/stuck-looking run is a
     # bug. PROGRESS prints per-generation/per-step timing; PROGRESS_EVERY
-    # additionally prints throughput every this-many individuals *within*
-    # growth/refresh/seeding loops. This is what caught growth's lookahead
-    # scoring being ~60-85x slower per individual than the batched refresh
-    # path on real hardware (see Handoff.md sec 6) -- if a run looks hung,
-    # turn this on before assuming xp="gpu" isn't working; growth doesn't
-    # route through xp at all (see RUN_GA_OPTIONS.lookahead below), so a
-    # slow growth phase looks identical whether xp is "gpu" or "none".
+    # additionally prints throughput within growth/refresh/seeding loops.
+    # This is what originally caught growth's lookahead scoring being
+    # ~20-27 individuals/sec (tens of times slower than the batched refresh
+    # path), and later caught that batching growth's scoring wasn't enough
+    # on its own -- merge_replicate()'s per-replicate storage diffing
+    # (still per-individual, unaffected by xp) became the new dominant cost
+    # once scoring got fast (see Handoff.md sec 6 and RUN_GA_OPTIONS.lookahead
+    # below). Turn this on before assuming a slow run is a bug rather than
+    # a known, already-diagnosed cost.
     PROGRESS=True,
     PROGRESS_EVERY=100,
 
@@ -190,18 +198,24 @@ CONFIG = dict(
         lookahead=True,             # directed_evolution: score every
                                      # synonymous alt at the chosen position
                                      # (True) vs pick one at random (False,
-                                     # cheaper). NOT "cheaper" as in a minor
+                                     # cheaper). When PIPELINE_XP_BACKEND is
+                                     # "none", NOT "cheaper" as in a minor
                                      # optimization -- measured at
-                                     # ~20-27 individuals/sec vs. ~350-1600/sec
-                                     # for the batched refresh path on real
-                                     # hardware (Handoff.md sec 6). This is
-                                     # NOT affected by PIPELINE_XP_BACKEND --
-                                     # growth is deliberately excluded from
-                                     # xp/GPU batching (see ga.py's
-                                     # directed_evolution docstring) -- if a
-                                     # run seems stuck, this is almost
-                                     # certainly why, not a GPU problem. Set
-                                     # False here to confirm/mitigate.
+                                     # ~20-27 individuals/sec per-individual.
+                                     # When PIPELINE_XP_BACKEND is "gpu" or
+                                     # "numpy", lookahead=True routes through
+                                     # the batched directed_evolution_batch()
+                                     # instead -- its own scoring is now fast
+                                     # (Kmer is batched too), but growth's
+                                     # *other* per-replicate cost
+                                     # (merge_replicate's storage diffing,
+                                     # still unbatched) caps the real
+                                     # end-to-end win at ~3x, not the 25-48x
+                                     # the exact-refresh steps get -- see
+                                     # Handoff.md sec 6. Set False here if
+                                     # even that isn't fast enough and
+                                     # picking the single best alternative
+                                     # per mutation isn't essential.
         refresh_every=5,            # force an exact change-vector recompute
                                      # every N generations (0/None = never,
                                      # fastest but drift is unbounded; 1 =
@@ -340,7 +354,32 @@ def pick_target(cfg, genes):
     if cfg["GENE_ID"] is not None:
         candidates = [(g, iso) for g, iso in candidates if g.geneID == cfg["GENE_ID"]]
         if not candidates:
-            raise ValueError(f"No protein-coding isoform found for geneID={cfg['GENE_ID']!r}")
+            # Distinguish "no gene with this ID was loaded at all" (typo,
+            # wrong ID, wrong GENE_OBJ_DIR) from "the gene exists but every
+            # isoform was filtered out by protein_coding_isoforms()" (only
+            # computationally-predicted transcripts -- 'X' in
+            # isoformNumber -- or an empty codon list) -- worth telling
+            # apart on a dataset that takes 30+ minutes to load (real
+            # Colab run: 18,864 genes + genome-wide Standards), where a
+            # vague error means burning another 30 minutes to find out
+            # which case it was.
+            matching_genes = [g for g in genes if g.geneID == cfg["GENE_ID"]]
+            if not matching_genes:
+                raise ValueError(
+                    f"No gene with geneID={cfg['GENE_ID']!r} was loaded from GENE_OBJ_DIR "
+                    f"({len(genes)} gene(s) loaded total) -- check the ID and that its JSON "
+                    f"file is actually present in that directory."
+                )
+            iso_summary = [
+                f"isoform {iso.isoformNumber!r} ({len(iso.codons)} codons)"
+                for g in matching_genes for iso in g.isoforms
+            ]
+            raise ValueError(
+                f"geneID={cfg['GENE_ID']!r} was loaded ({matching_genes[0].geneName}) but has no "
+                f"protein-coding isoform -- protein_coding_isoforms() skips isoforms with 'X' in "
+                f"isoformNumber (computationally-predicted-only) or an empty codon list. "
+                f"This gene's isoform(s): {iso_summary}. Pick a different GENE_ID."
+            )
     if not candidates:
         raise ValueError("No protein-coding isoforms found at all in the loaded genes.")
 
@@ -502,3 +541,22 @@ def main(cfg=CONFIG):
 
 if __name__ == "__main__":
     main()
+
+# ----------------------------------------------------------------------------
+# Real-scale note: loading the actual reference set is slow -- confirmed on
+# a real Colab run at 18,864 genes + genome-wide Standards baselines, load
+# alone took ~30 minutes. main() reloads on every call, so re-running it
+# just to try a different GENE_ID/RUN_MODE/CONFIG option pays that cost
+# again. In a Colab notebook (not this script's __main__ block), prefer
+# calling the pieces across separate cells so genes/analysis_objects stay in
+# memory between iterations:
+#
+#   # cell 1 (~30 min on the real reference set, run once per session)
+#   setup_environment(CONFIG)
+#   xp_gpu, gpu_label = detect_gpu_backend(CONFIG)
+#   genes, analysis_objects = load_gene_data(CONFIG)
+#
+#   # cell 2 (seconds -- re-run freely while iterating on GENE_ID etc.)
+#   CONFIG["GENE_ID"] = 326
+#   aa_seq, locvec = pick_target(CONFIG, genes)
+#   run_pipeline(CONFIG, aa_seq, locvec, analysis_objects, xp_gpu)

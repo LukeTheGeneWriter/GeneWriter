@@ -26,12 +26,14 @@ codon_tables.encode_codons()/decode_codons(). A GPU kernel can't operate on
 Python strings, so this conversion happens once at the batch boundary, not
 per-term.
 
-Not yet batched here: Kmer (its substring->score lookup is a hash-map
-operation over arbitrary-length k-mer strings, not a natural fit for either
-numpy-style array vectorization or a first GPU pass -- would need k-mers
-re-encoded as base-4 integers for an array-indexed lookup table, left as
-follow-up). batch_calculate_change_vectors() falls back to the existing
-per-individual Kmer term for that piece.
+Kmer is now batched too (batch_kmer_term()): its substring->score lookup
+was a hash-map operation over arbitrary-length k-mer strings, not a natural
+fit for array vectorization -- fixed by re-encoding every k-mer window as a
+base-4 integer (A/C/G/T -> 0..3, codon_tables.NT_TO_BASE4) so the baseline's
+fold_enrich scores become one flat (num_buckets, 4**k) array, and the
+per-window lookup becomes array indexing (`table[bucket, code]`) instead of
+a dict lookup -- see batch_kmer_term()'s docstring for the full design and
+its memory-scaling caveat at large k.
 """
 
 import numpy as np
@@ -44,6 +46,8 @@ from .codon_tables import (
     CODON_TO_AA,
     CODON_TO_INDEX,
     GC_FLAGS_BY_INDEX,
+    NT_BASE4_BY_CODON_INDEX,
+    NT_TO_BASE4,
     RARE_CODON_INDICES,
     TAG_TO_BUCKET,
     TAG_TO_WINDOW_BUCKET,
@@ -291,16 +295,7 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     num_windows = max(len(location_string) - span, 0)
 
     if num_windows > 0:
-        bucket_index = {name: i for i, name in enumerate(_WINDOW_BUCKET_NAMES)}
-        bucket_of_nt = np.fromiter(
-            (bucket_index[TAG_TO_WINDOW_BUCKET[loc]] for loc in location_string),
-            dtype=np.int8, count=len(location_string),
-        )
-        counts = np.stack([
-            _np_sliding_sum(bucket_of_nt == b, span)[:num_windows]
-            for b in range(len(_WINDOW_BUCKET_NAMES))
-        ], axis=1)
-        majority_bucket = counts.argmax(axis=1)  # (num_windows,) shared across batch
+        majority_bucket = _majority_window_bucket(location_string, span, num_windows)
 
         window_gc = _sliding_window_view(xp, nt_gc_flat, span, axis=1)[:, :num_windows].mean(axis=2)  # (P, num_windows)
 
@@ -328,6 +323,120 @@ def _np_sliding_sum(bool_arr_1d, span):
     return sliding_window_view(bool_arr_1d.astype(np.int64), span).sum(axis=1)
 
 
+def _majority_window_bucket(location_string: str, span: int, num_windows: int):
+    """Majority location-bucket per window (3-way argmax over per-bucket
+    windowed counts) -- shared by batch_gc_term() and batch_kmer_term(),
+    both of which need "which of ExonL50/Exon/ExonR50 does this window
+    mostly fall in" for the same location_string/span shape. Always plain
+    numpy regardless of the caller's xp: this depends only on locvec (one
+    string, shared by the whole batch), not on population size, so there's
+    no batch dimension to move to the GPU here -- computed once per call
+    and reused across every individual via the callers' own indexing.
+
+    Returns an int array of shape (num_windows,), values indexing
+    _WINDOW_BUCKET_NAMES. Assumes num_windows > 0 (callers already guard
+    the num_windows == 0 case before calling)."""
+    bucket_index = {name: i for i, name in enumerate(_WINDOW_BUCKET_NAMES)}
+    bucket_of_nt = np.fromiter(
+        (bucket_index[TAG_TO_WINDOW_BUCKET[loc]] for loc in location_string),
+        dtype=np.int8, count=len(location_string),
+    )
+    counts = np.stack([
+        _np_sliding_sum(bucket_of_nt == b, span)[:num_windows]
+        for b in range(len(_WINDOW_BUCKET_NAMES))
+    ], axis=1)
+    return counts.argmax(axis=1)
+
+
+def _encode_kmer_string(seq: str, k: int) -> int:
+    """A k-length A/C/G/T string -> its base-4 integer in [0, 4**k), using
+    codon_tables.NT_TO_BASE4 -- must stay the same mapping
+    batch_kmer_term() uses to encode candidate windows, since this is only
+    ever used to build that function's lookup table from the same kind of
+    string the candidates are encoded from."""
+    code = 0
+    for base in seq:
+        code = code * 4 + NT_TO_BASE4[base]
+    return code
+
+
+def _build_kmer_score_table(kmer_by_seq: dict, k: int) -> np.ndarray:
+    """(num_buckets, 4**k) float array of fold_enrich scores for one k,
+    built once per batch_kmer_term() call (not per individual -- same cost
+    class as batch_codon_pair_bias_term() building its cpb_table from a
+    dict). Default 1.0 for a k-mer/bucket combination never observed in the
+    baseline, matching _kmer_term's identical `entry is None` /
+    `.get(bucket, {}).get('fold_enrich', 1.0)` defaults exactly."""
+    table = np.ones((len(_WINDOW_BUCKET_NAMES), 4 ** k), dtype=float)
+    for seq, buckets in kmer_by_seq.items():
+        idx = _encode_kmer_string(seq, k)
+        for b, name in enumerate(_WINDOW_BUCKET_NAMES):
+            entry = buckets.get(name)
+            if entry is not None:
+                table[b, idx] = entry.get('fold_enrich', 1.0)
+    return table
+
+
+def batch_kmer_term(xp, codon_idx, kmer, locvec: list, winsize: int = 15):
+    """codon_idx: (P, N) int array. kmer: KmerAnalysis. locvec: list[str] of
+    length N, shared across the whole batch. Returns (P, N).
+
+    The one piece of calculate_change_vector() that used to resist batching
+    entirely (see this module's own history / docstring): _kmer_term's
+    substring->score lookup is keyed by an arbitrary-length k-mer string,
+    which doesn't fit a numeric array lookup the way every other term's
+    baseline data does. Fixed here by re-encoding every k-mer window as a
+    base-4 integer (A/C/G/T -> 0..3, codon_tables.NT_TO_BASE4/
+    NT_BASE4_BY_CODON_INDEX) so the baseline's fold_enrich scores become one
+    flat (num_buckets, 4**k) table (_build_kmer_score_table()) and the
+    per-window score becomes one `table[bucket, code]` fancy-index gather
+    across the *whole batch at once*, instead of a per-window,
+    per-individual Python dict lookup.
+
+    Memory scales as 4**k per k value in kmer.kmer_dict -- fine for the k
+    range real Standards baselines actually use (up to 9-10, see
+    Handoff.md's environment notes on how long a genome-wide k=9 baseline
+    takes to compute in the first place): 4**10 * 3 buckets * 8 bytes is
+    ~25MB, built once per call. This would stop being fine well before
+    k=15 (4**15 * 3 * 8 bytes ~= 400GB) -- not a real concern for any
+    baseline this codebase can currently produce, but worth knowing if a
+    much larger k is ever considered.
+    """
+    P, N = codon_idx.shape
+    base4_table = xp.asarray(np.asarray(NT_BASE4_BY_CODON_INDEX, dtype=np.int64))  # (64, 3)
+    nt_base4 = base4_table[codon_idx].reshape(P, N * 3)  # (P, 3N)
+
+    location_string = ''.join(loc * 3 for loc in locvec)  # length 3N, shared
+    M = N * 3
+
+    per_nt_total = xp.zeros((P, M), dtype=float)
+    for k_str, kmer_by_seq in kmer.kmer_dict.items():
+        k = int(k_str)
+        num_wins = max(M - k, 0)
+        if num_wins == 0:
+            continue
+
+        windows = _sliding_window_view(xp, nt_base4, k, axis=1)[:, :num_wins]  # (P, num_wins, k)
+        powers = xp.asarray(np.asarray([4 ** (k - 1 - j) for j in range(k)], dtype=np.int64))
+        codes = (windows * powers).sum(axis=2)  # (P, num_wins), each in [0, 4**k)
+
+        majority_bucket = _majority_window_bucket(location_string, k, num_wins)  # (num_wins,) shared
+        bucket_rows = xp.asarray(majority_bucket)
+
+        table = xp.asarray(_build_kmer_score_table(kmer_by_seq, k))  # (num_buckets, 4**k)
+        win_scores = table[xp.broadcast_to(bucket_rows, codes.shape), codes]  # (P, num_wins)
+
+        overall = win_scores.mean(axis=1)  # (P,)
+        by_pos = windowed_average_batched(xp, win_scores, M, winsize)  # (P, M)
+        # Summing each k's per-nucleotide contribution before the final
+        # reshape-to-per-codon-and-mean (done once, after this loop) is
+        # equivalent to _kmer_term's per-k reshape-then-sum-at-the-end:
+        # reshape+mean is linear, so it commutes with the sum over k.
+        per_nt_total += by_pos * overall.reshape(P, 1)
+
+    return per_nt_total.reshape(P, N, 3).mean(axis=2)
+
+
 def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: list = None, xp=np, progress_every: int = None) -> list:
     """Compute change vectors for a whole population in one batched pass.
 
@@ -337,22 +446,22 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
     xp: array module to compute with -- numpy (default, still much faster
         than the per-individual Python loop) or cupy (genuinely on the
         GPU). Pass the cupy module object, not a string.
-    progress_every: if set, print elapsed-time progress every this-many
-        individuals through the Kmer loop below (plus one line marking when
-        the batched rare/usage/cpb/gc section finishes) -- diagnostic only,
-        no effect on the returned values. Kmer is the one term *not*
-        batched (see module docstring), so at large population sizes it is
-        the most likely place this function appears to hang; this is here
-        to make that visible instead of guessed at. None (default): silent,
-        matching the original behavior exactly.
+    progress_every: if set, print elapsed-time progress marking when each
+        term's batched pass finishes -- diagnostic only, no effect on the
+        returned values. None (default): silent, matching the original
+        behavior exactly.
 
     Returns a list of P dicts, one per individual, in the same shape
     calculate_change_vector() returns for a single individual -- so this is
     a drop-in replacement for `[calculate_change_vector(sol, ...) for sol
     in pop_codons]`, just computed as one batch instead of P separate calls.
 
-    Kmer is not yet batched (see module docstring) -- computed per
-    individual via the existing implementation and merged in.
+    All 5 terms are batched, including Kmer (see batch_kmer_term() and this
+    module's docstring for how -- it used to fall back to a per-individual
+    Python loop, which is why progress_every used to report throughput
+    "through the Kmer loop" specifically; that per-individual fallback is
+    gone, so a slow call now means something else -- rerun with
+    progress_every set to see which term's batched pass is slow).
     """
     if not pop_codons:
         return []
@@ -364,46 +473,44 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
         import time as _time
         _t0 = _time.perf_counter()
 
+        def _mark(label):
+            nonlocal _t0
+            now = _time.perf_counter()
+            print(f"  [batch_calculate_change_vectors] {label} for {len(pop_codons)} "
+                  f"individuals done in {now - _t0:.2f}s", flush=True)
+            _t0 = now
+
     codon_idx = encode_population(xp, pop_codons)
 
     rare = batch_rare_codon_term(xp, codon_idx, analysis_objects.rare_codon)
+    if progress_every:
+        _mark("RareCodons")
     usage = batch_codon_usage_term(xp, codon_idx, analysis_objects.codon_usage)
+    if progress_every:
+        _mark("CodonUsage")
     cpb = batch_codon_pair_bias_term(xp, codon_idx, analysis_objects.codon_pair_bias)
+    if progress_every:
+        _mark("CodonPairBias")
     gc = batch_gc_term(xp, codon_idx, analysis_objects.gc, locvec)
+    if progress_every:
+        _mark("GC")
+    kmer = batch_kmer_term(xp, codon_idx, analysis_objects.kmer, locvec)
+    if progress_every:
+        _mark("Kmer")
 
     rare_np = rare if xp is np else xp.asnumpy(rare)
     usage_np = usage if xp is np else xp.asnumpy(usage)
     cpb_np = cpb if xp is np else xp.asnumpy(cpb)
     gc_np = gc if xp is np else xp.asnumpy(gc)
+    kmer_np = kmer if xp is np else xp.asnumpy(kmer)
 
-    if progress_every:
-        print(f"  [batch_calculate_change_vectors] batched terms (RareCodons/CodonUsage/"
-              f"CodonPairBias/GC) for {len(pop_codons)} individuals done in "
-              f"{_time.perf_counter() - _t0:.2f}s -- starting per-individual Kmer loop "
-              f"(the known unbatched hotspot)", flush=True)
-        _t_kmer0 = _time.perf_counter()
-
-    from .change_vector import _kmer_term
-
-    results = []
-    for p, sol in enumerate(pop_codons):
-        kmer_vals = _kmer_term(sol, analysis_objects, locvec)
-        results.append({
+    return [
+        {
             'RareCodons': rare_np[p].tolist(),
             'CodonUsage': usage_np[p].tolist(),
             'CodonPairBias': cpb_np[p].tolist(),
             'GC': gc_np[p].tolist(),
-            'Kmer': kmer_vals,
-        })
-        if progress_every and (p + 1) % progress_every == 0:
-            elapsed = _time.perf_counter() - _t_kmer0
-            rate = (p + 1) / elapsed if elapsed > 0 else float('inf')
-            remaining = (len(pop_codons) - (p + 1)) / rate if rate > 0 else float('inf')
-            print(f"  [batch_calculate_change_vectors] Kmer {p + 1}/{len(pop_codons)} "
-                  f"({rate:.1f} indiv/s, ~{remaining:.0f}s remaining)", flush=True)
-
-    if progress_every:
-        print(f"  [batch_calculate_change_vectors] Kmer loop done in "
-              f"{_time.perf_counter() - _t_kmer0:.2f}s", flush=True)
-
-    return results
+            'Kmer': kmer_np[p].tolist(),
+        }
+        for p in range(len(pop_codons))
+    ]

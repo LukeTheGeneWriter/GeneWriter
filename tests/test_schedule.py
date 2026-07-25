@@ -119,6 +119,38 @@ def test_step_growth_diffs_new_individuals_against_their_parent(ctx, monkeypatch
     assert calls, "growth step never called diff_change_vector for a new genotype"
 
 
+def test_step_growth_with_xp_and_lookahead_uses_batched_growth(aa_seq, analysis_objects, weights, monkeypatch):
+    """ctx.xp set + lookahead=True (the default) must route "growth"
+    through ga.directed_evolution_batch(), not the per-individual
+    directed_evolution() -- see Handoff.md sec 6 on why this is the
+    real-scale bottleneck the xp wiring is meant to fix."""
+    import numpy as np
+
+    # schedule.py did `from .ga import directed_evolution_batch`, which
+    # binds the name into schedule's own module namespace -- patching
+    # genewriter.ga's attribute would not affect schedule's already-bound
+    # reference, so this patches `sched` (the module _step_growth actually
+    # looks the name up in) instead.
+    calls = []
+    original = sched.directed_evolution_batch
+
+    def _spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("directed_evolution (per-individual) should not be called when ctx.xp is set and lookahead=True")
+
+    monkeypatch.setattr(sched, "directed_evolution_batch", _spy)
+    monkeypatch.setattr(sched, "directed_evolution", _boom)
+
+    xp_ctx = sched.ScheduleContext(aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects, xp=np)
+    seeded = sched.run_steps([], xp_ctx, [{"kind": "input", "count": 6}])
+    sched.run_steps(seeded, xp_ctx, [{"kind": "growth", "rate": 4, "mutation_chance": 0.3}])
+
+    assert calls, "growth step with ctx.xp set never used the batched growth path"
+
+
 def test_step_save_writes_a_checkpoint(tmp_path, aa_seq, analysis_objects, weights):
     ctx_with_save = sched.ScheduleContext(
         aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects,

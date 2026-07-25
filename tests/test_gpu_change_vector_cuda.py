@@ -24,6 +24,7 @@ from genewriter.gpu_change_vector import (  # noqa: E402
     batch_codon_pair_bias_term,
     batch_codon_usage_term,
     batch_gc_term,
+    batch_kmer_term,
     batch_rare_codon_term,
     encode_population,
     windowed_average_batched,
@@ -114,6 +115,16 @@ def test_batch_gc_term_gpu_matches_cpu(analysis_objects):
     locvec = ['I'] * len(LONG_AA_SEQ)
     cpu = batch_gc_term(np, cpu_idx, analysis_objects.gc, locvec)
     gpu = batch_gc_term(cp, gpu_idx, analysis_objects.gc, locvec)
+    _assert_arrays_close(cpu, gpu)
+
+
+def test_batch_kmer_term_gpu_matches_cpu(analysis_objects):
+    pop = _population(LONG_AA_SEQ, 6)
+    cpu_idx = encode_population(np, pop)
+    gpu_idx = encode_population(cp, pop)
+    locvec = ['I'] * len(LONG_AA_SEQ)
+    cpu = batch_kmer_term(np, cpu_idx, analysis_objects.kmer, locvec)
+    gpu = batch_kmer_term(cp, gpu_idx, analysis_objects.kmer, locvec)
     _assert_arrays_close(cpu, gpu)
 
 

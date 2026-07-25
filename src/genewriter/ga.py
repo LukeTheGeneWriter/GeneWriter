@@ -55,6 +55,8 @@ import math
 import os
 import random
 
+import numpy as np
+
 from .change_vector import AnalysisObjects, calculate_change_vector, diff_change_vector, require_weights, score_changevec
 from .classes import Proposed_Solution
 from .codon_tables import generate_codon_vec
@@ -236,6 +238,19 @@ def replicate_and_mutate_random(sol: list, aa_seq: str, nreplicates: int = 10, m
     return replicates
 
 
+def _ranked_positions(sol: list, changevecs: dict, weights: dict) -> tuple:
+    """Every position in sol, ranked by weighted change-vector score
+    (highest first) with a matching list of finite, non-negative
+    random.choices() weights -- the position-selection logic shared by
+    directed_evolution() and directed_evolution_batch()."""
+    weighted_positions = [
+        sum(weights[key] * changevecs[key][i] for key in changevecs) for i in range(len(sol))
+    ]
+    ranked = sorted(range(len(sol)), key=lambda i: weighted_positions[i], reverse=True)
+    position_weights = [_finite_nonneg(weighted_positions[i]) for i in ranked]
+    return ranked, position_weights
+
+
 def directed_evolution(
     sol: list,
     changevecs: dict,
@@ -258,14 +273,18 @@ def directed_evolution(
     position* gets mutated is still weighted by the change vector -- this
     only removes the expensive part (comparing every synonymous option at
     that position).
+
+    This is the per-individual path -- see directed_evolution_batch() for
+    the batched counterpart used when growth is run with xp set, which
+    scores every candidate exactly (via batch_calculate_change_vectors())
+    instead of diff_change_vector()'s cheaper-per-call-but-many-calls
+    excerpt approximation; measured as the dominant real-scale cost here
+    (many small numpy calls, dispatch-overhead-bound) -- see Handoff.md
+    sec 6.
     """
     require_weights(changevecs.keys(), weights)
     codon_vec = generate_codon_vec(aa_seq)
-    weighted_positions = [
-        sum(weights[key] * changevecs[key][i] for key in changevecs) for i in range(len(sol))
-    ]
-    ranked = sorted(range(len(sol)), key=lambda i: weighted_positions[i], reverse=True)
-    position_weights = [_finite_nonneg(weighted_positions[i]) for i in ranked]
+    ranked, position_weights = _ranked_positions(sol, changevecs, weights)
 
     replicates = []
     for _ in range(nreplicates):
@@ -296,6 +315,143 @@ def directed_evolution(
         new_sol[position] = best_codon
         replicates.append(new_sol)
     return replicates
+
+
+def directed_evolution_batch(
+    individuals: list,
+    weights: dict,
+    aa_seq: str,
+    analysis_objects: AnalysisObjects,
+    locvec: list = None,
+    nreplicates: int = 10,
+    xp=None,
+    progress_every: int = None,
+) -> dict:
+    """Batched counterpart of directed_evolution(lookahead=True) across
+    MULTIPLE individuals at once.
+
+    Why this exists: directed_evolution()'s lookahead scores every
+    synonymous alternative at the chosen position via one
+    diff_change_vector() Python call each -- cheap in isolation, but
+    measured as the actual real-scale bottleneck (~20-27 individuals/sec,
+    ~60-85x slower per individual than the batched exact-refresh path --
+    see Handoff.md sec 6), because it's thousands of small numpy calls
+    (dispatch-overhead-bound, not compute-bound), not because the per-call
+    math is expensive. This collects every individual's candidate
+    alternatives into one batch and scores them all with a single
+    gpu_change_vector.batch_calculate_change_vectors() call instead.
+
+    individuals: list of Proposed_Solution, each with a valid change_vecs
+        (used for position-selection weighting, same as directed_evolution).
+    xp: array module (numpy or cupy) for the batched scoring pass -- unlike
+        seed_population()/refresh_change_vectors(), there's no
+        per-individual fallback mode here; this function only exists for
+        its batching. None defaults to numpy. Callers decide *whether* to
+        batch growth at all by choosing to call this instead of
+        directed_evolution() in a loop -- see run_ga()/schedule.py's
+        "growth" step, both gated on `xp is not None`.
+
+    Position selection (which position each of nreplicates replicate slots
+    mutates) is unchanged from directed_evolution() -- same weighted-random
+    logic via _ranked_positions(), same number and order of
+    random.choices() calls per individual. What's batched is choosing the
+    *best* synonymous alternative at that position: a given (individual,
+    position) pair's best alternative is deterministic from that
+    individual's own change_vecs (it doesn't depend on which replicate slot
+    drew the position), so repeat draws of the same position -- likely,
+    since draws are weighted toward a handful of high-scoring positions --
+    are memoized instead of re-scored.
+
+    Accuracy trade-off worth knowing: scoring here recomputes each
+    candidate's change vector exactly (full sequence, and -- now that
+    batch_calculate_change_vectors() batches all 5 terms including Kmer --
+    cheaply) rather than diff_change_vector's local-excerpt approximation.
+    Strictly more accurate (true whole-sequence aggregates instead of
+    excerpt-estimated ones), numerically different results.
+
+    Performance reality check, found by profiling rather than assumed:
+    this function's own batched scoring is now fast (measured: 1.45s for
+    ~10,000 candidates across ~1,000 individuals on real gene data, this
+    RTX 3050 -- see Handoff.md sec 6), but the *caller's* merge_replicate()
+    loop that stores each accepted replicate -- one diff_change_vector()
+    call per replicate, unaffected by anything batched here or in
+    gpu_change_vector.py -- now dominates growth's total time instead
+    (measured: ~12s for that same ~10,000 replicates in the same run).
+    Net growth speedup end-to-end is therefore a modest ~3x, not the
+    25-48x batch_calculate_change_vectors() itself achieves -- batching
+    merge_replicate's storage diffing across a generation the way
+    seed_population()/refresh_change_vectors() already do is the natural
+    next step if growth needs to be faster than that, and is NOT done.
+
+    Returns {id(individual): [new_sol, ...]}, matching what looping
+    directed_evolution() per individual would return (list length up to
+    nreplicates, fewer entries for slots whose drawn position had no
+    synonymous alternative).
+    """
+    xp = xp if xp is not None else np
+    codon_vec = generate_codon_vec(aa_seq)
+
+    for ind in individuals:
+        require_weights(ind.change_vecs.keys(), weights)
+
+    unique_pairs = {}  # (id(ind), position) -> True, insertion order
+    per_individual_positions = {}  # id(ind) -> [position, ...], one per replicate slot
+
+    for ind in individuals:
+        sol = ind.codons
+        key = id(ind)
+        ranked, position_weights = _ranked_positions(sol, ind.change_vecs, weights)
+
+        positions = []
+        for _ in range(nreplicates):
+            choice_idx = random.choices(range(len(ranked)), weights=position_weights)[0]
+            position = ranked[choice_idx]
+            positions.append(position)
+            current_codon = sol[position]
+            if any(c != current_codon for c in codon_vec[position]):
+                unique_pairs[(key, position)] = True
+        per_individual_positions[key] = positions
+
+    if not unique_pairs:
+        return {id(ind): [] for ind in individuals}
+
+    by_key = {id(ind): ind for ind in individuals}
+    candidates = []
+    candidate_owner = []  # parallel: (key, position, alt) per candidate row
+    for key, position in unique_pairs:
+        sol = by_key[key].codons
+        current_codon = sol[position]
+        for alt in codon_vec[position]:
+            if alt == current_codon:
+                continue
+            candidate = list(sol)
+            candidate[position] = alt
+            candidates.append(candidate)
+            candidate_owner.append((key, position, alt))
+
+    vecs_list = batch_calculate_change_vectors(candidates, analysis_objects, locvec, xp=xp, progress_every=progress_every)
+
+    best_alt = {}  # (key, position) -> (best_alt, best_score)
+    for (key, position, alt), vecs in zip(candidate_owner, vecs_list):
+        score = score_changevec(vecs, weights)
+        current = best_alt.get((key, position))
+        if current is None or score < current[1]:
+            best_alt[(key, position)] = (alt, score)
+
+    results = {}
+    for ind in individuals:
+        key = id(ind)
+        sol = ind.codons
+        reps = []
+        for position in per_individual_positions[key]:
+            entry = best_alt.get((key, position))
+            if entry is None:
+                continue
+            new_sol = sol.copy()
+            new_sol[position] = entry[0]
+            reps.append(new_sol)
+        results[key] = reps
+    return results
 
 
 def nearest_neighbors(sol: list, aa_seq: str) -> list:
@@ -504,13 +660,27 @@ def run_ga(
         each exact reset. Set to 1 for always-exact selection (same
         behavior/cost as before diffing existed), or 0/None to never force
         a reset (fastest, but drift is unbounded over a long run).
-    xp: array module (numpy or cupy) to batch the initial seeding and every
-        exact refresh through gpu_change_vector.batch_calculate_change_vectors()
-        instead of a per-individual Python loop -- see seed_population() /
-        refresh_change_vectors(). None (default) keeps the original
-        per-individual path. Growth's own per-offspring diffing is
-        unaffected either way -- diff_change_vector is already cheap enough
-        not to need batching.
+    xp: array module (numpy or cupy) to batch the initial seeding, every
+        exact refresh, and (when lookahead=True) growth's alternative
+        scoring, through gpu_change_vector.batch_calculate_change_vectors()
+        instead of per-individual Python loops -- see seed_population() /
+        refresh_change_vectors() / directed_evolution_batch(). None
+        (default) keeps the original per-individual path throughout,
+        including growth. When xp is set and lookahead=True, growth's
+        best-alternative selection is scored by an exact full recompute
+        batched across the whole generation instead of
+        diff_change_vector()'s cheaper-per-call-but-many-calls excerpt
+        approximation -- measurably more accurate, numerically different
+        results. seeding and refresh_change_vectors see a large real-scale
+        speedup from this (25-48x measured, see Handoff.md sec 6 -- Kmer is
+        batched too, not just the other 4 terms). growth's own end-to-end
+        speedup is more modest (~3x measured): its best-alternative scoring
+        is now cheap, but merge_replicate()'s per-replicate storage diffing
+        (unaffected by xp, still one diff_change_vector() call per accepted
+        replicate) is now what dominates growth's cost instead -- see
+        directed_evolution_batch()'s docstring. lookahead=False growth is
+        unaffected by xp either way -- it was already cheap (no
+        per-alternative scoring to batch).
     progress: if True, print per-generation timing (seeding, growth,
         refresh, select, each separately) plus population size before/after
         -- diagnostic only, meant for tracking down which phase a slow or
@@ -558,17 +728,42 @@ def run_ga(
         if progress:
             _t0 = _time.perf_counter()
         pop_index = {tuple(p.codons): p for p in pop}
-        for i, p in enumerate(pop):
-            if random.random() < 0.5:
-                reps = replicate_and_mutate_random(p.codons, aa_seq)
-            else:
-                reps = directed_evolution(
-                    p.codons, p.change_vecs, weights, aa_seq, analysis_objects, locvec, lookahead=lookahead,
-                )
-            for rep in reps:
-                merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
-            if progress_every and (i + 1) % progress_every == 0:
-                _progress_print("run_ga growth", i + 1, len(pop), _t0)
+
+        if xp is not None and lookahead:
+            # Batched growth path -- see directed_evolution_batch()'s
+            # docstring and Handoff.md sec 6 for why this exists: lookahead
+            # scoring, not anything else in the loop, was the measured
+            # real-scale bottleneck. Classification (random vs. directed)
+            # keeps the same one-random.random()-per-individual-in-pop-order
+            # sequence as the per-individual path below; what changes is
+            # that directed individuals' replicates are all scored in one
+            # batched pass instead of individually.
+            is_random = [random.random() < 0.5 for _ in pop]
+            random_individuals = [p for p, r in zip(pop, is_random) if r]
+            directed_individuals = [p for p, r in zip(pop, is_random) if not r]
+
+            for p in random_individuals:
+                for rep in replicate_and_mutate_random(p.codons, aa_seq):
+                    merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
+
+            batch_reps = directed_evolution_batch(
+                directed_individuals, weights, aa_seq, analysis_objects, locvec, xp=xp, progress_every=progress_every,
+            )
+            for p in directed_individuals:
+                for rep in batch_reps[id(p)]:
+                    merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
+        else:
+            for i, p in enumerate(pop):
+                if random.random() < 0.5:
+                    reps = replicate_and_mutate_random(p.codons, aa_seq)
+                else:
+                    reps = directed_evolution(
+                        p.codons, p.change_vecs, weights, aa_seq, analysis_objects, locvec, lookahead=lookahead,
+                    )
+                for rep in reps:
+                    merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
+                if progress_every and (i + 1) % progress_every == 0:
+                    _progress_print("run_ga growth", i + 1, len(pop), _t0)
 
         pop = list(pop_index.values())
         if progress:

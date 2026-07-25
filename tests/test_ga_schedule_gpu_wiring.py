@@ -1,7 +1,17 @@
 """Verifies the `xp` wiring added to ga.py/schedule.py -- seed_population(),
-refresh_change_vectors(), run_ga(), and run_schedule()'s "input"/"kill_off"/
-"select"/"flatten" steps -- actually runs on the GPU (xp=cupy) and produces
-results equivalent to the CPU path, not just that passing xp doesn't crash.
+refresh_change_vectors(), directed_evolution_batch(), run_ga(), and
+run_schedule()'s "input"/"growth"/"kill_off"/"select"/"flatten" steps --
+actually runs on the GPU (xp=cupy) and produces results equivalent to the
+numpy-batched (xp=numpy) path, not just that passing xp doesn't crash.
+
+Note this compares xp=numpy against xp=cupy, NOT against the default
+xp=None per-individual path: growth's own behavior genuinely changes when
+xp is set (see ga.directed_evolution_batch()) -- it scores each candidate
+exactly via a batched full recompute instead of diff_change_vector()'s
+local-excerpt approximation, so xp=None and xp=<anything> are expected to
+diverge (different scores can pick a different "best" synonymous
+alternative). What must still hold is that xp=numpy and xp=cupy agree with
+each other, since they run the identical algorithm on different backends.
 
 Skipped automatically wherever cupy or a GPU isn't available, same pattern as
 test_gpu_change_vector_cuda.py (whose battle-tested numpy-vs-cupy equivalence
@@ -58,31 +68,55 @@ def test_refresh_change_vectors_gpu_matches_cpu(aa_seq, analysis_objects):
         _assert_change_vecs_close(a.change_vecs, b.change_vecs)
 
 
-def test_run_ga_gpu_matches_per_individual_final_population(aa_seq, analysis_objects, weights):
-    """Growth/selection both consume random.random()/random.choices() the
-    same number of times regardless of xp (only seeding and the periodic
-    exact refresh route through the batched math), so with the module RNG
-    reseeded identically before each call, xp=cupy and the default
-    per-individual path should walk the exact same sequence of generations
-    and land on the same final population."""
+def test_directed_evolution_batch_gpu_matches_numpy(aa_seq, analysis_objects, weights):
+    """directed_evolution_batch() itself, numpy vs cupy, isolated from the
+    rest of run_ga -- same random-draw sequence (position selection doesn't
+    touch xp at all), same candidates, so the two backends must pick the
+    identical best alternative for every individual."""
+    import random
+
+    individuals = []
+    for _ in range(5):
+        codons = ga.generate_seed(aa_seq)
+        individuals.append(Proposed_Solution(codons, 1, calculate_change_vector(codons, analysis_objects)))
+
+    random.seed(42)
+    reps_np = ga.directed_evolution_batch(individuals, weights, aa_seq, analysis_objects, xp=np)
+
+    random.seed(42)
+    reps_gpu = ga.directed_evolution_batch(individuals, weights, aa_seq, analysis_objects, xp=cp)
+
+    for ind in individuals:
+        assert reps_np[id(ind)] == reps_gpu[id(ind)]
+
+
+def test_run_ga_numpy_xp_matches_gpu_xp_final_population(aa_seq, analysis_objects, weights):
+    """With xp set, growth's batched lookahead scoring (see
+    ga.directed_evolution_batch()) is the identical algorithm on both
+    backends -- only the array module differs -- so xp=numpy and xp=cupy
+    must land on the same final population given the same RNG seed. This
+    is deliberately NOT compared against the default xp=None path: growth's
+    own scoring genuinely changes when xp is set (batched exact recompute
+    vs. diff_change_vector's excerpt approximation), so xp=None is expected
+    to diverge -- see this file's module docstring."""
     import random
 
     seeds = [ga.generate_seed(aa_seq) for _ in range(4)]
 
     random.seed(1234)
-    pop_default = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=4, target_size=8)
+    pop_np = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=4, target_size=8, xp=np)
 
     random.seed(1234)
     pop_gpu = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=4, target_size=8, xp=cp)
 
-    assert {tuple(p.codons) for p in pop_default} == {tuple(p.codons) for p in pop_gpu}
-    by_codons_default = {tuple(p.codons): p for p in pop_default}
+    assert {tuple(p.codons) for p in pop_np} == {tuple(p.codons) for p in pop_gpu}
+    by_codons_np = {tuple(p.codons): p for p in pop_np}
     by_codons_gpu = {tuple(p.codons): p for p in pop_gpu}
-    for key in by_codons_default:
-        assert by_codons_default[key].number == by_codons_gpu[key].number
+    for key in by_codons_np:
+        assert by_codons_np[key].number == by_codons_gpu[key].number
 
 
-def test_run_schedule_with_gpu_xp_matches_cpu(aa_seq, analysis_objects, weights):
+def test_run_schedule_numpy_xp_matches_gpu_xp(aa_seq, analysis_objects, weights):
     import random
 
     schedule = [
@@ -94,12 +128,12 @@ def test_run_schedule_with_gpu_xp_matches_cpu(aa_seq, analysis_objects, weights)
     ]
 
     random.seed(5678)
-    pop_default = sched.run_schedule(aa_seq, weights, analysis_objects, schedule)
+    pop_np = sched.run_schedule(aa_seq, weights, analysis_objects, schedule, xp=np)
 
     random.seed(5678)
     pop_gpu = sched.run_schedule(aa_seq, weights, analysis_objects, schedule, xp=cp)
 
-    assert {tuple(p.codons) for p in pop_default} == {tuple(p.codons) for p in pop_gpu}
+    assert {tuple(p.codons) for p in pop_np} == {tuple(p.codons) for p in pop_gpu}
 
 
 def test_run_schedule_gpu_result_matches_exact_recompute(aa_seq, analysis_objects, weights):
