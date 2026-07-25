@@ -103,8 +103,21 @@ def windowed_average_batched(xp, values, target_len: int, winsize: int):
         windows = _sliding_window_view(xp, values, 2 * half, axis=1)  # (P, M-2half+1, 2half)
         safe_idx = idx[safe]
         row_starts = safe_idx - half
-        means = windows[:, row_starts, :].mean(axis=2)
-        out[:, safe_idx] = means
+        # safe_idx is always a single contiguous ascending run: regime_c is
+        # itself a contiguous middle band, and the extra (idx-half>=0) /
+        # (idx+half<=M) conditions are just tighter monotonic bounds on the
+        # same idx array -- intersecting monotonic bounds can only narrow
+        # an interval, never split it. That makes row_starts contiguous
+        # too, so this can be a plain slice into `windows` (a view, no
+        # allocation) instead of fancy-indexing it -- fancy-indexing here
+        # forces materializing a full (P, len(row_starts), 2*half) copy,
+        # confirmed as the exact cause of a real CUDA OOM on real Colab
+        # data (population=50,000, a 758-residue gene): the failed
+        # allocation was 50000*2238*14*8 == 12,532,800,000 bytes, an exact
+        # match for that shape.
+        lo, hi = int(row_starts[0]), int(row_starts[-1]) + 1
+        means = windows[:, lo:hi, :].mean(axis=2)
+        out[:, safe_idx[0]:safe_idx[-1] + 1] = means
 
     for i in idx[~safe].tolist():
         if i < winsize:

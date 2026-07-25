@@ -68,6 +68,62 @@ def test_windowed_average_batched_matches_per_individual_for_each_row():
                 assert abs(a - e) < 1e-9, f"trial {trial}, row {p}, pos {i}: {a} vs {e}"
 
 
+def test_windowed_average_batched_safe_path_matches_fancy_indexing_reference():
+    """windowed_average_batched's "safe" fast path used to gather
+    `windows[:, row_starts, :]` via fancy indexing, which forces
+    materializing a full (P, len(row_starts), 2*half) copy -- confirmed as
+    the exact cause of a real CUDA OOM on real Colab data (population
+    50,000, a 758-residue gene): the failed allocation was
+    50000*2238*14*8 == 12,532,800,000 bytes, an exact match for that shape.
+    Fixed by slicing instead (safe_idx/row_starts are always a single
+    contiguous ascending run, so a slice is equivalent and just a view, no
+    copy). This checks the slice-based version against the original
+    fancy-indexing formula directly, not just against the per-individual
+    reference (which the test above already does, and which passing
+    doesn't by itself rule out a regression two array-backed
+    implementations could both share)."""
+    def _fancy_index_reference(xp, values, target_len, winsize):
+        P, M = values.shape
+        half = max(winsize // 2, 1)
+        if M == 0 or target_len == 0:
+            return xp.zeros((P, target_len), dtype=float)
+        idx = np.arange(target_len)
+        regime_a = idx < winsize
+        regime_b = (~regime_a) & (idx > target_len - winsize)
+        regime_c = ~(regime_a | regime_b)
+        safe = regime_c & (idx - half >= 0) & (idx + half <= M) & (M >= 2 * half)
+        out = xp.zeros((P, target_len), dtype=float)
+        if safe.any():
+            from genewriter.gpu_change_vector import _sliding_window_view
+            windows = _sliding_window_view(xp, values, 2 * half, axis=1)
+            safe_idx = idx[safe]
+            row_starts = safe_idx - half
+            means = windows[:, row_starts, :].mean(axis=2)
+            out[:, safe_idx] = means
+        for i in idx[~safe].tolist():
+            if i < winsize:
+                start, end = 0, i
+            elif i > target_len - winsize:
+                start, end = i, M
+            else:
+                start, end = max(i - half, 0), min(i + half, M)
+            if end > start:
+                out[:, i] = values[:, start:end].mean(axis=1)
+        return out
+
+    rng = np.random.default_rng(1)
+    for trial in range(20):
+        P = rng.integers(1, 6)
+        M = rng.integers(0, 80)
+        target_len = rng.integers(0, 80)
+        winsize = int(rng.integers(1, 25))
+        values = rng.uniform(-50, 50, size=(P, M))
+
+        reference = _fancy_index_reference(np, values, target_len, winsize)
+        actual = windowed_average_batched(np, values, target_len, winsize)
+        assert np.allclose(actual, reference, atol=1e-12), f"trial {trial}: P={P} M={M} target_len={target_len} winsize={winsize}"
+
+
 def test_encode_population_round_trips_via_decode():
     from genewriter.codon_tables import decode_codons
 
