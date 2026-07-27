@@ -255,17 +255,16 @@ CONFIG = dict(
                                      # When PIPELINE_XP_BACKEND is "gpu" or
                                      # "numpy", lookahead=True routes through
                                      # the batched directed_evolution_batch()
-                                     # instead -- its own scoring is now fast
-                                     # (Kmer is batched too), but growth's
-                                     # *other* per-replicate cost
-                                     # (merge_replicate's storage diffing,
-                                     # still unbatched) caps the real
-                                     # end-to-end win at ~3x, not the 25-48x
-                                     # the exact-refresh steps get -- see
-                                     # Handoff.md sec 6. Set False here if
-                                     # even that isn't fast enough and
-                                     # picking the single best alternative
-                                     # per mutation isn't essential.
+                                     # instead -- both its scoring (Kmer is
+                                     # batched too) and growth's replicate
+                                     # storage (merge_replicate_exact()/
+                                     # merge_replicates_batch(), no longer
+                                     # the unbatched bottleneck it used to
+                                     # be) are fast now -- see Handoff.md
+                                     # sec 9/10. Set False here if even that
+                                     # isn't fast enough and picking the
+                                     # single best alternative per mutation
+                                     # isn't essential.
         refresh_every=5,            # force an exact change-vector recompute
                                      # every N generations (0/None = never,
                                      # fastest but drift is unbounded; 1 =
@@ -661,4 +660,17 @@ if __name__ == "__main__":
 #   # cell 2 (seconds -- re-run freely while iterating on GENE_ID etc.)
 #   CONFIG["GENE_ID"] = 326
 #   aa_seq, locvec = pick_target(CONFIG, genes)
-#   run_pipeline(CONFIG, aa_seq, locvec, analysis_objects, xp_gpu, genes)
+#   final_pop = run_pipeline(CONFIG, aa_seq, locvec, analysis_objects, xp_gpu, genes)
+#
+#   # cell 3 (seconds -- t-SNE over codon-choice neighborhoods, colored by
+#   # fitness/any change-vector term -- see genewriter.visualize's module
+#   # docstring). Needs final_pop from cell 2 -- if that wasn't captured
+#   # (e.g. you ran main() directly instead), reload the latest saved
+#   # generation from RUN_GA_OPTIONS['save_dir'] instead (see that dict's
+#   # save_dir/run_name -- save_gen() writes one {run_name}_gen{N}.json per
+#   # generation there, so the run doesn't have to be re-run or even have
+#   # finished to visualize its most recent generation).
+#   from genewriter.visualize import plot_population_tsne
+#   import matplotlib.pyplot as plt
+#   fig = plot_population_tsne(final_pop, CONFIG["WEIGHTS"], color_by=["fitness", "GC", "RareCodons", "Uracil"])
+#   plt.show()
