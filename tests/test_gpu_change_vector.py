@@ -346,3 +346,26 @@ def test_batch_calculate_change_vectors_matches_per_individual_for_all_terms(ana
 
 def test_batch_calculate_change_vectors_empty_population_returns_empty_list(analysis_objects):
     assert batch_calculate_change_vectors([], analysis_objects, xp=np) == []
+
+
+def test_batched_and_per_individual_paths_share_the_baseline_stat_cache(analysis_objects):
+    """Real bug found on a real Colab run (Tesla T4, real genome-wide
+    Standards baselines): CodonUsage/GC/CodonPairBias each recomputed
+    baseline mean/std from scratch on *every* batched call, dominating
+    real-scale cost so completely that each term cost the same whether the
+    population was 200 or 50,000 individuals. Fixed via change_vector.py's
+    cached_stat()/cached_mean_std(), shared by both this module and
+    change_vector.py's per-individual terms (same cache key). Prove the
+    sharing is real: run the per-individual path first (populates the
+    cache), corrupt the baseline in place, then confirm the batched path
+    reuses the now-stale-relative-to-the-mutation cached value rather than
+    recomputing -- if it recomputed, this would fail."""
+    pop = _population(LONG_AA_SEQ, 3)
+    per_individual = [calculate_change_vector(sol, analysis_objects)['CodonUsage'] for sol in pop]
+
+    analysis_objects.codon_usage.windowscores = [999.0] * len(analysis_objects.codon_usage.windowscores)
+    analysis_objects.codon_usage.windowdistancesfromoptimal = [999.0] * len(analysis_objects.codon_usage.windowdistancesfromoptimal)
+    analysis_objects.codon_usage.codonUsageScoreByGene = [999.0] * len(analysis_objects.codon_usage.codonUsageScoreByGene)
+
+    batched = batch_calculate_change_vectors(pop, analysis_objects, xp=np)
+    _assert_rows_close(per_individual, [r['CodonUsage'] for r in batched])

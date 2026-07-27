@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from genewriter.change_vector import calculate_change_vector, score_changevec
+from genewriter.change_vector import cached_mean_std, cached_stat, calculate_change_vector, score_changevec
 from genewriter.codon_tables import generate_codon_vec
 
 from conftest import random_solution as _random_solution
@@ -130,3 +130,70 @@ def test_uracil_term_counts_multiple_variable_t_bases_in_one_codon(analysis_obje
     from genewriter.change_vector import _uracil_term
 
     assert _uracil_term(['TCT'], analysis_objects, ['I']) == [2.0]
+
+
+def test_cached_stat_computes_only_once(analysis_objects):
+    """The whole point of cached_stat(): a real Colab run against real
+    genome-wide Standards baselines showed CodonUsage/GC/CodonPairBias each
+    taking a near-constant ~5-13s per batched call *regardless of
+    population size*, traced to recomputing baseline mean/std (or a whole
+    lookup table) from scratch every call. compute_fn must only ever run
+    once per (obj, key)."""
+    calls = []
+
+    def compute():
+        calls.append(1)
+        return 42
+
+    obj = analysis_objects.rare_codon
+    assert cached_stat(obj, 'k', compute) == 42
+    assert cached_stat(obj, 'k', compute) == 42
+    assert cached_stat(obj, 'k', compute) == 42
+    assert len(calls) == 1
+
+
+def test_cached_stat_is_scoped_per_object_and_per_key(analysis_objects):
+    """Different objects, and different keys on the same object, must not
+    collide in the cache."""
+    calls = []
+
+    def compute(tag):
+        calls.append(tag)
+        return tag
+
+    a, b = analysis_objects.rare_codon, analysis_objects.codon_usage
+    assert cached_stat(a, 'x', lambda: compute('a-x')) == 'a-x'
+    assert cached_stat(a, 'y', lambda: compute('a-y')) == 'a-y'
+    assert cached_stat(b, 'x', lambda: compute('b-x')) == 'b-x'
+    assert sorted(calls) == ['a-x', 'a-y', 'b-x']
+
+
+def test_cached_mean_std_ignores_later_mutation_of_the_source_list(analysis_objects):
+    obj = analysis_objects.codon_usage
+    values = [1.0, 2.0, 3.0]
+    first = cached_mean_std(obj, 'k', values)
+    values.append(1000.0)  # mutate in place after first use -- must not affect the cache
+    second = cached_mean_std(obj, 'k', values)
+    assert first == second
+
+
+def test_codon_usage_term_baseline_stats_are_cached_across_calls(aa_seq, analysis_objects):
+    """Real end-to-end proof the term itself is wired to the cache, not
+    just that cached_mean_std() works in isolation: mutating
+    ca.windowscores in place *after* the first call must not change the
+    second call's result. (Real callers never mutate a loaded baseline in
+    place -- see cached_stat()'s docstring -- so this is a deliberate
+    contract violation used only to prove the cache is actually active.)"""
+    sol = _random_solution(aa_seq)
+    first = calculate_change_vector(sol, analysis_objects)['CodonUsage']
+    analysis_objects.codon_usage.windowscores = [999.0] * len(analysis_objects.codon_usage.windowscores)
+    second = calculate_change_vector(sol, analysis_objects)['CodonUsage']
+    assert first == second
+
+
+def test_gc_term_baseline_stats_are_cached_across_calls(aa_seq, analysis_objects):
+    sol = _random_solution(aa_seq)
+    first = calculate_change_vector(sol, analysis_objects)['GC']
+    analysis_objects.gc.taggedGC1['Exon'] = [999.0] * len(analysis_objects.gc.taggedGC1['Exon'])
+    second = calculate_change_vector(sol, analysis_objects)['GC']
+    assert first == second

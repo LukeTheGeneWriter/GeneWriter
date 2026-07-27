@@ -154,6 +154,59 @@ def _zscore(value: float, mean: float, std: float) -> float:
     return 0.0 if std == 0 else (value - mean) / std
 
 
+def cached_stat(obj, key, compute_fn):
+    """Lazily compute and cache compute_fn() on obj, keyed by key -- reused
+    across every subsequent call for the life of obj instead of
+    recomputing from scratch every time.
+
+    Real-world impact this fixes: RareCodons/CodonUsage/CodonPairBias/GC
+    all recomputed mean/std (or, for CodonPairBias/Kmer, a whole lookup
+    table) from a baseline array on *every single call* -- cheap against
+    the tiny synthetic baselines every local test uses, but on a real
+    Colab run against real genome-wide Standards baselines (windowdistances-
+    fromoptimal/windowscores/taggedGC1-3/cpbPerWindow are window-level
+    arrays across the whole corpus, potentially huge), this dominated
+    real-scale cost so completely that CodonUsage/GC/CodonPairBias each
+    took a near-*constant* ~5-13s per batched call regardless of whether
+    the population was 200 or 50,000 -- a dead giveaway it was baseline-
+    sized work, not population-sized work. `rare_codon.usagePerGene` (one
+    value per gene, not per window) is the one baseline small enough that
+    this went unnoticed there. `analysis_objects` (and each of its 5
+    sub-analyses) is loaded once per GA run and never mutated afterward by
+    any term in this module or gpu_change_vector.py, so caching per-object
+    is safe -- a caller that genuinely needs different baseline data
+    mid-run must load/construct a new object rather than editing fields on
+    this one in place, or the cache goes stale (no test in this repo does
+    that; each mutates a baseline field before the object's first use, on
+    a fresh per-test fixture instance).
+
+    Cached directly on the instance (a private dict attribute), not a
+    module-level dict keyed by id(obj) -- so it is garbage-collected
+    together with the object (no unbounded growth across many different
+    baseline objects over a long-running process) and immune to id()
+    reuse after garbage collection (a real risk a global id()-keyed cache
+    would have). Shared between change_vector.py's per-individual terms
+    and gpu_change_vector.py's batched counterparts (same obj, same key)
+    -- whichever path runs first populates the cache for both.
+    """
+    cache = getattr(obj, '_stat_cache', None)
+    if cache is None:
+        cache = {}
+        obj._stat_cache = cache
+    if key not in cache:
+        cache[key] = compute_fn()
+    return cache[key]
+
+
+def cached_mean_std(obj, key, values) -> tuple:
+    """cached_stat() specialized for the extremely common "(mean, std) of
+    this baseline array/list" case -- see cached_stat()'s docstring."""
+    def _compute():
+        arr = np.asarray(values, dtype=float)
+        return (float(arr.mean()), float(arr.std()))
+    return cached_stat(obj, key, _compute)
+
+
 _TERM_REGISTRY = {}
 
 
@@ -226,21 +279,28 @@ def _rare_codon_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: lis
     else:
         window_sums = np.empty(0, dtype=np.int64)
 
-    total_windows = sum(rc.rare_codon_windows.values())
     # odds.get(sum(win), inf) as an array lookup: window sums can only be
     # in [0, winsize], so a fixed-size table covers every possible key;
     # counts the baseline dict doesn't have an entry for (e.g. windows of
     # that composition were never observed) default to inf, same as .get().
-    odds_by_count = np.full(winsize + 1, np.inf)
-    for count, n in rc.rare_codon_windows.items():
-        if 0 <= count <= winsize:
-            odds_by_count[count] = np.inf if n == 0 else total_windows / n
+    # Cached per (rc, winsize) -- built from rc.rare_codon_windows, which
+    # never changes for the life of an analysis object -- see
+    # cached_stat()'s docstring for why recomputing this every call was a
+    # real cost at real-scale baseline sizes.
+    def _build_odds_by_count():
+        total_windows = sum(rc.rare_codon_windows.values())
+        table = np.full(winsize + 1, np.inf)
+        for count, n in rc.rare_codon_windows.items():
+            if 0 <= count <= winsize:
+                table[count] = np.inf if n == 0 else total_windows / n
+        return table
+    odds_by_count = cached_stat(rc, ('odds_by_count', winsize), _build_odds_by_count)
     scorewins = odds_by_count[window_sums].tolist() if window_sums.size else []
     scorevec = _windowed_average(scorewins, len(sol), winsize)
 
     overall_rc = rvec.sum() / len(rvec)
-    distrib = np.asarray(rc.usagePerGene, dtype=float)
-    zscore = _zscore(overall_rc, distrib.mean(), distrib.std()) ** 2
+    distrib_mean, distrib_std = cached_mean_std(rc, 'usagePerGene', rc.usagePerGene)
+    zscore = _zscore(overall_rc, distrib_mean, distrib_std) ** 2
 
     # rvec[i] gates the signal to rare-codon positions only. Guard the
     # multiplication explicitly rather than `scorevec[i] * rvec[i] * zscore`:
@@ -277,14 +337,14 @@ def _codon_usage_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: li
         cuwinscores = []
         cudists = []
 
-    dist_mean, dist_std = np.mean(ca.windowdistancesfromoptimal), np.std(ca.windowdistancesfromoptimal)
-    score_mean, score_std = np.mean(ca.windowscores), np.std(ca.windowscores)
+    dist_mean, dist_std = cached_mean_std(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
+    score_mean, score_std = cached_mean_std(ca, 'windowscores', ca.windowscores)
     dist_vals = _windowed_average(cudists, len(sol), winsize)
     score_vals = _windowed_average(cuwinscores, len(sol), winsize)
     dist_zs = [_zscore(v, dist_mean, dist_std) ** 2 for v in dist_vals]
     score_zs = [_zscore(v, score_mean, score_std) ** 2 for v in score_vals]
 
-    gene_mean, gene_std = np.mean(ca.codonUsageScoreByGene), np.std(ca.codonUsageScoreByGene)
+    gene_mean, gene_std = cached_mean_std(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
     straight_z = [_zscore(o, gene_mean, gene_std) / 2 for o in cuvec]
 
     return [straight_z[i] * score_zs[i] + straight_z[i] * dist_zs[i] for i in range(len(sol))]
@@ -313,7 +373,7 @@ def _codon_pair_bias_term(sol: list, analysis_objects: 'AnalysisObjects', locvec
     else:
         win_scores = [0.0] * num_windows
 
-    win_mean, win_std = np.mean(cpb.cpbPerWindow), np.std(cpb.cpbPerWindow)
+    win_mean, win_std = cached_mean_std(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
     win_z = [_zscore(v, win_mean, win_std) ** 2 for v in win_scores]
     win_change = _windowed_average(win_z, len(sol), winsize)
 
@@ -351,16 +411,20 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
     gc2_mean = 1.0 - gc_flags[:, 1].mean()
     gc3_mean = 1.0 - gc_flags[:, 2].mean()
 
-    def z_for(loc: str, tagged: dict, value: float) -> float:
-        arr = np.asarray(tagged[loc], dtype=float)
-        return _zscore(value, arr.mean(), arr.std())
+    def z_for(loc: str, field_name: str, tagged: dict, value: float) -> float:
+        # Cache key matches gpu_change_vector.batch_gc_term's z_batch()
+        # exactly, so whichever path (per-individual or batched) runs
+        # first populates the cache for both -- see cached_stat()'s
+        # docstring.
+        mean, std = cached_mean_std(gc, (field_name, loc), tagged[loc])
+        return _zscore(value, mean, std)
 
     z_by_bucket = {}
     for bucket in ('ExonL50', 'Exon', 'ExonR50', 'Splice'):
         z_by_bucket[bucket] = {
-            1: z_for(bucket, gc.taggedGC1, gc1_mean),
-            2: z_for(bucket, gc.taggedGC2, gc2_mean),
-            3: z_for(bucket, gc.taggedGC3, gc3_mean),
+            1: z_for(bucket, 'taggedGC1', gc.taggedGC1, gc1_mean),
+            2: z_for(bucket, 'taggedGC2', gc.taggedGC2, gc2_mean),
+            3: z_for(bucket, 'taggedGC3', gc.taggedGC3, gc3_mean),
         }
 
     # A position is only worth mutating for GC purposes if some synonymous
@@ -407,8 +471,8 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
             mask = majority_bucket == b
             if not mask.any():
                 continue
-            baseline = np.asarray(gc.windows[name], dtype=float)
-            win_z[mask] = _zscore(window_gc[mask], baseline.mean(), baseline.std()) ** 2
+            base_mean, base_std = cached_mean_std(gc, ('windows', name), gc.windows[name])
+            win_z[mask] = _zscore(window_gc[mask], base_mean, base_std) ** 2
         win_z = win_z.tolist()
     else:
         win_z = []

@@ -38,7 +38,7 @@ its memory-scaling caveat at large k.
 
 import numpy as np
 
-from .change_vector import _zscore, calculate_change_vector, registered_terms
+from .change_vector import _zscore, cached_mean_std, cached_stat, calculate_change_vector, registered_terms
 from .codon_tables import (
     AA_CODONS,
     CODON_FREQ_BY_INDEX,
@@ -164,19 +164,23 @@ def batch_rare_codon_term(xp, codon_idx, rc, winsize: int = 15):
     else:
         window_sums = xp.zeros((P, 0), dtype=xp.int64)
 
-    total_windows = sum(rc.rare_codon_windows.values())
-    odds_by_count = np.full(winsize + 1, np.inf)
-    for count, n in rc.rare_codon_windows.items():
-        if 0 <= count <= winsize:
-            odds_by_count[count] = np.inf if n == 0 else total_windows / n
-    odds_by_count = xp.asarray(odds_by_count)
+    # Cached per (rc, winsize) -- same key change_vector._rare_codon_term
+    # uses, shared cache -- see cached_stat()'s docstring for why this
+    # matters at real-scale baseline sizes.
+    def _build_odds_by_count():
+        total_windows = sum(rc.rare_codon_windows.values())
+        table = np.full(winsize + 1, np.inf)
+        for count, n in rc.rare_codon_windows.items():
+            if 0 <= count <= winsize:
+                table[count] = np.inf if n == 0 else total_windows / n
+        return table
+    odds_by_count = xp.asarray(cached_stat(rc, ('odds_by_count', winsize), _build_odds_by_count))
     scorewins = odds_by_count[window_sums] if window_sums.shape[1] else xp.zeros((P, 0), dtype=float)
 
     scorevec = windowed_average_batched(xp, scorewins, N, winsize)  # (P, N)
 
     overall_rc = rvec.sum(axis=1) / N  # (P,)
-    distrib = np.asarray(rc.usagePerGene, dtype=float)
-    dmean, dstd = float(distrib.mean()), float(distrib.std())
+    dmean, dstd = cached_mean_std(rc, 'usagePerGene', rc.usagePerGene)
     zscore = (xp.zeros_like(overall_rc) if dstd == 0 else (overall_rc - dmean) / dstd) ** 2  # (P,)
 
     # rvec gates the signal to rare-codon positions only -- select 0 rather
@@ -202,8 +206,8 @@ def batch_codon_usage_term(xp, codon_idx, ca, winsize: int = 15):
         cuwinscores = xp.zeros((P, 0), dtype=float)
         cudists = xp.zeros((P, 0), dtype=float)
 
-    dist_mean, dist_std = float(np.mean(ca.windowdistancesfromoptimal)), float(np.std(ca.windowdistancesfromoptimal))
-    score_mean, score_std = float(np.mean(ca.windowscores)), float(np.std(ca.windowscores))
+    dist_mean, dist_std = cached_mean_std(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
+    score_mean, score_std = cached_mean_std(ca, 'windowscores', ca.windowscores)
     dist_vals = windowed_average_batched(xp, cudists, N, winsize)
     score_vals = windowed_average_batched(xp, cuwinscores, N, winsize)
     # std==0 branches return a same-shaped zero array, not a bare Python
@@ -213,7 +217,7 @@ def batch_codon_usage_term(xp, codon_idx, ca, winsize: int = 15):
     dist_zs = (xp.zeros_like(dist_vals) if dist_std == 0 else (dist_vals - dist_mean) / dist_std) ** 2
     score_zs = (xp.zeros_like(score_vals) if score_std == 0 else (score_vals - score_mean) / score_std) ** 2
 
-    gene_mean, gene_std = float(np.mean(ca.codonUsageScoreByGene)), float(np.std(ca.codonUsageScoreByGene))
+    gene_mean, gene_std = cached_mean_std(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
     straight_z = (xp.zeros_like(cuvec) if gene_std == 0 else (cuvec - gene_mean) / gene_std) / 2
 
     return straight_z * score_zs + straight_z * dist_zs
@@ -225,12 +229,14 @@ def batch_codon_pair_bias_term(xp, codon_idx, cpb, winsize: int = 15):
     if N < 2:
         return xp.zeros((P, N), dtype=float)
 
-    num_codons = len(CODON_LIST)
-    cpb_table = np.zeros((num_codons, num_codons), dtype=float)
-    for pair, score in cpb.cpb_lit.items():
-        i, j = CODON_TO_INDEX[pair[:3]], CODON_TO_INDEX[pair[3:]]
-        cpb_table[i, j] = score
-    cpb_table = xp.asarray(cpb_table)
+    def _build_cpb_table():
+        num_codons = len(CODON_LIST)
+        table = np.zeros((num_codons, num_codons), dtype=float)
+        for pair, score in cpb.cpb_lit.items():
+            i, j = CODON_TO_INDEX[pair[:3]], CODON_TO_INDEX[pair[3:]]
+            table[i, j] = score
+        return table
+    cpb_table = xp.asarray(cached_stat(cpb, 'cpb_table', _build_cpb_table))
 
     pair_scores = cpb_table[codon_idx[:, :-1], codon_idx[:, 1:]]  # (P, N-1)
 
@@ -242,7 +248,7 @@ def batch_codon_pair_bias_term(xp, codon_idx, cpb, winsize: int = 15):
     else:
         win_scores = xp.zeros((P, num_windows), dtype=float)
 
-    win_mean, win_std = float(np.mean(cpb.cpbPerWindow)), float(np.std(cpb.cpbPerWindow))
+    win_mean, win_std = cached_mean_std(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
     win_z = (xp.zeros_like(win_scores) if win_std == 0 else (win_scores - win_mean) / win_std) ** 2
     win_change = windowed_average_batched(xp, win_z, N, winsize)  # (P, N)
 
@@ -275,13 +281,15 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     gc2_mean = 1.0 - per_pos_gc[:, :, 1].mean(axis=1)
     gc3_mean = 1.0 - per_pos_gc[:, :, 2].mean(axis=1)
 
-    def z_batch(value_mean, loc, tagged):
+    def z_batch(value_mean, loc, field_name, tagged):
         """(value_mean - baseline_mean) / baseline_std, elementwise over
         the batch. Always returns an xp array of shape (P,), even when
         std==0 (a same-shaped zero array, not a bare Python 0.0) so every
-        caller can treat the result uniformly."""
-        arr = np.asarray(tagged[loc], dtype=float)
-        m, s = float(arr.mean()), float(arr.std())
+        caller can treat the result uniformly. Cache key matches
+        change_vector._gc_term's z_for() exactly, so whichever path runs
+        first populates the cache for both -- see cached_stat()'s
+        docstring."""
+        m, s = cached_mean_std(gc, (field_name, loc), tagged[loc])
         if s == 0:
             return xp.zeros_like(value_mean, dtype=float)
         return (value_mean - m) / s
@@ -289,9 +297,9 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     z_by_bucket = {}  # bucket -> (z1, z2, z3), each shape (P,)
     for bucket in _LOCATION_BUCKET_NAMES:
         z_by_bucket[bucket] = (
-            z_batch(gc1_mean, bucket, gc.taggedGC1),
-            z_batch(gc2_mean, bucket, gc.taggedGC2),
-            z_batch(gc3_mean, bucket, gc.taggedGC3),
+            z_batch(gc1_mean, bucket, 'taggedGC1', gc.taggedGC1),
+            z_batch(gc2_mean, bucket, 'taggedGC2', gc.taggedGC2),
+            z_batch(gc3_mean, bucket, 'taggedGC3', gc.taggedGC3),
         )
 
     variable_flags = xp.asarray(np.asarray(VARIABLE_FLAGS_BY_INDEX, dtype=float))  # (64, 3)
@@ -327,8 +335,7 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
             mask = majority_bucket == b
             if not mask.any():
                 continue
-            baseline = np.asarray(gc.windows[name], dtype=float)
-            m, s = float(baseline.mean()), float(baseline.std())
+            m, s = cached_mean_std(gc, ('windows', name), gc.windows[name])
             cols = np.asarray(np.nonzero(mask)[0])
             val = window_gc[:, cols]
             win_z[:, cols] = (0.0 if s == 0 else (val - m) / s) ** 2
@@ -446,7 +453,11 @@ def batch_kmer_term(xp, codon_idx, kmer, locvec: list, winsize: int = 15):
         majority_bucket = _majority_window_bucket(location_string, k, num_wins)  # (num_wins,) shared
         bucket_rows = xp.asarray(majority_bucket)
 
-        table = xp.asarray(_build_kmer_score_table(kmer_by_seq, k))  # (num_buckets, 4**k)
+        # Cached per (kmer, k) -- see this function's docstring for the
+        # per-k table-build cost, and cached_stat()'s docstring for why
+        # rebuilding it from kmer_by_seq on every call was worth avoiding.
+        table_np = cached_stat(kmer, ('kmer_score_table', k_str), lambda kbs=kmer_by_seq, kk=k: _build_kmer_score_table(kbs, kk))
+        table = xp.asarray(table_np)  # (num_buckets, 4**k)
         win_scores = table[xp.broadcast_to(bucket_rows, codes.shape), codes]  # (P, num_wins)
 
         overall = win_scores.mean(axis=1)  # (P,)
