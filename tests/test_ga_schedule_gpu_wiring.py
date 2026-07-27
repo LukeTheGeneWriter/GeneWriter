@@ -181,6 +181,7 @@ def test_run_schedule_numpy_xp_matches_gpu_xp(aa_seq, analysis_objects, weights)
         {"kind": "kill_off", "percent_cut": 30},
         {"kind": "select", "target_size": 10},
         {"kind": "flatten", "recursion_limit": 1},
+        {"kind": "directed_growth", "rate": 3},  # strategic placement right after flatten -- see its docstring
     ]
 
     random.seed(5678)

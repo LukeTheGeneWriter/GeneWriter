@@ -15,7 +15,9 @@ def ctx(aa_seq, analysis_objects, weights):
 
 
 def test_registered_steps_includes_the_builtin_kinds():
-    assert set(sched.registered_steps()) == {'input', 'growth', 'kill_off', 'select', 'flatten', 'save', 'repeat'}
+    assert set(sched.registered_steps()) == {
+        'input', 'growth', 'directed_growth', 'kill_off', 'select', 'flatten', 'save', 'repeat',
+    }
 
 
 def test_step_input_adds_the_requested_number_of_seeds(ctx):
@@ -172,6 +174,87 @@ def test_step_growth_with_xp_and_lookahead_uses_batched_growth(aa_seq, analysis_
     sched.run_steps(seeded, xp_ctx, [{"kind": "growth", "rate": 4, "mutation_chance": 0.3}])
 
     assert calls, "growth step with ctx.xp set never used the batched growth path"
+
+
+def test_step_directed_growth_never_calls_random_mutation(ctx, monkeypatch):
+    """The whole point of "directed_growth" vs. "growth": 100% directed,
+    0% random-mutation replicates. Confirm replicate_and_mutate_random is
+    never even called, not just that its output happens not to show up."""
+    def _boom(*args, **kwargs):
+        raise AssertionError("directed_growth must never call replicate_and_mutate_random")
+
+    monkeypatch.setattr(sched, "replicate_and_mutate_random", _boom)
+
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 3}])
+    result = sched.run_steps(seeded, ctx, [{"kind": "directed_growth", "rate": 5}])
+    assert len(result) >= 1
+
+
+def test_step_directed_growth_reproduces_and_dedups_within_the_step(ctx):
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 1}])
+    result = sched.run_steps(seeded, ctx, [{"kind": "directed_growth", "rate": 5}])
+    codons_seen = [tuple(p.codons) for p in result]
+    assert len(codons_seen) == len(set(codons_seen)), "directed_growth step produced duplicate genotypes as separate entries"
+
+
+def test_step_directed_growth_diffs_new_individuals_against_their_parent(ctx, monkeypatch):
+    """Same diffed-storage contract as "growth" (see
+    test_step_growth_diffs_new_individuals_against_their_parent) -- the
+    per-individual (xp=None) path still stores new genotypes via
+    ga.merge_replicate()'s diff_change_vector() approximation."""
+    import genewriter.ga as ga_module
+
+    calls = []
+    original = ga_module.diff_change_vector
+
+    def _spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(ga_module, "diff_change_vector", _spy)
+
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 1}])
+    sched.run_steps(seeded, ctx, [{"kind": "directed_growth", "rate": 8}])
+
+    assert calls, "directed_growth step never called diff_change_vector for a new genotype"
+
+
+def test_step_directed_growth_with_xp_and_lookahead_uses_batched_growth(aa_seq, analysis_objects, weights, monkeypatch):
+    """Same xp-batching contract as "growth" (see
+    test_step_growth_with_xp_and_lookahead_uses_batched_growth) -- must
+    route through directed_evolution_batch(), not per-individual
+    directed_evolution(), when ctx.xp is set and lookahead=True."""
+    import numpy as np
+
+    calls = []
+    original = sched.directed_evolution_batch
+
+    def _spy(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("directed_evolution (per-individual) should not be called when ctx.xp is set and lookahead=True")
+
+    monkeypatch.setattr(sched, "directed_evolution_batch", _spy)
+    monkeypatch.setattr(sched, "directed_evolution", _boom)
+
+    xp_ctx = sched.ScheduleContext(aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects, xp=np)
+    seeded = sched.run_steps([], xp_ctx, [{"kind": "input", "count": 6}])
+    sched.run_steps(seeded, xp_ctx, [{"kind": "directed_growth", "rate": 4}])
+
+    assert calls, "directed_growth step with ctx.xp set never used the batched growth path"
+
+
+def test_step_directed_growth_after_flatten_does_not_crash(ctx):
+    """The strategic placement this step was actually designed for -- see
+    its docstring and the schedule module docstring."""
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 6}])
+    result = sched.run_steps(seeded, ctx, [
+        {"kind": "flatten", "recursion_limit": 1},
+        {"kind": "directed_growth", "rate": 3},
+    ])
+    assert len(result) >= 1
 
 
 def test_step_save_writes_a_checkpoint(tmp_path, aa_seq, analysis_objects, weights):

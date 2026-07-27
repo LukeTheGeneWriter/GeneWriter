@@ -58,6 +58,15 @@ from its parent one at a time via merge_replicate()) -- once the
 alternative-scoring itself got fast, that per-replicate storage diffing had
 become the new dominant cost (see directed_evolution_batch()'s docstring
 and Handoff.md sec 5/6 for the profiling that found it).
+
+"directed_growth" is "growth" with the random-mutation branch removed
+entirely -- every replicate is directed/lookahead, none is a plain random
+mutation. Meant for strategic placement rather than as a blanket swap for
+"growth", e.g. right after "flatten": flatten trades concentration for
+neighborhood breadth, and a pure directed-growth step right after pushes
+each of those newly-diversified individuals toward its locally-best
+synonymous alternative instead of spending half its replicates on
+undirected mutation again.
 """
 
 import random
@@ -161,40 +170,38 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     return list(pop_index.values())
 
 
-@register_step("growth")
-def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
-    """Reproduce every individual. `rate` offspring per individual (default
-    10), each independently either a random-mutation replicate (with
-    probability `mutation_chance` per codon, default 0.05) or a
-    directed-evolution replicate (greedy one-step lookahead biased toward
-    high-change-vector positions, unless `lookahead` is False -- see
-    ga.directed_evolution()), chosen per-offspring with probability
-    `directed_fraction` (default 0.5) of being directed.
+def _do_growth(
+    pop: list, ctx: ScheduleContext, rate: int, mutation_chance: float, directed_fraction: float, lookahead: bool,
+) -> list:
+    """Shared implementation behind the "growth" and "directed_growth" step
+    kinds (see both registered functions' docstrings) -- every difference
+    between them is just what directed_fraction is: "growth" takes it from
+    `params` (default 0.5, a real mix), "directed_growth" hardcodes 1.0
+    (every replicate directed, no random-mutation branch at all).
 
-    Cheap: every new genotype's change vector is approximated by diffing
-    against its parent rather than fully recomputed -- see module
-    docstring. When ctx.xp is set and lookahead=True, *which* synonymous
-    alternative gets chosen is instead decided by a batched exact
-    recompute across every directed individual in this step at once (see
-    ga.directed_evolution_batch()), and storage of both directed and
-    random-mutation replicates is batched too (see
-    ga.merge_replicate_exact()/ga.merge_replicates_batch()) -- see module
-    docstring."""
-    rate = params.get("rate", 10)
-    mutation_chance = params.get("mutation_chance", 0.05)
-    directed_fraction = params.get("directed_fraction", 0.5)
-    lookahead = params.get("lookahead", True)
-
+    directed_fraction >= 1.0 skips the random-mutation classification/
+    branch entirely rather than just routing 0 individuals into it -- both
+    to avoid a wasted random.random() draw per individual (keeps
+    "directed_growth"'s RNG consumption minimal and predictable, not "the
+    same classification draw as growth, just always landing on directed")
+    and because merge_replicates_batch()/replicate_and_mutate_random()
+    have no useful work to do on an empty individual list anyway.
+    """
     pop_index = {tuple(p.codons): p for p in pop}
 
     if ctx.xp is not None and lookahead:
         # Batched growth path -- see ga.directed_evolution_batch() and this
         # module's docstring. Classification keeps the same
         # one-random.random()-per-individual-in-pop-order sequence as the
-        # per-individual path below.
-        is_directed = [random.random() < directed_fraction for _ in pop]
-        directed_individuals = [p for p, d in zip(pop, is_directed) if d]
-        random_individuals = [p for p, d in zip(pop, is_directed) if not d]
+        # per-individual path below (skipped entirely, not just
+        # short-circuited, when directed_fraction >= 1.0).
+        if directed_fraction >= 1.0:
+            directed_individuals = list(pop)
+            random_individuals = []
+        else:
+            is_directed = [random.random() < directed_fraction for _ in pop]
+            directed_individuals = [p for p, d in zip(pop, is_directed) if d]
+            random_individuals = [p for p, d in zip(pop, is_directed) if not d]
 
         random_reps = []
         for p in random_individuals:
@@ -214,7 +221,10 @@ def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
             import time as _time
             _t0 = _time.perf_counter()
         for i, p in enumerate(pop):
-            if random.random() < directed_fraction:
+            # Short-circuits (no random.random() call at all) when
+            # directed_fraction >= 1.0, same reasoning as the batched
+            # branch above.
+            if directed_fraction >= 1.0 or random.random() < directed_fraction:
                 # This, not anything xp/GPU-batching touches (unless xp is
                 # set -- see above), is the known per-individual hotspot at
                 # real scale: `lookahead=True` scores every synonymous
@@ -242,6 +252,65 @@ def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
     if ctx.save_dir:
         save_gen(result, ctx.step_count, ctx.save_dir, ctx.run_name)
     return result
+
+
+@register_step("growth")
+def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
+    """Reproduce every individual. `rate` offspring per individual (default
+    10), each independently either a random-mutation replicate (with
+    probability `mutation_chance` per codon, default 0.05) or a
+    directed-evolution replicate (greedy one-step lookahead biased toward
+    high-change-vector positions, unless `lookahead` is False -- see
+    ga.directed_evolution()), chosen per-offspring with probability
+    `directed_fraction` (default 0.5) of being directed.
+
+    Cheap: every new genotype's change vector is approximated by diffing
+    against its parent rather than fully recomputed -- see module
+    docstring. When ctx.xp is set and lookahead=True, *which* synonymous
+    alternative gets chosen is instead decided by a batched exact
+    recompute across every directed individual in this step at once (see
+    ga.directed_evolution_batch()), and storage of both directed and
+    random-mutation replicates is batched too (see
+    ga.merge_replicate_exact()/ga.merge_replicates_batch()) -- see module
+    docstring.
+
+    See "directed_growth" for a step that skips the random-mutation
+    branch entirely (100% directed) instead of mixing the two."""
+    rate = params.get("rate", 10)
+    mutation_chance = params.get("mutation_chance", 0.05)
+    directed_fraction = params.get("directed_fraction", 0.5)
+    lookahead = params.get("lookahead", True)
+    return _do_growth(pop, ctx, rate, mutation_chance, directed_fraction, lookahead)
+
+
+@register_step("directed_growth")
+def _step_directed_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
+    """Pure directed-evolution growth: every replicate comes from the
+    lookahead/directed-evolution path (ga.directed_evolution() /
+    ga.directed_evolution_batch()) -- no random-mutation replicates at
+    all, unlike "growth" (which mixes both via `directed_fraction`).
+
+    Meant to be placed strategically in a schedule rather than used as a
+    blanket replacement for "growth" -- e.g. right after a "flatten" step:
+    flatten trades replicate-count concentration for neighborhood breadth
+    (cashing each individual's copies in for single-mutation neighbors),
+    and a pure directed-growth step right after aggressively pushes each
+    of those newly-diversified individuals toward its locally-best
+    synonymous alternative instead of spending half the step's replicates
+    on undirected random mutation again.
+
+    `rate` (replicates per individual, default 10) and `lookahead`
+    (default True -- greedy one-step-lookahead alternative selection vs.
+    a uniform-random one at the chosen position, see
+    ga.directed_evolution()'s docstring) are the only params -- no
+    `mutation_chance`/`directed_fraction`, since there's no random-mutation
+    branch here to configure. Same xp-batching behavior as "growth" when
+    ctx.xp is set and lookahead=True (see ga.directed_evolution_batch()
+    and this module's docstring), just with every individual routed
+    through the directed/batched path instead of a random subset."""
+    rate = params.get("rate", 10)
+    lookahead = params.get("lookahead", True)
+    return _do_growth(pop, ctx, rate, mutation_chance=0.0, directed_fraction=1.0, lookahead=lookahead)
 
 
 @register_step("kill_off")
