@@ -709,6 +709,40 @@ def kill_off(pop: list, weights: dict, percent_cut: int = 30) -> list:
     return [p for p in pop if p.number > 0]
 
 
+def kill_off_outside_natural_range(pop: list, analysis_objects: AnalysisObjects, threshold: float) -> list:
+    """Hard cutoff, unlike kill_off()'s soft proportional cull: drops any
+    individual whose own aggregate metric (see
+    weight_calibration.natural_deviation_zscores()) is more than
+    `threshold` standard deviations from the natural per-gene baseline mean
+    in ANY category with a usable baseline -- a candidate can score well on
+    every other axis and still get cut for being a `threshold`+ sigma
+    outlier on just one.
+
+    Complements kill_off(): that one culls proportionally, weighted toward
+    the worst overall weighted score, but never guarantees any individual
+    genotype survives or dies. This one is an absolute guardrail -- "no
+    candidate this far outside nature's own observed range for any single
+    metric survives," independent of how good its overall weighted fitness
+    looks. An individual's entire replicate count is dropped (not
+    proportionally reduced like kill_off()) -- the cut is a property of the
+    genotype itself, not something a fraction of its copies can be exempt
+    from.
+
+    threshold: no default -- pick deliberately for your baseline's scale
+    (see natural_deviation_zscores()'s docstring for what's being
+    thresholded) rather than inheriting an arbitrary cutoff.
+    """
+    from .weight_calibration import natural_deviation_zscores
+
+    survivors = []
+    for p in pop:
+        zscores = natural_deviation_zscores(p.codons, analysis_objects)
+        if zscores and max(zscores.values()) > threshold:
+            continue
+        survivors.append(p)
+    return survivors
+
+
 def save_gen(pop: list, gen: int, save_dir: str, run_name: str) -> str:
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(save_dir, f"{run_name}_gen{gen}.json")

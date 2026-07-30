@@ -149,9 +149,15 @@ def compute_gc_analysis(genes: list, organism: str = "human", winsize: int = 21)
     tagged_gc2 = {'ExonL50': [], 'Exon': [], 'ExonR50': [], 'Splice': []}
     tagged_gc3 = {'ExonL50': [], 'Exon': [], 'ExonR50': [], 'Splice': []}
     windows = {'ExonL50': [], 'Exon': [], 'ExonR50': []}
+    gc_per_gene = []
     total_codons = 0
 
     for _gene, iso in protein_coding_isoforms(genes):
+        if not iso.codons:
+            continue
+        gc_bases = sum(1 for cod, _loc in iso.codons for base in cod if base in 'GC')
+        gc_per_gene.append(gc_bases / (3 * len(iso.codons)))
+
         for cod, loc in iso.codons:
             total_codons += 1
             bucket = TAG_TO_BUCKET.get(loc)
@@ -179,6 +185,7 @@ def compute_gc_analysis(genes: list, organism: str = "human", winsize: int = 21)
         taggedGC2=tagged_gc2,
         taggedGC3=tagged_gc3,
         windowsize=winsize,
+        gcPerGene=gc_per_gene,
     )
 
 

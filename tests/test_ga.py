@@ -75,6 +75,40 @@ def test_kill_off_terminates_when_every_individual_is_at_minimum(aa_seq, weights
     assert result == []
 
 
+def test_kill_off_outside_natural_range_drops_only_the_outlier_genotype(analysis_objects):
+    """Hard cutoff, unlike kill_off(): a genotype whose own aggregate
+    RareCodons rate is 9 std devs from the natural per-gene baseline mean
+    (forced via the overridden usagePerGene below) must be dropped
+    entirely, in full (not proportionally reduced like kill_off()),
+    regardless of its replicate count -- while a genotype within range
+    survives untouched."""
+    analysis_objects.rare_codon.usagePerGene = [0.0, 0.2] * 100  # mean 0.1, std 0.1
+    analysis_objects.gc.gcPerGene = [0.3, 0.7] * 100  # mean 0.5, std 0.2
+    analysis_objects.codon_usage.codonFreqsLit = {c: 20.0 for c in analysis_objects.codon_usage.codonFreqsLit}
+    analysis_objects.codon_usage.codonUsageScoreByGene = [18.0, 22.0] * 100
+    analysis_objects.codon_pair_bias.cpb_lit = {p: 50000.0 for p in analysis_objects.codon_pair_bias.cpb_lit}
+    analysis_objects.codon_pair_bias.cpbPerGene = [45000.0, 55000.0] * 100
+
+    normal = ['CTT'] * 10  # Leu, not rare, GC fraction 1/3 -- within range on every axis
+    outlier = ['GCG'] * 10  # Ala, every codon rare -- RareCodons z-score of 9.0
+    pop = [Proposed_Solution(normal, 3, {}), Proposed_Solution(outlier, 5, {})]
+
+    survivors = ga.kill_off_outside_natural_range(pop, analysis_objects, threshold=3.0)
+
+    assert len(survivors) == 1
+    assert survivors[0].codons == normal
+    assert survivors[0].number == 3  # untouched, not proportionally reduced
+
+
+def test_kill_off_outside_natural_range_keeps_everyone_when_threshold_is_high(analysis_objects):
+    analysis_objects.rare_codon.usagePerGene = [0.0, 0.2] * 100
+
+    pop = [Proposed_Solution(['GCG'] * 10, 1, {}), Proposed_Solution(['CTT'] * 10, 1, {})]
+    survivors = ga.kill_off_outside_natural_range(pop, analysis_objects, threshold=1e9)
+
+    assert len(survivors) == 2
+
+
 def test_replicate_and_mutate_random_preserves_length(aa_seq):
     sol = ga.generate_seed(aa_seq)
     reps = ga.replicate_and_mutate_random(sol, aa_seq, nreplicates=5, mutation_rate=0.5)

@@ -79,6 +79,7 @@ from .ga import (
     flatten_generation,
     generate_seed,
     kill_off,
+    kill_off_outside_natural_range,
     merge_replicate,
     merge_replicate_exact,
     merge_replicates_batch,
@@ -322,6 +323,23 @@ def _step_kill_off(pop: list, ctx: ScheduleContext, params: dict) -> list:
     percent_cut = params.get("percent_cut", 30)
     pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
     return kill_off(pop, ctx.weights, percent_cut=percent_cut)
+
+
+@register_step("natural_range_cutoff")
+def _step_natural_range_cutoff(pop: list, ctx: ScheduleContext, params: dict) -> list:
+    """Hard cutoff, not a survival-pressure step like kill_off/select/
+    flatten: drops any individual whose own aggregate per-category metric
+    is more than `threshold` standard deviations from the natural per-gene
+    baseline mean in any category (see
+    ga.kill_off_outside_natural_range()). No pre-step exact refresh --
+    unlike kill_off/select/flatten, this doesn't consult change_vecs at
+    all, only each individual's raw codons against analysis_objects.
+
+    `threshold` is required, no default -- pick deliberately (see
+    weight_calibration.natural_deviation_zscores()'s docstring for what's
+    being thresholded) rather than inheriting an arbitrary cutoff."""
+    threshold = params["threshold"]
+    return kill_off_outside_natural_range(pop, ctx.analysis_objects, threshold)
 
 
 @register_step("select")

@@ -45,6 +45,18 @@ import subprocess
 import sys
 import time
 
+# Populated by main() (see its `global` declaration) so a Colab notebook
+# cell pasted after this one can use them directly -- e.g.
+# genewriter.visualize.plot_population_tsne(final_pop, CONFIG["WEIGHTS"], ...)
+# -- without the caller having to thread every intermediate result through
+# by hand. None until main() actually runs.
+final_pop = None
+genes = None
+analysis_objects = None
+aa_seq = None
+locvec = None
+natural_codons = None
+
 # ============================================================================
 # CONFIG -- every option currently exposed by the codebase, in one place.
 # Edit this block; the rest of the script just reads from it.
@@ -178,6 +190,18 @@ CONFIG = dict(
     # enable it.
     # ------------------------------------------------------------------
     WEIGHTS=dict(RareCodons=1.0, CodonUsage=1.0, CodonPairBias=1.0, GC=1.0, Kmer=1.0, Uracil=0.0),
+
+    # If True, override WEIGHTS for every term with a natural-gene per-gene
+    # baseline array (RareCodons, CodonUsage, CodonPairBias, GC -- see
+    # weight_calibration.py) using compute_intolerance_weights(): a term
+    # real genes barely vary in gene-to-gene gets a proportionally larger
+    # weight (nature is intolerant of perturbing it), one they vary a lot in
+    # gets a proportionally smaller one -- scaled so the calibrated terms
+    # still average to 1.0 (same scale as leaving every WEIGHTS entry at
+    # 1.0). Kmer (no per-gene baseline) and Uracil (not a natural-baseline
+    # term at all -- see change_vector._uracil_term's docstring) always
+    # keep their WEIGHTS value regardless of this flag.
+    USE_INTOLERANCE_WEIGHTS=False,
 
     # ------------------------------------------------------------------
     # Step 2: batched change-vector GPU benchmark
@@ -393,12 +417,20 @@ def load_gene_data(cfg):
 
 
 def pick_target(cfg, genes):
-    """Returns (aa_seq, locvec) for either a custom sequence
-    (TARGET_MODE="custom", bypasses gene lookup entirely -- `genes` is
-    accepted but never touched) or the configured GENE_ID/ISOFORM_INDEX
-    (TARGET_MODE="gene", default) -- locvec is the real 'F'/'T'/'I'/'S'
-    location tag per residue, taken straight from the chosen isoform's
-    codon list rather than defaulted to all-'I'."""
+    """Returns (aa_seq, locvec, natural_codons) for either a custom
+    sequence (TARGET_MODE="custom", bypasses gene lookup entirely --
+    `genes` is accepted but never touched) or the configured
+    GENE_ID/ISOFORM_INDEX (TARGET_MODE="gene", default) -- locvec is the
+    real 'F'/'T'/'I'/'S' location tag per residue, taken straight from the
+    chosen isoform's codon list rather than defaulted to all-'I'.
+
+    natural_codons: the real isoform's own codon list (list[str], same
+    length as aa_seq) for TARGET_MODE="gene" -- lets
+    visualize.plot_population_trajectory's natural_codons argument embed
+    nature's own sequence in the same t-SNE space as the GA's population.
+    None for TARGET_MODE="custom" (no real gene at all) or if the
+    isoform's codon count doesn't match len(aa_seq) (malformed data --
+    can't safely embed alongside same-length GA individuals)."""
     if cfg["TARGET_MODE"] == "custom":
         from genewriter.codon_tables import validate_aa_sequence
 
@@ -409,7 +441,7 @@ def pick_target(cfg, genes):
         if len(locvec) != len(aa_seq):
             raise ValueError(f"CUSTOM_LOCVEC length ({len(locvec)}) must match CUSTOM_AA_SEQ length ({len(aa_seq)})")
         print(f"Target: custom sequence, {len(aa_seq)} residues (no gene lookup)")
-        return aa_seq, locvec
+        return aa_seq, locvec, None
 
     if cfg["TARGET_MODE"] != "gene":
         raise ValueError(f"Unknown TARGET_MODE: {cfg['TARGET_MODE']!r} (must be 'gene' or 'custom')")
@@ -459,9 +491,16 @@ def pick_target(cfg, genes):
     if len(locvec) < len(aa_seq):
         locvec += ["I"] * (len(aa_seq) - len(locvec))
 
+    natural_codons = [codon for codon, _loc in iso.codons]
+    if len(natural_codons) != len(aa_seq):
+        print(f"Isoform's codon count ({len(natural_codons)}) doesn't match aa_seq length "
+              f"({len(aa_seq)}) -- natural_codons omitted (visualize.plot_population_trajectory's "
+              f"natural_codons argument needs it to match the GA population's codon length exactly).")
+        natural_codons = None
+
     print(f"Target: gene {gene.geneID} ({gene.geneName}), isoform {iso.isoformNumber}, "
           f"{len(aa_seq)} residues")
-    return aa_seq, locvec
+    return aa_seq, locvec, natural_codons
 
 
 # ============================================================================
@@ -548,11 +587,14 @@ def _resolve_pipeline_xp(cfg, xp_gpu):
 def _build_seed_fn(cfg, genes):
     """Returns a callable aa_seq -> list[codon_str] per SEED_STRATEGY.
     "uniform" (default) is ga.generate_seed, unchanged. "ngram" loads (if
-    NGRAM_MODEL_PATH is set) or builds (from genes, otherwise) a
-    CodonNgramModel and returns a partial around
+    NGRAM_MODEL_PATH is set and the file exists) or builds (from genes,
+    otherwise) a CodonNgramModel and returns a partial around
     codon_ngram.sample_codon_ngram_seed -- see that module's docstring for
     why this is only scientifically meaningful against gene data generated
-    after GeneDataSourcing.ipynb's check_cds_against_protein fix."""
+    after GeneDataSourcing.ipynb's check_cds_against_protein fix. If
+    NGRAM_MODEL_PATH is set but doesn't point at an existing file yet, the
+    freshly built model is saved there too, so subsequent runs pointed at
+    the same path load instead of rebuilding."""
     if cfg["SEED_STRATEGY"] == "uniform":
         from genewriter.ga import generate_seed
         return generate_seed
@@ -562,25 +604,53 @@ def _build_seed_fn(cfg, genes):
 
         from genewriter.codon_ngram import (
             build_codon_ngram_model, load_codon_ngram_model, sample_codon_ngram_seed,
+            save_codon_ngram_model,
         )
 
-        if cfg["NGRAM_MODEL_PATH"]:
-            model = load_codon_ngram_model(cfg["NGRAM_MODEL_PATH"])
-            print(f"Loaded codon n-gram model from {cfg['NGRAM_MODEL_PATH']}")
+        model_path = cfg["NGRAM_MODEL_PATH"]
+        if model_path and os.path.isfile(model_path):
+            model = load_codon_ngram_model(model_path)
+            print(f"Loaded codon n-gram model from {model_path}")
         else:
-            print("Building codon n-gram model from GENE_OBJ_DIR (SEED_STRATEGY='ngram', "
-                  "no NGRAM_MODEL_PATH set)...")
+            reason = "no NGRAM_MODEL_PATH set" if not model_path else f"{model_path!r} not found"
+            print(f"Building codon n-gram model from GENE_OBJ_DIR (SEED_STRATEGY='ngram', {reason})...")
             model = build_codon_ngram_model(
                 genes, organism=cfg["ORGANISM"], context_orders=cfg["NGRAM_CONTEXT_ORDERS"],
             )
+            if model_path:
+                save_codon_ngram_model(model, model_path)
+                print(f"Saved codon n-gram model to {model_path}")
         return functools.partial(sample_codon_ngram_seed, model=model, min_observations=cfg["NGRAM_MIN_OBSERVATIONS"])
 
     raise ValueError(f"Unknown SEED_STRATEGY: {cfg['SEED_STRATEGY']!r} (must be 'uniform' or 'ngram')")
 
 
+def _resolve_weights(cfg, analysis_objects):
+    """Returns the WEIGHTS dict actually used for a pipeline run:
+    cfg["WEIGHTS"] unchanged, unless USE_INTOLERANCE_WEIGHTS is True, in
+    which case terms with a natural-gene per-gene baseline (RareCodons,
+    CodonUsage, CodonPairBias, GC) are recalibrated via
+    weight_calibration.compute_intolerance_weights() -- see that module's
+    docstring for the reasoning (tighter natural per-gene distribution ->
+    proportionally larger weight). Kmer/Uracil (no per-gene baseline to
+    calibrate from -- see that function's docstring) always keep their
+    cfg["WEIGHTS"] value."""
+    if not cfg["USE_INTOLERANCE_WEIGHTS"]:
+        return cfg["WEIGHTS"]
+
+    from genewriter.weight_calibration import compute_intolerance_weights
+
+    weights = compute_intolerance_weights(analysis_objects, fallback_weights=cfg["WEIGHTS"])
+    print(f"USE_INTOLERANCE_WEIGHTS=True -- calibrated WEIGHTS from natural-gene per-gene variance: {weights}")
+    return weights
+
+
 def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
     from genewriter.change_vector import registered_terms, require_weights
-    require_weights(registered_terms().keys(), cfg["WEIGHTS"])
+
+    weights = _resolve_weights(cfg, analysis_objects)
+    cfg["WEIGHTS"] = weights  # keep cfg["WEIGHTS"] consistent with what actually scored this run (e.g. a later cell's visualization reads CONFIG["WEIGHTS"] after the fact) even when USE_INTOLERANCE_WEIGHTS recalibrated it
+    require_weights(registered_terms().keys(), weights)
 
     xp = _resolve_pipeline_xp(cfg, xp_gpu)
     xp_label = "none (per-individual)" if xp is None else getattr(xp, "__name__", str(xp))
@@ -600,7 +670,7 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
         seeds = [seed_fn(aa_seq) for _ in range(num_seeds)]
 
         t0 = time.perf_counter()
-        final_pop = run_ga(aa_seq, seeds, cfg["WEIGHTS"], analysis_objects, **opts)
+        final_pop = run_ga(aa_seq, seeds, weights, analysis_objects, **opts)
         elapsed = time.perf_counter() - t0
 
     elif cfg["RUN_MODE"] == "schedule":
@@ -608,7 +678,7 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
 
         t0 = time.perf_counter()
         final_pop = run_schedule(
-            aa_seq, cfg["WEIGHTS"], analysis_objects, cfg["SCHEDULE"],
+            aa_seq, weights, analysis_objects, cfg["SCHEDULE"],
             locvec=locvec, save_dir=cfg["SCHEDULE_SAVE_DIR"], run_name=cfg["SCHEDULE_RUN_NAME"], xp=xp,
             progress=cfg["PROGRESS"], progress_every=cfg["PROGRESS_EVERY"], seed_fn=seed_fn,
         )
@@ -627,17 +697,27 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
 
 
 def main(cfg=CONFIG):
+    # Without this, assigning these names below would create NEW locals
+    # scoped to main() instead of updating the module-level placeholders
+    # declared above CONFIG -- a Colab cell pasted after this one (which
+    # reads e.g. `final_pop` as a bare name) would then always see None,
+    # regardless of how the run actually went. This was previously worked
+    # around by hand -- copying each result out of a call to
+    # run_pipeline()/pick_target() into a notebook-global variable after
+    # the fact -- which this makes unnecessary.
+    global final_pop, genes, analysis_objects, aa_seq, locvec, natural_codons
+
     setup_environment(cfg)
     xp_gpu, gpu_label = detect_gpu_backend(cfg)
 
     genes, analysis_objects = load_gene_data(cfg)
-    aa_seq, locvec = pick_target(cfg, genes)
+    aa_seq, locvec, natural_codons = pick_target(cfg, genes)
 
     if cfg["RUN_BATCH_BENCHMARK"]:
-        run_batch_benchmark(cfg, aa_seq, locvec, analysis_objects, xp_gpu, gpu_label)
+        final_pop = run_batch_benchmark(cfg, aa_seq, locvec, analysis_objects, xp_gpu, gpu_label)
 
     if cfg["RUN_PIPELINE"]:
-        run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes)
+        final_pop = run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes)
 
 
 if __name__ == "__main__":
@@ -659,7 +739,7 @@ if __name__ == "__main__":
 #
 #   # cell 2 (seconds -- re-run freely while iterating on GENE_ID etc.)
 #   CONFIG["GENE_ID"] = 326
-#   aa_seq, locvec = pick_target(CONFIG, genes)
+#   aa_seq, locvec, natural_codons = pick_target(CONFIG, genes)
 #   final_pop = run_pipeline(CONFIG, aa_seq, locvec, analysis_objects, xp_gpu, genes)
 #
 #   # cell 3 (seconds -- t-SNE over codon-choice neighborhoods, colored by
@@ -673,4 +753,20 @@ if __name__ == "__main__":
 #   from genewriter.visualize import plot_population_tsne
 #   import matplotlib.pyplot as plt
 #   fig = plot_population_tsne(final_pop, CONFIG["WEIGHTS"], color_by=["fitness", "GC", "RareCodons", "Uracil"])
+#   plt.show()
+#
+#   # cell 4 (generation-over-time trajectory across every checkpoint
+#   # save_gen() wrote for this run, all embedded in ONE shared t-SNE space
+#   # -- see plot_population_trajectory()'s docstring. natural_codons (from
+#   # cell 2's pick_target(), None for TARGET_MODE="custom") is embedded
+#   # alongside the population as a flagged reference point, so you can see
+#   # where nature's own sequence already sits relative to where the GA
+#   # moved -- useful for judging how far a rewrite target actually needed
+#   # to travel.)
+#   from genewriter.visualize import plot_population_trajectory
+#   fig = plot_population_trajectory(
+#       CONFIG["RUN_GA_OPTIONS"]["save_dir"], CONFIG["RUN_GA_OPTIONS"]["run_name"], CONFIG["WEIGHTS"],
+#       analysis_objects=analysis_objects, natural_codons=natural_codons, locvec=locvec,
+#       color_by=["fitness", "GC"],
+#   )
 #   plt.show()

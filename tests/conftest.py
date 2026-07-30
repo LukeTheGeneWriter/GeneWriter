@@ -139,6 +139,7 @@ def gc_analysis():
         taggedGC2={k: list(v) for k, v in tagged.items()},
         taggedGC3={k: list(v) for k, v in tagged.items()},
         windowsize=15,
+        gcPerGene=[rng.uniform(0.3, 0.7) for _ in range(200)],
     )
 
 

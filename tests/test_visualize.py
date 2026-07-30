@@ -14,6 +14,8 @@ from genewriter.visualize import (
     codon_distance_matrix,
     fitness_color_values,
     load_population_json,
+    load_population_trajectory,
+    plot_population_trajectory,
     plot_population_tsne,
     subsample_population,
 )
@@ -176,3 +178,55 @@ def test_plot_population_tsne_subsamples_large_populations(aa_seq, analysis_obje
 def test_plot_population_tsne_rejects_empty_population(weights):
     with pytest.raises(ValueError, match="empty"):
         plot_population_tsne([], weights)
+
+
+def _save_generations(tmp_path, aa_seq, analysis_objects, run_name="traj", gens=(0, 1, 2), n_per_gen=6):
+    for gen in gens:
+        pop = _population(aa_seq, analysis_objects, n=n_per_gen)
+        ga.save_gen(pop, gen, str(tmp_path), run_name)
+
+
+def test_load_population_trajectory_loads_every_generation_in_order(tmp_path, aa_seq, analysis_objects):
+    _save_generations(tmp_path, aa_seq, analysis_objects, gens=(2, 0, 1))  # written out of order
+    entries = load_population_trajectory(str(tmp_path), "traj")
+    assert [gen for gen, _pop in entries] == [0, 1, 2]
+    assert all(len(pop) == 6 for _gen, pop in entries)
+
+
+def test_load_population_trajectory_raises_when_nothing_matches(tmp_path):
+    with pytest.raises(FileNotFoundError, match="traj"):
+        load_population_trajectory(str(tmp_path), "traj")
+
+
+def test_plot_population_trajectory_returns_figure_with_generation_and_mode_panels(tmp_path, aa_seq, analysis_objects, weights):
+    _save_generations(tmp_path, aa_seq, analysis_objects)
+    fig = plot_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness', 'GC'])
+    # 3 scatter axes (generation, fitness, GC) + 3 colorbar axes
+    assert len(fig.axes) == 6
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def test_plot_population_trajectory_requires_analysis_objects_with_natural_codons(tmp_path, aa_seq, analysis_objects, weights):
+    _save_generations(tmp_path, aa_seq, analysis_objects)
+    natural = ga.generate_seed(aa_seq)
+    with pytest.raises(ValueError, match="analysis_objects"):
+        plot_population_trajectory(str(tmp_path), "traj", weights, natural_codons=natural)
+    import matplotlib.pyplot as plt
+    plt.close('all')
+
+
+def test_plot_population_trajectory_includes_natural_cds_reference_point(tmp_path, aa_seq, analysis_objects, weights):
+    _save_generations(tmp_path, aa_seq, analysis_objects)
+    natural = ga.generate_seed(aa_seq)
+    fig = plot_population_trajectory(
+        str(tmp_path), "traj", weights, analysis_objects=analysis_objects, natural_codons=natural,
+    )
+    # every axis should carry the "Natural CDS" legend entry
+    for ax in fig.axes:
+        legend = ax.get_legend()
+        if legend is not None:
+            labels = [t.get_text() for t in legend.get_texts()]
+            assert "Natural CDS" in labels
+    import matplotlib.pyplot as plt
+    plt.close(fig)

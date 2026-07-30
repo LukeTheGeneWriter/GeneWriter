@@ -16,7 +16,7 @@ def ctx(aa_seq, analysis_objects, weights):
 
 def test_registered_steps_includes_the_builtin_kinds():
     assert set(sched.registered_steps()) == {
-        'input', 'growth', 'directed_growth', 'kill_off', 'select', 'flatten', 'save', 'repeat',
+        'input', 'growth', 'directed_growth', 'kill_off', 'natural_range_cutoff', 'select', 'flatten', 'save', 'repeat',
     }
 
 
@@ -68,6 +68,18 @@ def test_step_kill_off_reduces_total_replicate_count(ctx):
     total_before = sum(p.number for p in seeded)
     result = sched.run_steps(seeded, ctx, [{"kind": "kill_off", "percent_cut": 50}])
     assert sum(p.number for p in result) < total_before
+
+
+def test_step_natural_range_cutoff_cuts_nothing_at_an_astronomical_threshold(ctx):
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 5}])
+    result = sched.run_steps(seeded, ctx, [{"kind": "natural_range_cutoff", "threshold": 1e9}])
+    assert len(result) == len(seeded)
+
+
+def test_step_natural_range_cutoff_requires_threshold_param(ctx):
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 3}])
+    with pytest.raises(KeyError):
+        sched.run_steps(seeded, ctx, [{"kind": "natural_range_cutoff"}])
 
 
 def test_step_select_caps_population_size(ctx):
