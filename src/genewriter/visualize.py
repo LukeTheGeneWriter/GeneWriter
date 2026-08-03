@@ -126,6 +126,35 @@ def fitness_color_values(pop: list, weights: dict, color_by: str) -> np.ndarray:
     return _sanitize_for_color(values)
 
 
+def _percentile_rank(values: np.ndarray) -> np.ndarray:
+    """Raw color values (fitness_color_values()'s output) rescaled to
+    percentile rank in [0, 100] -- fixes the "everything looks the same
+    shade" problem a raw min/max-normalized colormap has whenever a few
+    outliers (e.g. an inf-clamped RareCodons score -- see
+    _sanitize_for_color()) dominate the scale and compress everyone else
+    into one end of it. Percentile rank only cares about each point's
+    relative position in the sorted order, so contrast stays spread out
+    across the full population regardless of the term's raw distribution.
+
+    Ties get the average rank (matches scipy.stats.rankdata's default),
+    so identical raw scores still render as the identical color.
+    """
+    if values.size <= 1:
+        return np.zeros_like(values)
+    from scipy.stats import rankdata
+    return (rankdata(values, method='average') - 1) / (values.size - 1) * 100.0
+
+
+def _size_by_count(pop: list, size_range: tuple = (4.0, 24.0)) -> np.ndarray:
+    """Scatter point size from each individual's `number` (replicate
+    count), log-scaled so a handful of massively-converged genotypes don't
+    make every singly-visited one invisible by comparison."""
+    counts = np.asarray([p.number for p in pop], dtype=float)
+    peak = counts.max() if counts.max() > 0 else 1.0
+    base, scale = size_range
+    return base + scale * (np.log1p(counts) / np.log1p(peak))
+
+
 def _sanitize_for_color(values: np.ndarray) -> np.ndarray:
     """Replace +-inf with the min/max *finite* value actually present (NaN
     with the mean of the finite values), so a point whose score happens to
@@ -166,6 +195,7 @@ def plot_population_tsne(
     perplexity: float = 30.0,
     random_state: int = 0,
     size_by_count: bool = True,
+    size_range: tuple = (4.0, 24.0),
     figsize_per_plot: tuple = (8.0, 8.0),
 ):
     """One t-SNE embedding (codon-choice Hamming distance -- see
@@ -178,7 +208,11 @@ def plot_population_tsne(
         passed to run_ga()/run_schedule().
     color_by: iterable of 'fitness' and/or any registered change-vector
         term name (see change_vector.registered_terms()) -- one subplot
-        per entry.
+        per entry. Each mode's raw score (fitness_color_values()) is
+        rescaled to percentile rank (see _percentile_rank()) before
+        coloring, so contrast stays spread across the full colormap
+        instead of collapsing toward one shade whenever the raw
+        distribution is skewed or outlier-dominated.
     max_points: pop is subsampled to at most this many distinct
         individuals before embedding -- see module docstring. Population
         size before subsampling is reported in the figure title.
@@ -188,6 +222,9 @@ def plot_population_tsne(
         individual's `number` (replicate count) -- a cluster of large
         points is a genotype the GA converged on hard, not just visited
         once.
+    size_range: (min, max) point size passed to _size_by_count() when
+        size_by_count is True; ignored (every point drawn at size_range[0])
+        when False.
 
     Returns the matplotlib Figure -- caller decides whether to show/save
     it (e.g. `plt.show()` in a Colab cell, or `fig.savefig(...)`).
@@ -212,11 +249,7 @@ def plot_population_tsne(
         perplexity=effective_perplexity, random_state=random_state,
     ).fit_transform(dist)
 
-    sizes = None
-    if size_by_count:
-        counts = np.asarray([p.number for p in sampled], dtype=float)
-        peak = counts.max() if counts.max() > 0 else 1.0
-        sizes = 10.0 + 60.0 * (np.log1p(counts) / np.log1p(peak))
+    sizes = _size_by_count(sampled, size_range) if size_by_count else None
 
     fig, axes = plt.subplots(
         1, len(color_by), figsize=(figsize_per_plot[0] * len(color_by), figsize_per_plot[1]), squeeze=False,
@@ -224,79 +257,49 @@ def plot_population_tsne(
     axes = axes[0]
 
     for ax, mode in zip(axes, color_by):
-        colors = fitness_color_values(sampled, weights, mode)
-        scatter = ax.scatter(coords[:, 0], coords[:, 1], c=colors, s=sizes, cmap='viridis')
+        ranks = _percentile_rank(fitness_color_values(sampled, weights, mode))
+        scatter = ax.scatter(coords[:, 0], coords[:, 1], c=ranks, s=sizes, cmap='viridis', vmin=0, vmax=100)
         ax.set_title(mode)
         ax.set_xticks([])
         ax.set_yticks([])
-        fig.colorbar(scatter, ax=ax, shrink=0.8)
+        fig.colorbar(scatter, ax=ax, shrink=0.8, label='percentile rank')
 
     fig.suptitle(f"t-SNE over codon-choice Hamming distance ({n} of {len(pop)} individuals shown)")
     fig.tight_layout()
     return fig
 
 
-def plot_population_trajectory(
+def _pool_and_embed_trajectory(
     save_dir: str,
     run_name: str,
-    weights: dict,
     analysis_objects=None,
     natural_codons: list = None,
     locvec: list = None,
-    color_by=('fitness',),
     max_points_per_gen: int = 500,
     perplexity: float = 30.0,
     random_state: int = 0,
-    size_by_count: bool = True,
-    figsize_per_plot: tuple = (8.0, 8.0),
 ):
-    """One shared t-SNE embedding across EVERY saved generation checkpoint
-    of a run (ga.save_gen()'s save_dir/run_name -- see
-    load_population_trajectory()), so you can see the population actually
-    migrate across generations instead of one frozen snapshot. Sharing one
-    embedding across generations matters even more here than across
-    plot_population_tsne's color_by modes: point positions are only
-    comparable generation-to-generation if the SAME embedding produced
-    them, which is why every generation is pooled and embedded together
-    rather than one t-SNE run per checkpoint.
+    """Shared pooling + embedding step behind plot_population_trajectory()
+    and animate_population_trajectory(): load every generation checkpoint,
+    subsample each independently (see plot_population_trajectory's
+    docstring for why per-generation, not global), optionally append the
+    natural-CDS reference point, and embed everything in ONE shared t-SNE
+    space so positions are comparable across generations.
 
-    Each generation is independently subsampled to at most
-    max_points_per_gen distinct individuals BEFORE pooling (see module
-    docstring on why real-scale populations need subsampling at all) --
-    kept separate per generation rather than one global subsample, so an
-    early, larger generation can't drown out a later, smaller one.
-
-    The first panel is always the trajectory itself: every point colored by
-    its generation number (sequential colormap), with each generation's
-    centroid connected by a line -- the actual "did the population move,
-    and which way" signal this function exists for. One further panel is
-    drawn per color_by entry (same fitness/term semantics as
-    plot_population_tsne), on the identical embedding, so you can check
-    whether the migration in panel 1 lines up with a real fitness/term
-    improvement rather than random drift.
-
-    natural_codons: the real target gene's own codon list (list[str]), if
-    you have one -- e.g. the actual CDS being rewritten, so you can see
-    where nature's own sequence already sits relative to where the GA's
-    population has moved (useful for judging whether a rewrite target even
-    needed to move very far). Embedded as one extra point in the SAME
-    space, flagged with a distinct star marker in every panel, colored like
-    every other point in the color_by panels but excluded from the
-    generation panel's color scale (it has no generation). Requires
-    analysis_objects (to score it) if given; None (default) omits it
-    entirely -- e.g. for a TARGET_MODE="custom" run with no real gene to
-    compare against.
-    locvec: real 'F'/'T'/'I'/'S' location tags for natural_codons, if
-    available (see gene_io/pick_target) -- None scores it as generic
-    interior sequence, same default calculate_change_vector itself uses.
-
-    Returns the matplotlib Figure.
+    Returns (entries, pooled, gen_of, natural_idx, coords):
+      entries: load_population_trajectory()'s (gen, pop) list, in order.
+      pooled: list[Proposed_Solution], every subsampled individual across
+        every generation, plus the natural reference point if given (last).
+      gen_of: list[int | None], same length/order as pooled -- gen_of[i]
+        is pooled[i]'s generation, or None for the natural reference point.
+      natural_idx: index into pooled of the natural reference point, or
+        None if natural_codons wasn't given.
+      coords: (len(pooled), 2) shared t-SNE embedding.
     """
-    import matplotlib.pyplot as plt
-    from sklearn.manifold import TSNE
-
     if natural_codons is not None and analysis_objects is None:
         raise ValueError("natural_codons requires analysis_objects (to score it) to also be given")
+
+    from sklearn.manifold import TSNE
 
     entries = load_population_trajectory(save_dir, run_name)
     rng = random.Random(random_state)
@@ -326,14 +329,79 @@ def plot_population_trajectory(
         perplexity=effective_perplexity, random_state=random_state,
     ).fit_transform(dist)
 
+    return entries, pooled, gen_of, natural_idx, coords
+
+
+def plot_population_trajectory(
+    save_dir: str,
+    run_name: str,
+    weights: dict,
+    analysis_objects=None,
+    natural_codons: list = None,
+    locvec: list = None,
+    color_by=('fitness',),
+    max_points_per_gen: int = 500,
+    perplexity: float = 30.0,
+    random_state: int = 0,
+    size_by_count: bool = True,
+    size_range: tuple = (4.0, 24.0),
+    figsize_per_plot: tuple = (8.0, 8.0),
+):
+    """One shared t-SNE embedding across EVERY saved generation checkpoint
+    of a run (ga.save_gen()'s save_dir/run_name -- see
+    load_population_trajectory()), so you can see the population actually
+    migrate across generations instead of one frozen snapshot. Sharing one
+    embedding across generations matters even more here than across
+    plot_population_tsne's color_by modes: point positions are only
+    comparable generation-to-generation if the SAME embedding produced
+    them, which is why every generation is pooled and embedded together
+    rather than one t-SNE run per checkpoint.
+
+    Each generation is independently subsampled to at most
+    max_points_per_gen distinct individuals BEFORE pooling (see module
+    docstring on why real-scale populations need subsampling at all) --
+    kept separate per generation rather than one global subsample, so an
+    early, larger generation can't drown out a later, smaller one.
+
+    The first panel is always the trajectory itself: every point colored by
+    its generation number (sequential colormap), with each generation's
+    centroid connected by a line -- the actual "did the population move,
+    and which way" signal this function exists for. One further panel is
+    drawn per color_by entry (same fitness/term semantics as
+    plot_population_tsne, including the percentile-rank color rescaling --
+    see _percentile_rank()), on the identical embedding, so you can check
+    whether the migration in panel 1 lines up with a real fitness/term
+    improvement rather than random drift.
+
+    natural_codons: the real target gene's own codon list (list[str]), if
+    you have one -- e.g. the actual CDS being rewritten, so you can see
+    where nature's own sequence already sits relative to where the GA's
+    population has moved (useful for judging whether a rewrite target even
+    needed to move very far). Embedded as one extra point in the SAME
+    space, flagged with a distinct star marker in every panel, colored like
+    every other point in the color_by panels but excluded from the
+    generation panel's color scale (it has no generation). Requires
+    analysis_objects (to score it) if given; None (default) omits it
+    entirely -- e.g. for a TARGET_MODE="custom" run with no real gene to
+    compare against.
+    locvec: real 'F'/'T'/'I'/'S' location tags for natural_codons, if
+    available (see gene_io/pick_target) -- None scores it as generic
+    interior sequence, same default calculate_change_vector itself uses.
+
+    Returns the matplotlib Figure.
+    """
+    import matplotlib.pyplot as plt
+
+    entries, pooled, gen_of, natural_idx, coords = _pool_and_embed_trajectory(
+        save_dir, run_name, analysis_objects=analysis_objects, natural_codons=natural_codons, locvec=locvec,
+        max_points_per_gen=max_points_per_gen, perplexity=perplexity, random_state=random_state,
+    )
+    n = len(pooled)
+
     has_gen = np.asarray([g is not None for g in gen_of])
     gen_values = np.asarray([g if g is not None else 0 for g in gen_of], dtype=float)
 
-    sizes = None
-    if size_by_count:
-        counts = np.asarray([p.number for p in pooled], dtype=float)
-        peak = counts.max() if counts.max() > 0 else 1.0
-        sizes = 10.0 + 60.0 * (np.log1p(counts) / np.log1p(peak))
+    sizes = _size_by_count(pooled, size_range) if size_by_count else None
 
     color_by = list(color_by)
     panels = ['generation'] + color_by
@@ -356,9 +424,9 @@ def plot_population_trajectory(
                     label='generation centroid')
             ax.set_title('generation (trajectory)')
         else:
-            colors = fitness_color_values(pooled, weights, mode)
-            scatter = ax.scatter(coords[:, 0], coords[:, 1], c=colors, s=sizes, cmap='viridis')
-            fig.colorbar(scatter, ax=ax, shrink=0.8)
+            ranks = _percentile_rank(fitness_color_values(pooled, weights, mode))
+            scatter = ax.scatter(coords[:, 0], coords[:, 1], c=ranks, s=sizes, cmap='viridis', vmin=0, vmax=100)
+            fig.colorbar(scatter, ax=ax, shrink=0.8, label='percentile rank')
             ax.set_title(mode)
 
         if natural_idx is not None:
@@ -376,3 +444,147 @@ def plot_population_trajectory(
     fig.suptitle(f"Population trajectory over generations [{gens_str}] ({n} points embedded, run={run_name!r})")
     fig.tight_layout()
     return fig
+
+
+def animate_population_trajectory(
+    save_dir: str,
+    run_name: str,
+    weights: dict,
+    analysis_objects=None,
+    natural_codons: list = None,
+    locvec: list = None,
+    color_by=('fitness',),
+    max_points_per_gen: int = 500,
+    perplexity: float = 30.0,
+    random_state: int = 0,
+    size_by_count: bool = True,
+    size_range: tuple = (4.0, 24.0),
+    figsize_per_plot: tuple = (6.0, 6.0),
+    trail: str = 'both',
+    trail_alpha: float = 0.15,
+    fps: float = 2.0,
+    out_path: str = None,
+):
+    """plot_population_trajectory(), animated: same shared t-SNE embedding
+    across every saved generation checkpoint (see _pool_and_embed_trajectory()
+    -- positions are only comparable generation-to-generation because every
+    generation is pooled and embedded together), but instead of overlaying
+    every generation on one static scatter, renders one frame per
+    generation -- the population's fixed 2D space stays put (axis limits
+    are set once, from every point across every generation) while which
+    dots are lit up on it changes frame to frame, so you actually see it
+    move rather than staring at one frozen superposition of every
+    generation at once.
+
+    color_by: iterable of 'fitness' and/or any registered change-vector
+        term name (see change_vector.registered_terms()) -- one column of
+        panels per entry. Each mode's raw score is rescaled to percentile
+        rank (see _percentile_rank()) ONCE, up front, so the color scale
+        stays fixed across every frame -- a point's shade means the same
+        thing in frame 1 as it does in frame 40.
+    trail: what a frame shows besides the current generation:
+      'current': only that generation's points are drawn -- positions
+        reset each frame, the cleanest read of "where is the population
+        RIGHT NOW".
+      'fade': the current generation drawn at full opacity, every EARLIER
+        generation also drawn (at trail_alpha) so a persistent low-opacity
+        trail builds up across frames -- motion context, where the
+        population CAME from, not just where it is.
+      'both' (default): renders both side by side (one row per variant,
+        one column per color_by mode) in the same gif, so you get either
+        read without re-rendering.
+    trail_alpha: opacity of earlier-generation points when trail is 'fade'
+        or 'both'; ignored for the 'current'-only row.
+    fps: playback speed, both for the live FuncAnimation interval and for
+        the saved gif (when out_path is given).
+    out_path: if given, saves the animation there (Pillow gif writer --
+        picked automatically, no imageio/ffmpeg dependency needed).
+
+    Returns the matplotlib.animation.FuncAnimation. Caller decides whether
+    to display it inline (e.g. `HTML(anim.to_jshtml())` in a notebook) or
+    save it (`anim.save(path, writer='pillow', fps=fps)`) if out_path
+    wasn't given.
+    """
+    import matplotlib.animation as animation
+    import matplotlib.pyplot as plt
+
+    trail_variants = []  # False = current-generation-only row, True = +fading-trail row
+    if trail in ('current', 'both'):
+        trail_variants.append(False)
+    if trail in ('fade', 'both'):
+        trail_variants.append(True)
+    if not trail_variants:
+        raise ValueError(f"trail must be one of 'current', 'fade', 'both' -- got {trail!r}")
+
+    entries, pooled, gen_of, natural_idx, coords = _pool_and_embed_trajectory(
+        save_dir, run_name, analysis_objects=analysis_objects, natural_codons=natural_codons, locvec=locvec,
+        max_points_per_gen=max_points_per_gen, perplexity=perplexity, random_state=random_state,
+    )
+    gen_of_arr = np.asarray([g if g is not None else -1 for g in gen_of])
+    has_gen = gen_of_arr >= 0
+    unique_gens = sorted(set(g for g in gen_of if g is not None))
+
+    sizes = _size_by_count(pooled, size_range) if size_by_count else np.full(len(pooled), sum(size_range) / 2.0)
+
+    color_by = list(color_by)
+    rank_colors = {mode: _percentile_rank(fitness_color_values(pooled, weights, mode)) for mode in color_by}
+
+    nrows, ncols = len(trail_variants), len(color_by)
+    fig, axes = plt.subplots(
+        nrows, ncols, figsize=(figsize_per_plot[0] * ncols, figsize_per_plot[1] * nrows), squeeze=False,
+    )
+
+    pad = 0.05 * max(np.ptp(coords[:, 0]), np.ptp(coords[:, 1]), 1e-9)
+    xlim = (coords[:, 0].min() - pad, coords[:, 0].max() + pad)
+    ylim = (coords[:, 1].min() - pad, coords[:, 1].max() + pad)
+
+    trail_scatters = {}
+    current_scatters = {}
+    for row, show_trail in enumerate(trail_variants):
+        for col, mode in enumerate(color_by):
+            ax = axes[row][col]
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_xticks([])
+            ax.set_yticks([])
+            ax.set_title(f"{mode}" + (" (+ trail)" if show_trail else ""))
+
+            if show_trail:
+                trail_scatters[(mode, show_trail)] = ax.scatter(
+                    [], [], s=[], c=[], cmap='viridis', vmin=0, vmax=100, alpha=trail_alpha,
+                )
+            current_scatters[(mode, show_trail)] = ax.scatter([], [], s=[], c=[], cmap='viridis', vmin=0, vmax=100)
+            fig.colorbar(current_scatters[(mode, show_trail)], ax=ax, shrink=0.8, label='percentile rank')
+
+            if natural_idx is not None:
+                ax.scatter(
+                    coords[natural_idx, 0], coords[natural_idx, 1], marker='*', s=350,
+                    facecolors='none', edgecolors='red', linewidths=2, zorder=5, label='Natural CDS',
+                )
+                ax.legend(loc='best', fontsize=8)
+
+    def update(frame_idx):
+        gen = unique_gens[frame_idx]
+        cur_mask = has_gen & (gen_of_arr == gen)
+        artists = []
+        for (mode, show_trail), scatter in current_scatters.items():
+            if show_trail:
+                trail_mask = has_gen & (gen_of_arr < gen)
+                trail_scatter = trail_scatters[(mode, show_trail)]
+                trail_scatter.set_offsets(coords[trail_mask])
+                trail_scatter.set_array(rank_colors[mode][trail_mask])
+                trail_scatter.set_sizes(sizes[trail_mask])
+                artists.append(trail_scatter)
+            scatter.set_offsets(coords[cur_mask])
+            scatter.set_array(rank_colors[mode][cur_mask])
+            scatter.set_sizes(sizes[cur_mask])
+            artists.append(scatter)
+        fig.suptitle(f"Population trajectory -- generation {gen} ({int(cur_mask.sum())} points shown, run={run_name!r})")
+        return artists
+
+    anim = animation.FuncAnimation(fig, update, frames=len(unique_gens), interval=1000.0 / fps, blit=False)
+
+    if out_path:
+        anim.save(out_path, writer=animation.PillowWriter(fps=fps))
+
+    return anim

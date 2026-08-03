@@ -10,7 +10,10 @@ from genewriter import ga
 from genewriter.change_vector import calculate_change_vector, score_changevec
 from genewriter.classes import Proposed_Solution
 from genewriter.visualize import (
+    _percentile_rank,
     _sanitize_for_color,
+    _size_by_count,
+    animate_population_trajectory,
     codon_distance_matrix,
     fitness_color_values,
     load_population_json,
@@ -216,6 +219,35 @@ def test_plot_population_trajectory_requires_analysis_objects_with_natural_codon
     plt.close('all')
 
 
+def test_percentile_rank_spans_0_to_100_regardless_of_raw_scale():
+    # A single huge outlier would compress everyone else into one shade
+    # under raw min/max normalization -- percentile rank shouldn't care.
+    values = np.array([1.0, 2.0, 3.0, 4.0, 1e9])
+    ranks = _percentile_rank(values)
+    assert ranks.min() == pytest.approx(0.0)
+    assert ranks.max() == pytest.approx(100.0)
+    assert np.all(np.diff(ranks) > 0)  # order-preserving
+
+
+def test_percentile_rank_ties_get_average_rank():
+    ranks = _percentile_rank(np.array([1.0, 1.0, 2.0]))
+    assert ranks[0] == pytest.approx(ranks[1])
+    assert ranks[2] > ranks[0]
+
+
+def test_percentile_rank_single_value_returns_zero():
+    assert _percentile_rank(np.array([5.0])).tolist() == [0.0]
+
+
+def test_size_by_count_stays_within_size_range(aa_seq, analysis_objects):
+    pop = _population(aa_seq, analysis_objects, n=10)
+    pop[0].number = 1
+    pop[1].number = 1000
+    sizes = _size_by_count(pop, size_range=(4.0, 24.0))
+    assert sizes.min() >= 4.0 - 1e-9
+    assert sizes.max() <= 28.0 + 1e-9
+
+
 def test_plot_population_trajectory_includes_natural_cds_reference_point(tmp_path, aa_seq, analysis_objects, weights):
     _save_generations(tmp_path, aa_seq, analysis_objects)
     natural = ga.generate_seed(aa_seq)
@@ -230,3 +262,57 @@ def test_plot_population_trajectory_includes_natural_cds_reference_point(tmp_pat
             assert "Natural CDS" in labels
     import matplotlib.pyplot as plt
     plt.close(fig)
+
+
+def test_animate_population_trajectory_both_trail_variants_makes_two_rows(tmp_path, aa_seq, analysis_objects, weights):
+    _save_generations(tmp_path, aa_seq, analysis_objects)
+    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness', 'GC'], trail='both')
+    fig = anim._fig
+    # 2 trail variants x 2 color_by modes = 4 scatter axes, each with its own colorbar axis
+    assert len(fig.axes) == 8
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def test_animate_population_trajectory_current_only_makes_one_row(tmp_path, aa_seq, analysis_objects, weights):
+    _save_generations(tmp_path, aa_seq, analysis_objects)
+    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness'], trail='current')
+    fig = anim._fig
+    assert len(fig.axes) == 2  # 1 scatter axis + 1 colorbar axis
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def test_animate_population_trajectory_rejects_unknown_trail_mode(tmp_path, aa_seq, analysis_objects, weights):
+    _save_generations(tmp_path, aa_seq, analysis_objects)
+    with pytest.raises(ValueError, match="trail must be"):
+        animate_population_trajectory(str(tmp_path), "traj", weights, trail='sparkle')
+
+
+def test_animate_population_trajectory_frame_only_shows_that_generations_points(tmp_path, aa_seq, analysis_objects, weights):
+    """Core ask this function exists for: each frame is ONE generation on
+    the shared embedding, not every generation overlaid at once."""
+    _save_generations(tmp_path, aa_seq, analysis_objects, gens=(0, 1, 2), n_per_gen=6)
+    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness'], trail='current')
+    fig = anim._fig
+    ax = fig.axes[0]
+    scatter = ax.collections[0]
+
+    anim._draw_frame(0)
+    assert scatter.get_offsets().shape[0] == 6
+    anim._draw_frame(2)
+    assert scatter.get_offsets().shape[0] == 6  # still just one generation's worth, not 12 or 18
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def test_animate_population_trajectory_saves_gif(tmp_path, aa_seq, analysis_objects, weights):
+    _save_generations(tmp_path, aa_seq, analysis_objects)
+    out_path = tmp_path / "trajectory.gif"
+    anim = animate_population_trajectory(
+        str(tmp_path), "traj", weights, color_by=['fitness'], out_path=str(out_path), fps=5,
+    )
+    assert out_path.exists()
+    assert out_path.stat().st_size > 0
+    import matplotlib.pyplot as plt
+    plt.close(anim._fig)
