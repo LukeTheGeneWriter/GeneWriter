@@ -185,9 +185,13 @@ CONFIG = dict(
     # the term's pressure. Uracil defaults to 0.0 (off) here -- unlike the
     # other 5 terms it isn't a natural-gene-baseline comparison, just a raw
     # "opportunity to remove a U" count (see change_vector._uracil_term's
-    # docstring), and it scores *higher* for more removable U -- so a
-    # *negative* weight is what actually pushes uracil content down if you
-    # enable it.
+    # docstring) -- a *positive* weight (the normal convention, same as
+    # every other term here) is what actually pushes uracil content down
+    # if you enable it. A negative weight does NOT invert this: kill_off/
+    # select_survivors clamp any negative score to ~0 (ga._finite_nonneg),
+    # so a negative weight just neuters this term's selection pressure (or
+    # worse, once other terms contribute a positive baseline) -- confirmed
+    # empirically, see _uracil_term's docstring for the trace.
     # ------------------------------------------------------------------
     WEIGHTS=dict(RareCodons=1.0, CodonUsage=1.0, CodonPairBias=1.0, GC=1.0, Kmer=1.0, Uracil=0.0),
 

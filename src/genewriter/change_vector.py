@@ -561,14 +561,27 @@ def _uracil_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list) -
     Design call, flagged rather than silently resolved (per this module's
     stated policy): the score returned is a *positive* "opportunity to
     remove a U here" count, consistent with every other term scoring "this
-    position is worth mutating" rather than "this position is good."
-    kill_off()/select_survivors()/directed_evolution() all treat a higher
-    weighted score as more in need of mutation -- so a *negative*
-    weights['Uracil'] is what actually pushes uracil content down; a
-    positive weight would instead bias the GA toward mutating away from
-    low-U positions (preserving or growing U content). Pick the sign
-    deliberately when configuring weights, not by assuming this docstring's
-    framing implies one.
+    position is worth mutating" rather than "this position is good" --
+    same "positive weight = counts normally" convention documented on
+    WEIGHTS itself. kill_off()/select_survivors() use score_changevec()
+    directly as a death weight via _finite_nonneg() (ga.py), which clamps
+    any negative score to ~0 -- so a *negative* weights['Uracil'] doesn't
+    invert anything, it just floors a high-U individual's death pressure
+    to the same near-zero value as a low-U one, neutering selection
+    pressure on this term (or worse: once other positive-weighted terms
+    contribute their own positive baseline, a negative Uracil weight can
+    make a high-U individual's *total* score lower than a low-U one's,
+    making it die LESS). Symmetrically, directed_evolution()'s lookahead
+    picks whichever synonymous alternative *minimizes* total score
+    (ga.py's `candidate_score < best_score`) -- with a negative weight that
+    means preferring the alternative with MORE removable U, actively
+    growing uracil content. A *positive* weights['Uracil'] (the normal
+    convention, matching every other registered term's default) is what
+    actually pushes uracil content down: confirmed empirically -- an
+    isolated die-weight comparison and a synonymous-codon-choice trace
+    (Serine, alternatives spanning 0-2 removable U's) both show weight=+1
+    favoring low-U individuals/alternatives and weight=-1 favoring
+    high-U ones.
     """
     scores = []
     for codon in sol:
