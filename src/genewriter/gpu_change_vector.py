@@ -471,7 +471,7 @@ def batch_kmer_term(xp, codon_idx, kmer, locvec: list, winsize: int = 15):
     return per_nt_total.reshape(P, N, 3).mean(axis=2)
 
 
-def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: list = None, xp=np, progress_every: int = None) -> list:
+def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: list = None, xp=np, progress_every: int = None, chunk_size: int = None) -> list:
     """Compute change vectors for a whole population in one batched pass.
 
     pop_codons: list of P individuals, each a list of N codon strings (same
@@ -484,6 +484,19 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
         term's batched pass finishes -- diagnostic only, no effect on the
         returned values. None (default): silent, matching the original
         behavior exactly.
+    chunk_size: if set, process pop_codons in sequential chunks of at most
+        this many individuals each, through this same function, instead of
+        building one xp array sized to the whole population in a single
+        pass. Every intermediate array below scales with the population
+        dimension P -- some (batch_kmer_term's sliding-window codes, in
+        particular, see its docstring) multiplicatively with sequence
+        length N and k-mer length k too -- so a long protein can blow past
+        available GPU memory at a population size that was previously fine.
+        Bounding P via chunk_size bounds peak xp memory independent of both
+        P and N, trading a few more (individually cheap -- see Handoff.md
+        sec 6) batched calls for a hard cap on peak allocation. Output is
+        identical to an unchunked call, just assembled chunk by chunk. None
+        (default): one pass over the whole population, unchanged behavior.
 
     Returns a list of P dicts, one per individual, in the same shape
     calculate_change_vector() returns for a single individual -- so this is
@@ -519,6 +532,16 @@ def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: l
     """
     if not pop_codons:
         return []
+
+    if chunk_size is not None and chunk_size < len(pop_codons):
+        results = []
+        for start in range(0, len(pop_codons), chunk_size):
+            results.extend(batch_calculate_change_vectors(
+                pop_codons[start:start + chunk_size], analysis_objects, locvec, xp=xp,
+                progress_every=progress_every,
+            ))
+        return results
+
     N = len(pop_codons[0])
     if locvec is None:
         locvec = ['I'] * N

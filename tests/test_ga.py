@@ -736,3 +736,52 @@ def test_run_ga_with_numpy_xp_does_not_crash(aa_seq, analysis_objects, weights):
     for p in final_pop:
         assert isinstance(p, Proposed_Solution)
         assert len(p.codons) == len(aa_seq)
+
+
+def test_seed_population_chunk_size_matches_unchunked(aa_seq, analysis_objects):
+    """chunk_size is purely a memory-bounding implementation detail of how
+    the underlying batch_calculate_change_vectors() call is split (see its
+    docstring) -- seed_population(chunk_size=...) must produce an identical
+    pop_index to chunk_size=None, not just a compatible one, for a
+    chunk_size that doesn't evenly divide the number of unique seeds."""
+    seeds = [ga.generate_seed(aa_seq) for _ in range(7)]
+    unchunked = ga.seed_population(seeds, analysis_objects, xp=np)
+    chunked = ga.seed_population(seeds, analysis_objects, xp=np, chunk_size=3)
+
+    assert set(unchunked) == set(chunked)
+    for key in unchunked:
+        assert unchunked[key].number == chunked[key].number
+        assert unchunked[key].change_vecs == chunked[key].change_vecs
+
+
+def test_refresh_change_vectors_chunk_size_matches_unchunked(aa_seq, analysis_objects):
+    pop = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {}) for _ in range(7)]
+    pop_chunked = [Proposed_Solution(list(p.codons), p.number, {}) for p in pop]
+
+    ga.refresh_change_vectors(pop, analysis_objects, xp=np)
+    ga.refresh_change_vectors(pop_chunked, analysis_objects, xp=np, chunk_size=3)
+
+    for a, b in zip(pop, pop_chunked):
+        assert a.codons == b.codons
+        assert a.change_vecs == b.change_vecs
+
+
+def test_run_ga_with_chunk_size_matches_without(aa_seq, analysis_objects, weights):
+    """chunk_size must not change run_ga's result given the same RNG seed --
+    it only bounds how many individuals any single xp-batched call processes
+    at once, not any random draw or selection logic."""
+    import random
+
+    seeds = [ga.generate_seed(aa_seq) for _ in range(4)]
+
+    random.seed(2026)
+    pop_unchunked = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=3, target_size=8, xp=np)
+
+    random.seed(2026)
+    pop_chunked = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=3, target_size=8, xp=np, chunk_size=3)
+
+    assert {tuple(p.codons) for p in pop_unchunked} == {tuple(p.codons) for p in pop_chunked}
+    by_codons_unchunked = {tuple(p.codons): p for p in pop_unchunked}
+    by_codons_chunked = {tuple(p.codons): p for p in pop_chunked}
+    for key in by_codons_unchunked:
+        assert by_codons_unchunked[key].number == by_codons_chunked[key].number

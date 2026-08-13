@@ -348,6 +348,29 @@ def test_batch_calculate_change_vectors_empty_population_returns_empty_list(anal
     assert batch_calculate_change_vectors([], analysis_objects, xp=np) == []
 
 
+@pytest.mark.parametrize("chunk_size", [1, 2, 3, 5, 100])
+def test_batch_calculate_change_vectors_chunk_size_matches_unchunked(analysis_objects, chunk_size):
+    """chunk_size splits the population into sequential sub-batches (see
+    its docstring on gpu_change_vector.batch_calculate_change_vectors) --
+    purely a memory/scheduling choice, so the output for any chunk_size
+    (including ones that don't evenly divide the population, and ones
+    larger than the whole population, a no-op) must be identical to one
+    unchunked pass, not just close."""
+    pop = _population(LONG_AA_SEQ, 7)
+    unchunked = batch_calculate_change_vectors(pop, analysis_objects, xp=np)
+    chunked = batch_calculate_change_vectors(pop, analysis_objects, xp=np, chunk_size=chunk_size)
+
+    assert len(chunked) == len(unchunked)
+    for expected, actual in zip(unchunked, chunked):
+        assert set(actual.keys()) == set(expected.keys())
+        for term in expected:
+            assert actual[term] == expected[term]
+
+
+def test_batch_calculate_change_vectors_chunk_size_on_empty_population(analysis_objects):
+    assert batch_calculate_change_vectors([], analysis_objects, xp=np, chunk_size=4) == []
+
+
 def test_batched_and_per_individual_paths_share_the_baseline_stat_cache(analysis_objects):
     """Real bug found on a real Colab run (Tesla T4, real genome-wide
     Standards baselines): CodonUsage/GC/CodonPairBias each recomputed

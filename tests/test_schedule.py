@@ -324,3 +324,32 @@ def test_run_schedule_end_to_end_matches_the_spec_example_shape(aa_seq, analysis
     for p in result:
         assert isinstance(p, Proposed_Solution)
         assert len(p.codons) == len(aa_seq)
+
+
+def test_run_schedule_with_chunk_size_matches_without(aa_seq, analysis_objects, weights):
+    """chunk_size (see ScheduleContext.chunk_size) only bounds how many
+    individuals any single xp-batched call processes at once -- it must not
+    change the schedule's result given the same RNG seed."""
+    import random
+
+    import numpy as np
+
+    schedule = [
+        {"kind": "input", "count": 7},
+        {"kind": "growth", "rate": 3, "mutation_chance": 0.1},
+        {"kind": "kill_off", "percent_cut": 30},
+        {"kind": "select", "target_size": 10},
+        {"kind": "flatten", "recursion_limit": 1},
+        {"kind": "directed_growth", "rate": 2},
+    ]
+
+    random.seed(4242)
+    pop_unchunked = sched.run_schedule(aa_seq, weights, analysis_objects, schedule, xp=np)
+
+    random.seed(4242)
+    pop_chunked = sched.run_schedule(aa_seq, weights, analysis_objects, schedule, xp=np, chunk_size=3)
+
+    assert {tuple(p.codons) for p in pop_unchunked} == {tuple(p.codons) for p in pop_chunked}
+    by_codons_unchunked = {tuple(p.codons): p.number for p in pop_unchunked}
+    by_codons_chunked = {tuple(p.codons): p.number for p in pop_chunked}
+    assert by_codons_unchunked == by_codons_chunked

@@ -124,6 +124,17 @@ class ScheduleContext:
     # per-individual path. "growth" is unaffected either way -- its new
     # genotypes are cheaply diffed from their parent, not batched.
     xp: object = None
+    # Passed straight through to every xp-batched
+    # gpu_change_vector.batch_calculate_change_vectors() call this makes
+    # (via seed_population()/refresh_change_vectors()/
+    # directed_evolution_batch()/merge_replicates_batch()/
+    # flatten_generation()) -- see that function's docstring for what it
+    # bounds and why: population size and protein length both multiply
+    # into some of its intermediate arrays, so a long enough protein can
+    # OOM at a population size that was previously fine. None (default):
+    # unchanged, each call still batches its whole input in one xp pass.
+    # Only relevant when xp is set.
+    chunk_size: int = None
     # Diagnostic-only, no effect on results: `progress` prints each step's
     # kind, timing, and resulting population size as it runs (see
     # run_steps()); `progress_every` is passed through to
@@ -159,7 +170,7 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     count = params["count"]
     seed_fn = ctx.seed_fn or generate_seed
     new_seeds = [seed_fn(ctx.aa_seq) for _ in range(count)]
-    new_index = seed_population(new_seeds, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
+    new_index = seed_population(new_seeds, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
 
     pop_index = {tuple(p.codons): p for p in pop}
     for key, new_sol in new_index.items():
@@ -207,12 +218,13 @@ def _do_growth(
         random_reps = []
         for p in random_individuals:
             random_reps.extend(replicate_and_mutate_random(p.codons, ctx.aa_seq, nreplicates=rate, mutation_rate=mutation_chance))
-        merge_replicates_batch(pop_index, random_reps, ctx.analysis_objects, ctx.locvec, ctx.xp, progress_every=ctx.progress_every)
+        merge_replicates_batch(pop_index, random_reps, ctx.analysis_objects, ctx.locvec, ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
 
         vecs_out = {}
         batch_reps = directed_evolution_batch(
             directed_individuals, ctx.weights, ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
             nreplicates=rate, xp=ctx.xp, progress_every=ctx.progress_every, vecs_out=vecs_out,
+            chunk_size=ctx.chunk_size,
         )
         for p in directed_individuals:
             for rep in batch_reps[id(p)]:
@@ -321,7 +333,7 @@ def _step_kill_off(pop: list, ctx: ScheduleContext, params: dict) -> list:
     See ga.kill_off(). Refreshes change vectors exactly first -- see module
     docstring."""
     percent_cut = params.get("percent_cut", 30)
-    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
     return kill_off(pop, ctx.weights, percent_cut=percent_cut)
 
 
@@ -348,7 +360,7 @@ def _step_select(pop: list, ctx: ScheduleContext, params: dict) -> list:
     ga.select_survivors(). Refreshes change vectors exactly first -- see
     module docstring."""
     target_size = params["target_size"]
-    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
     return select_survivors(pop, ctx.weights, target_size)
 
 
@@ -363,8 +375,8 @@ def _step_flatten(pop: list, ctx: ScheduleContext, params: dict) -> list:
     docstring). Refreshes change vectors exactly first -- see module
     docstring."""
     recursion_limit = params.get("recursion_limit", 3)
-    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every)
-    return flatten_generation(pop, ctx.aa_seq, ctx.analysis_objects, ctx.locvec, recursion_limit, xp=ctx.xp)
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
+    return flatten_generation(pop, ctx.aa_seq, ctx.analysis_objects, ctx.locvec, recursion_limit, xp=ctx.xp, chunk_size=ctx.chunk_size)
 
 
 @register_step("save")
@@ -421,6 +433,7 @@ def run_schedule(
     progress: bool = False,
     progress_every: int = None,
     seed_fn=None,
+    chunk_size: int = None,
 ) -> list:
     """Run a declarative schedule end to end and return the final population.
 
@@ -438,8 +451,13 @@ def run_schedule(
     seed_fn: callable aa_seq -> list[codon_str] used by "input" to generate
         new seeds -- see ScheduleContext.seed_fn. None (default) uses
         ga.generate_seed.
+    chunk_size: caps how many individuals any single xp-batched call in this
+        schedule processes at once -- see ScheduleContext.chunk_size. None
+        (default) keeps the original behavior of batching each step's whole
+        input in one xp pass. Only relevant when xp is set.
     """
     ctx = ScheduleContext(aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects,
                            locvec=locvec, save_dir=save_dir, run_name=run_name, xp=xp,
-                           progress=progress, progress_every=progress_every, seed_fn=seed_fn)
+                           progress=progress, progress_every=progress_every, seed_fn=seed_fn,
+                           chunk_size=chunk_size)
     return run_steps([], ctx, schedule)
