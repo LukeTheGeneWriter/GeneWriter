@@ -23,7 +23,6 @@ from genewriter.change_vector import cached_normal_transform, calculate_change_v
 from genewriter.codon_tables import (
     CODON_FREQS_LIT,
     RARE_CODONS_LIT,
-    TAG_TO_BUCKET,
     TAG_TO_WINDOW_BUCKET,
     codon_choices_for_aa,
     get_aa,
@@ -125,25 +124,14 @@ def _ref_codon_pair_bias_term(sol, cpb, winsize=15):
 
 
 def _ref_gc_term(sol, gc, locvec, winsize=15):
-    gc1_mean = np.mean([0 if c[0] in 'GC' else 1 for c in sol])
-    gc2_mean = np.mean([0 if c[1] in 'GC' else 1 for c in sol])
-    gc3_mean = np.mean([0 if c[2] in 'GC' else 1 for c in sol])
-
-    def z_for(loc, field_name, tagged, value):
-        # field_name/loc key matches change_vector._gc_term's z_for() cache
-        # key exactly, so this is a cache hit against the fit
-        # calculate_change_vector() already populated moments earlier in
-        # each test below, not an independent (and much slower, called 12x
-        # per test here) refit -- see the module-level comment above.
-        return cached_normal_transform(gc, (field_name, loc), tagged[loc]).transform(value)
-
-    z_by_bucket = {}
-    for bucket in ('ExonL50', 'Exon', 'ExonR50', 'Splice'):
-        z_by_bucket[bucket] = {
-            1: z_for(bucket, 'taggedGC1', gc.taggedGC1, gc1_mean),
-            2: z_for(bucket, 'taggedGC2', gc.taggedGC2, gc2_mean),
-            3: z_for(bucket, 'taggedGC3', gc.taggedGC3, gc3_mean),
-        }
+    # Per-sequence GC deviation: one scalar for the whole candidate, added
+    # (not multiplied) to every position's local windowed score below --
+    # see change_vector._gc_term's docstring for the full reasoning behind
+    # this replacing the old gc1/gc2/gc3-by-bucket signal. Goes through
+    # cached_normal_transform() on the same gc object calculate_change_
+    # vector() already populated moments earlier -- cache hit, not a refit.
+    overall_gc = np.mean([1 if base in 'GC' else 0 for c in sol for base in c])
+    seq_deviation = cached_normal_transform(gc, 'gcPerGene', gc.gcPerGene).transform(overall_gc) ** 2
 
     def variable_flags(pos):
         choices = codon_choices_for_aa(get_aa(sol[pos]))
@@ -152,11 +140,7 @@ def _ref_gc_term(sol, gc, locvec, winsize=15):
         v3 = 0 if all(c[2] == choices[0][2] for c in choices) else 1
         return v1, v2, v3
 
-    gc_change = []
-    for i in range(len(sol)):
-        v1, v2, v3 = variable_flags(i)
-        z = z_by_bucket[TAG_TO_BUCKET[locvec[i]]]
-        gc_change.append(v1 * z[1] ** 2 + v2 * z[2] ** 2 + v3 * z[3] ** 2)
+    mutable = [1.0 if any(variable_flags(i)) else 0.0 for i in range(len(sol))]
 
     continuous = ''.join(sol)
     location_string = ''.join(loc * 3 for loc in locvec)
@@ -176,7 +160,7 @@ def _ref_gc_term(sol, gc, locvec, winsize=15):
     per_codon = [np.mean(win_z_by_pos[i:i + 3]) if win_z_by_pos[i:i + 3] else 0.0 for i in range(0, len(win_z_by_pos), 3)]
     per_codon = per_codon[:len(sol)] + [0.0] * max(len(sol) - len(per_codon), 0)
 
-    return [per_codon[i] * gc_change[i] for i in range(len(sol))]
+    return [mutable[i] * (per_codon[i] + seq_deviation) for i in range(len(sol))]
 
 
 def _ref_kmer_term(sol, kmer, locvec, winsize=15):

@@ -79,7 +79,6 @@ from .codon_tables import (
     CODON_TO_VARIABLE_FLAGS,
     GC_FLAGS_BY_INDEX,
     RARE_CODONS_LIT,
-    TAG_TO_BUCKET,
     TAG_TO_WINDOW_BUCKET,
     codon_choices_for_aa,
     get_aa,
@@ -421,51 +420,41 @@ def _codon_pair_bias_term(sol: list, analysis_objects: 'AnalysisObjects', locvec
 @register_term('GC')
 def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsize: int = 15) -> list:
     gc = analysis_objects.gc
-    # NB for anyone touching this later (bit me once already porting this
-    # to gpu_change_vector.py's batched version): 0 for G/C, 1 for A/T --
-    # *inverted* from every other GC indicator in this function (window_gc
-    # below) and from how the baseline itself was built (baseline.py's
-    # tagged_gc1/2/3 use 1 for G/C). That's what the original notebook
-    # computed; preserved as-is rather than "fixed", per this module's
-    # policy of flagging behavior questions instead of silently resolving
-    # them (see module docstring). Computed via the precomputed
-    # GC_FLAGS_BY_INDEX table (1=G/C, normal polarity) and inverted here,
-    # rather than re-inspecting each codon's characters -- mirrors
-    # gpu_change_vector.py's batch_gc_term, which already solved this same
-    # "precompute per-codon GC" item the same way (see codon_tables.py's
-    # GC_FLAGS_BY_INDEX comment).
-    gc_flags = np.asarray(GC_FLAGS_BY_INDEX, dtype=float)[[CODON_TO_INDEX[c] for c in sol]]
-    gc1_mean = 1.0 - gc_flags[:, 0].mean()
-    gc2_mean = 1.0 - gc_flags[:, 1].mean()
-    gc3_mean = 1.0 - gc_flags[:, 2].mean()
+    gc_flags = np.asarray(GC_FLAGS_BY_INDEX, dtype=float)[[CODON_TO_INDEX[c] for c in sol]]  # (N, 3), 1=G/C, normal polarity
 
-    def z_for(loc: str, field_name: str, tagged: dict, value: float) -> float:
-        # Cache key matches gpu_change_vector.batch_gc_term's z_batch()
-        # exactly, so whichever path (per-individual or batched) runs
-        # first populates the cache for both -- see cached_stat()'s
-        # docstring.
-        transform = cached_normal_transform(gc, (field_name, loc), tagged[loc])
-        return transform.transform(value)
-
-    z_by_bucket = {}
-    for bucket in ('ExonL50', 'Exon', 'ExonR50', 'Splice'):
-        z_by_bucket[bucket] = {
-            1: z_for(bucket, 'taggedGC1', gc.taggedGC1, gc1_mean),
-            2: z_for(bucket, 'taggedGC2', gc.taggedGC2, gc2_mean),
-            3: z_for(bucket, 'taggedGC3', gc.taggedGC3, gc3_mean),
-        }
+    # Per-SEQUENCE GC deviation: one scalar for the whole candidate, added
+    # (not multiplied) to every position's local windowed score below.
+    # Replaces the old gc1/gc2/gc3-by-bucket signal, which turned out to be
+    # a whole-candidate aggregate masquerading as a per-position one (every
+    # position sharing a bucket got the identical value, regardless of
+    # which codon was actually there) and -- worse -- barely moved at all
+    # when the GA scored synonymous alternatives at a position, since
+    # swapping one codon shifts a whole-sequence mean by ~1/(3*len(sol))
+    # (see diff_change_vector()'s and directed_evolution_batch()'s own
+    # docstrings, which already documented this dilution for exactly this
+    # kind of whole-sequence aggregate). overall_gc here matches
+    # GCAnalysis.gcPerGene's own construction exactly (baseline.py:
+    # gc_bases / (3 * len(codons)), same normal polarity) so the two are
+    # directly comparable through the fitted transform.
+    #
+    # This makes GC's overall priority scale with how far off nature's
+    # typical GC% the WHOLE candidate is: badly off overall -> every
+    # position's GC score gets a large constant boost (GC matters more,
+    # relative to the other terms, everywhere); roughly on-spec overall ->
+    # that boost is ~0 and GC only matters where the *local* window
+    # (below) is itself off -- still-independent local smoothing pressure,
+    # not gated by the sequence-wide state.
+    overall_gc = gc_flags.mean()
+    seq_transform = cached_normal_transform(gc, 'gcPerGene', gc.gcPerGene)
+    seq_deviation = seq_transform.transform(overall_gc) ** 2
 
     # A position is only worth mutating for GC purposes if some synonymous
-    # codon actually differs at that base -- if every synonym shares the
-    # same base 1/2/3, mutating can't change GC there. CODON_TO_VARIABLE_FLAGS
-    # is precomputed once at import time (depends only on the amino acid,
-    # not which codon is chosen -- see codon_tables.py), replacing a
-    # per-position codon_choices_for_aa()+get_aa()+three all()-comparisons.
-    gc_change = []
-    for i in range(len(sol)):
-        v1, v2, v3 = CODON_TO_VARIABLE_FLAGS[sol[i]]
-        z = z_by_bucket[TAG_TO_BUCKET[locvec[i]]]
-        gc_change.append(v1 * z[1] ** 2 + v2 * z[2] ** 2 + v3 * z[3] ** 2)
+    # codon actually differs at some base there -- if every synonym shares
+    # the same base 1/2/3, no change at this position can move GC at all,
+    # local or global. CODON_TO_VARIABLE_FLAGS is precomputed once at
+    # import time (depends only on the amino acid, not which codon is
+    # chosen -- see codon_tables.py).
+    mutable = [1.0 if any(CODON_TO_VARIABLE_FLAGS[c]) else 0.0 for c in sol]
 
     continuous = ''.join(sol)
     location_string = ''.join(loc * 3 for loc in locvec)
@@ -515,7 +504,7 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
     per_codon = win_z_by_pos_arr[:num_full_codons * 3].reshape(-1, 3).mean(axis=1).tolist() if num_full_codons else []
     per_codon = per_codon[:len(sol)] + [0.0] * max(len(sol) - len(per_codon), 0)
 
-    return [per_codon[i] * gc_change[i] for i in range(len(sol))]
+    return [mutable[i] * (per_codon[i] + seq_deviation) for i in range(len(sol))]
 
 
 @register_term('Kmer')

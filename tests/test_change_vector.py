@@ -192,8 +192,14 @@ def test_codon_usage_term_baseline_stats_are_cached_across_calls(aa_seq, analysi
 
 
 def test_gc_term_baseline_stats_are_cached_across_calls(aa_seq, analysis_objects):
+    """Mutates the two baseline arrays the GC term actually reads post-
+    per-sequence-deviation redesign (gc.windows for the local windowed
+    signal, gc.gcPerGene for the whole-candidate deviation) -- taggedGC1-3
+    are no longer read by this term at all (see _gc_term's docstring), so
+    mutating those wouldn't exercise the cache either way."""
     sol = _random_solution(aa_seq)
     first = calculate_change_vector(sol, analysis_objects)['GC']
-    analysis_objects.gc.taggedGC1['Exon'] = [999.0] * len(analysis_objects.gc.taggedGC1['Exon'])
+    analysis_objects.gc.windows['Exon'] = [999.0] * len(analysis_objects.gc.windows['Exon'])
+    analysis_objects.gc.gcPerGene = [999.0] * len(analysis_objects.gc.gcPerGene)
     second = calculate_change_vector(sol, analysis_objects)['GC']
     assert first == second

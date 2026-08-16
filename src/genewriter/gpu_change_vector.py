@@ -49,14 +49,12 @@ from .codon_tables import (
     NT_BASE4_BY_CODON_INDEX,
     NT_TO_BASE4,
     RARE_CODON_INDICES,
-    TAG_TO_BUCKET,
     TAG_TO_WINDOW_BUCKET,
     VARIABLE_FLAGS_BY_INDEX,
     encode_codons,
 )
 
 _WINDOW_BUCKET_NAMES = ('ExonL50', 'Exon', 'ExonR50')
-_LOCATION_BUCKET_NAMES = ('ExonL50', 'Exon', 'ExonR50', 'Splice')
 
 # The only terms this module has a hand-written batched (xp-array)
 # implementation for. Unlike change_vector.py's @register_term registry,
@@ -268,53 +266,28 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     length/gene body for every individual in one calculate_change_vector-
     style call). Returns (P, N)."""
     P, N = codon_idx.shape
-    gc_flags = xp.asarray(np.asarray(GC_FLAGS_BY_INDEX, dtype=float))  # (64, 3), 1=G/C, 0=A/T
+    gc_flags = xp.asarray(np.asarray(GC_FLAGS_BY_INDEX, dtype=float))  # (64, 3), 1=G/C, normal polarity
     per_pos_gc = gc_flags[codon_idx]  # (P, N, 3)
-    # The per-individual term's gc1_mean/gc2_mean/gc3_mean use an *inverted*
-    # polarity from everywhere else in this function (and from the baseline
-    # data itself, gc.taggedGC1/2/3, and window_gc below): `0 if c[0] in
-    # 'GC' else 1`, i.e. 0 for G/C and 1 for A/T. That's how the original
-    # notebook computed it and change_vector.py's _gc_term faithfully
-    # preserves it rather than "fixing" an inconsistency that isn't this
-    # port's call to make (see change_vector.py's module docstring) --
-    # matched here by inverting the (normal-polarity) per_pos_gc average.
-    gc1_mean = 1.0 - per_pos_gc[:, :, 0].mean(axis=1)  # (P,)
-    gc2_mean = 1.0 - per_pos_gc[:, :, 1].mean(axis=1)
-    gc3_mean = 1.0 - per_pos_gc[:, :, 2].mean(axis=1)
 
-    def z_batch(value_mean, loc, field_name, tagged):
-        """Normal-scores z of value_mean against the baseline's fitted
-        distribution, elementwise over the batch. Always returns an xp
-        array of shape (P,) so every caller can treat the result uniformly
-        (see distribution_fit.FittedDistribution.transform_array()). Cache
-        key matches change_vector._gc_term's z_for() exactly, so whichever
-        path runs first populates the cache for both -- see cached_stat()'s
-        docstring."""
-        transform = cached_normal_transform(gc, (field_name, loc), tagged[loc])
-        return transform.transform_array(value_mean, xp=xp)
+    # Per-SEQUENCE GC deviation -- one scalar per individual, added (not
+    # multiplied) to every position's local windowed score below. Replaces
+    # the old gc1/gc2/gc3-by-bucket signal, which was a whole-candidate
+    # aggregate applied identically to every position sharing a bucket
+    # (not a real per-position signal) and barely moved when scoring
+    # synonymous alternatives at a single position -- see
+    # change_vector._gc_term's matching comment for the full reasoning.
+    # overall_gc matches GCAnalysis.gcPerGene's own construction exactly
+    # (baseline.py: gc_bases / (3 * len(codons)), same normal polarity).
+    overall_gc = per_pos_gc.reshape(P, N * 3).mean(axis=1)  # (P,)
+    seq_transform = cached_normal_transform(gc, 'gcPerGene', gc.gcPerGene)
+    seq_deviation = seq_transform.transform_array(overall_gc, xp=xp) ** 2  # (P,)
 
-    z_by_bucket = {}  # bucket -> (z1, z2, z3), each shape (P,)
-    for bucket in _LOCATION_BUCKET_NAMES:
-        z_by_bucket[bucket] = (
-            z_batch(gc1_mean, bucket, 'taggedGC1', gc.taggedGC1),
-            z_batch(gc2_mean, bucket, 'taggedGC2', gc.taggedGC2),
-            z_batch(gc3_mean, bucket, 'taggedGC3', gc.taggedGC3),
-        )
-
+    # A position is only worth mutating for GC purposes if some synonymous
+    # codon actually differs at some base there -- see change_vector._gc_
+    # term's matching comment.
     variable_flags = xp.asarray(np.asarray(VARIABLE_FLAGS_BY_INDEX, dtype=float))  # (64, 3)
     per_pos_var = variable_flags[codon_idx]  # (P, N, 3)
-
-    bucket_of_codon = [TAG_TO_BUCKET[loc] for loc in locvec]  # length N, shared
-    gc_change = xp.zeros((P, N), dtype=float)
-    for bucket in set(bucket_of_codon):
-        cols = np.asarray([i for i, b in enumerate(bucket_of_codon) if b == bucket])
-        z1, z2, z3 = z_by_bucket[bucket]
-        contribution = (
-            per_pos_var[:, cols, 0] * (z1.reshape(P, 1)) ** 2
-            + per_pos_var[:, cols, 1] * (z2.reshape(P, 1)) ** 2
-            + per_pos_var[:, cols, 2] * (z3.reshape(P, 1)) ** 2
-        )
-        gc_change[:, cols] = contribution
+    mutable = (per_pos_var.sum(axis=2) > 0).astype(float)  # (P, N)
 
     # Flatten to per-nucleotide (P, 3N) to match the window span (in
     # nucleotides) the baseline was computed over.
@@ -344,7 +317,7 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     win_z_by_pos = windowed_average_batched(xp, win_z, N * 3, winsize)  # (P, 3N)
     per_codon = win_z_by_pos.reshape(P, N, 3).mean(axis=2)  # (P, N)
 
-    return per_codon * gc_change
+    return mutable * (per_codon + seq_deviation.reshape(P, 1))
 
 
 def _np_sliding_sum(bool_arr_1d, span):
