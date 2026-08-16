@@ -27,7 +27,7 @@ z-scoring.
 
 import numpy as np
 
-from .change_vector import AnalysisObjects, _zscore, cached_mean_std
+from .change_vector import AnalysisObjects, cached_normal_transform
 from .codon_tables import RARE_CODONS_LIT
 
 # Per-gene baseline array backing each term's coefficient of variation --
@@ -153,11 +153,16 @@ def natural_deviation_zscores(sol: list, analysis_objects: AnalysisObjects) -> d
     term_coefficients_of_variation() reads -- see _PER_GENE_FIELDS).
 
     Unlike the internal z-scoring every change-vector term already does
-    (change_vector._zscore, against position/window-level baselines), this
-    z-scores a single whole-candidate aggregate against the distribution of
-    that same aggregate across real genes -- "is this candidate's overall
-    rare-codon rate/GC content/etc. within the range real genes actually
-    occupy," not "is this specific window unusual."
+    (against position/window-level baselines), this z-scores a single
+    whole-candidate aggregate against the distribution of that same
+    aggregate across real genes -- "is this candidate's overall rare-codon
+    rate/GC content/etc. within the range real genes actually occupy," not
+    "is this specific window unusual." Uses the same auto-detected-
+    distribution normal-scores transform as the change-vector terms
+    (change_vector.cached_normal_transform(), see distribution_fit.py) --
+    a per-gene aggregate array (cpbPerGene et al.) is exactly the same kind
+    of "might not actually be Gaussian" baseline the terms' own arrays are,
+    so it gets the same correction.
 
     A category is omitted if its baseline array has fewer than 2 genes'
     worth of data or a std of 0 (real Standards/GCAnalysis.json files
@@ -173,8 +178,8 @@ def natural_deviation_zscores(sol: list, analysis_objects: AnalysisObjects) -> d
         values = getattr(baseline_obj, field_name)
         if len(values) < 2:
             continue
-        mean, std = cached_mean_std(baseline_obj, field_name, values)
-        if std == 0:
+        transform = cached_normal_transform(baseline_obj, field_name, values)
+        if transform.family == 'degenerate':
             continue
-        zscores[term_name] = abs(_zscore(stats[term_name], mean, std))
+        zscores[term_name] = abs(transform.transform(stats[term_name]))
     return zscores

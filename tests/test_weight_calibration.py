@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 
 from genewriter.weight_calibration import (
@@ -80,21 +81,47 @@ def test_compute_candidate_natural_stats_empty_solution_returns_empty_dict(analy
 
 def test_natural_deviation_zscores_zero_at_the_baseline_mean(analysis_objects):
     analysis_objects.codon_usage.codonFreqsLit = {c: 20.0 for c in analysis_objects.codon_usage.codonFreqsLit}
-    analysis_objects.codon_usage.codonUsageScoreByGene = [18.0, 22.0] * 100  # mean 20, std 2
+    # A real continuous sample, not an exact-alternating 2-point array: the
+    # normal-scores transform (see distribution_fit.py) auto-selects among
+    # several candidate distribution families, and an alternating [18, 22]
+    # array is a discrete two-point mixture that none of them actually
+    # describes well -- AIC ends up picking whichever odd-shaped family
+    # happens to fit that pathological case "least badly" (empirically,
+    # lognorm), which has nothing to do with what this test is actually
+    # checking. A real Gaussian sample lets norm reliably win, matching
+    # this test's intent: a candidate sitting exactly at nature's own
+    # central tendency should score as unremarkable.
+    rng = np.random.default_rng(0)
+    analysis_objects.codon_usage.codonUsageScoreByGene = rng.normal(20.0, 2.0, 5000).tolist()
 
     sol = ['CTT'] * 4  # Leu, not rare -- only CodonUsage is being asserted on here
     zscores = natural_deviation_zscores(sol, analysis_objects)
 
-    assert zscores['CodonUsage'] == pytest.approx(0.0)
+    # Not exactly 0.0: the fitted mean is a sample estimate, not exactly
+    # 20.0. Comfortably tight given N=5000.
+    assert zscores['CodonUsage'] == pytest.approx(0.0, abs=0.05)
 
 
 def test_natural_deviation_zscores_large_for_a_genuine_outlier(analysis_objects):
-    analysis_objects.rare_codon.usagePerGene = [0.0, 0.2] * 100  # mean 0.1, std 0.1
+    # Real continuous sample rather than an alternating 2-point array --
+    # see the comment in test_natural_deviation_zscores_zero_at_the_
+    # baseline_mean above for why. std small enough that the (unclipped)
+    # normal draw essentially never goes negative, since a rare-codon
+    # fraction can't.
+    rng = np.random.default_rng(1)
+    analysis_objects.rare_codon.usagePerGene = rng.normal(0.1, 0.02, 5000).tolist()
 
     sol = ['GCG'] * 4  # Ala, every codon rare -> fraction 1.0
     zscores = natural_deviation_zscores(sol, analysis_objects)
 
-    assert zscores['RareCodons'] == pytest.approx(9.0)  # |(1.0 - 0.1) / 0.1|
+    # 1.0 is ~45 sample-std past the baseline mean -- nowhere close to
+    # anything actually observed while fitting. distribution_fit.py
+    # deliberately caps how extreme a transform can report (_CDF_EPS, see
+    # its docstring) rather than extrapolating an unbounded raw z for a
+    # candidate this far outside the fitted range, so this checks
+    # "unambiguously flagged as an outlier," not a specific magnitude tied
+    # to the old uncapped linear formula.
+    assert zscores['RareCodons'] > 3.0
 
 
 def test_natural_deviation_zscores_skips_categories_with_insufficient_baseline(analysis_objects):

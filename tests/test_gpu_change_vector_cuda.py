@@ -19,6 +19,7 @@ except Exception:
 
 pytestmark = pytest.mark.skipif(not _has_gpu, reason="no CUDA GPU available")
 
+from genewriter.distribution_fit import fit_normal_transform  # noqa: E402
 from genewriter.gpu_change_vector import (  # noqa: E402
     batch_calculate_change_vectors,
     batch_codon_pair_bias_term,
@@ -125,6 +126,24 @@ def test_batch_kmer_term_gpu_matches_cpu(analysis_objects):
     locvec = ['I'] * len(LONG_AA_SEQ)
     cpu = batch_kmer_term(np, cpu_idx, analysis_objects.kmer, locvec)
     gpu = batch_kmer_term(cp, gpu_idx, analysis_objects.kmer, locvec)
+    _assert_arrays_close(cpu, gpu)
+
+
+def test_fitted_distribution_transform_array_gpu_matches_cpu():
+    """distribution_fit.FittedDistribution.transform_array()'s interpolation
+    is written by hand against searchsorted/clip (see its docstring for
+    why: no reliance on xp.interp existing/matching across cupy versions)
+    -- this is the direct test that the numpy and cupy code paths through
+    that hand-written interpolation actually agree, isolated from any one
+    change-vector term."""
+    rng = np.random.default_rng(5)
+    data = rng.exponential(scale=2.0, size=4000) + 1.0  # skewed -- exercises a real (non-norm) fit
+    fd = fit_normal_transform(data)
+    assert fd.family != 'norm'
+
+    values = rng.uniform(-5.0, 30.0, size=(8, 20))  # includes out-of-range (below the 1.0 floor) values
+    cpu = fd.transform_array(values, xp=np)
+    gpu = fd.transform_array(cp.asarray(values), xp=cp)
     _assert_arrays_close(cpu, gpu)
 
 

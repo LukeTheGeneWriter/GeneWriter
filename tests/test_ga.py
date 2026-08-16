@@ -82,15 +82,29 @@ def test_kill_off_outside_natural_range_drops_only_the_outlier_genotype(analysis
     entirely, in full (not proportionally reduced like kill_off()),
     regardless of its replicate count -- while a genotype within range
     survives untouched."""
-    analysis_objects.rare_codon.usagePerGene = [0.0, 0.2] * 100  # mean 0.1, std 0.1
-    analysis_objects.gc.gcPerGene = [0.3, 0.7] * 100  # mean 0.5, std 0.2
+    # Real continuous Gaussian samples, not exact-alternating 2-point
+    # arrays: the normal-scores transform (distribution_fit.py) picks
+    # among several candidate distribution families by AIC, and a discrete
+    # two-point mixture like [0.0, 0.2]*100 isn't well-described by any of
+    # them -- AIC ends up choosing whichever shape fits that pathological
+    # case "least badly" (e.g. lognorm), which can quietly change which
+    # genotypes cross `threshold` here for reasons that have nothing to do
+    # with what this test means to check. A real Gaussian sample at the
+    # same (mean, std) keeps that intent intact: norm reliably wins, so
+    # "N std from the baseline mean" means what the comments below say.
+    rng = np.random.default_rng(0)
+    analysis_objects.rare_codon.usagePerGene = rng.normal(0.1, 0.1, 5000).tolist()  # mean 0.1, std 0.1
+    analysis_objects.gc.gcPerGene = rng.normal(0.5, 0.2, 5000).tolist()  # mean 0.5, std 0.2
     analysis_objects.codon_usage.codonFreqsLit = {c: 20.0 for c in analysis_objects.codon_usage.codonFreqsLit}
-    analysis_objects.codon_usage.codonUsageScoreByGene = [18.0, 22.0] * 100
+    analysis_objects.codon_usage.codonUsageScoreByGene = rng.normal(20.0, 2.0, 5000).tolist()
     analysis_objects.codon_pair_bias.cpb_lit = {p: 50000.0 for p in analysis_objects.codon_pair_bias.cpb_lit}
-    analysis_objects.codon_pair_bias.cpbPerGene = [45000.0, 55000.0] * 100
+    analysis_objects.codon_pair_bias.cpbPerGene = rng.normal(50000.0, 5000.0, 5000).tolist()
 
     normal = ['CTT'] * 10  # Leu, not rare, GC fraction 1/3 -- within range on every axis
-    outlier = ['GCG'] * 10  # Ala, every codon rare -- RareCodons z-score of 9.0
+    outlier = ['GCG'] * 10  # Ala, every codon rare -- fraction 1.0 is ~9 raw std from the
+                             # baseline mean, though distribution_fit.py caps how extreme a
+                             # transform can report (_CDF_EPS) rather than reporting the raw
+                             # value -- comfortably still above `threshold` either way.
     pop = [Proposed_Solution(normal, 3, {}), Proposed_Solution(outlier, 5, {})]
 
     survivors = ga.kill_off_outside_natural_range(pop, analysis_objects, threshold=3.0)

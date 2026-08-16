@@ -207,6 +207,34 @@ def cached_mean_std(obj, key, values) -> tuple:
     return cached_stat(obj, key, _compute)
 
 
+def cached_normal_transform(obj, key, values):
+    """cached_stat() specialized for building a distribution_fit.
+    FittedDistribution from a baseline array -- the normal-scores-transform
+    counterpart of cached_mean_std(), and every term below now uses this
+    instead. See distribution_fit.py's module docstring for why: a plain
+    (x - mean) / std z-score, squared, silently misrepresents rarity when
+    the baseline array isn't symmetric (confirmed against real
+    CodonPairBias data, which is Boltzmann/exponential-tailed, not
+    Gaussian). fit_normal_transform() auto-detects the actual shape and
+    returns a lookup table that reduces to the classic z-score exactly when
+    the shape really is normal, so this is a strict correctness upgrade,
+    not a behavior change for baselines that were already Gaussian.
+
+    Same object-keyed caching as cached_mean_std() (and cached_stat() in
+    general) -- the fit is genuinely heavyweight (an MLE + AIC comparison
+    across several candidate families), which is exactly why it's cached
+    for the life of `obj` rather than recomputed per call. Shared between
+    change_vector.py's per-individual terms, gpu_change_vector.py's batched
+    counterparts, and weight_calibration.py wherever they pass the same
+    (obj, key) -- whichever runs first populates the cache for all three.
+    """
+    from .distribution_fit import fit_normal_transform
+
+    def _compute():
+        return fit_normal_transform(values)
+    return cached_stat(obj, key, _compute)
+
+
 _TERM_REGISTRY = {}
 
 
@@ -299,8 +327,8 @@ def _rare_codon_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: lis
     scorevec = _windowed_average(scorewins, len(sol), winsize)
 
     overall_rc = rvec.sum() / len(rvec)
-    distrib_mean, distrib_std = cached_mean_std(rc, 'usagePerGene', rc.usagePerGene)
-    zscore = _zscore(overall_rc, distrib_mean, distrib_std) ** 2
+    usage_transform = cached_normal_transform(rc, 'usagePerGene', rc.usagePerGene)
+    zscore = usage_transform.transform(overall_rc) ** 2
 
     # rvec[i] gates the signal to rare-codon positions only. Guard the
     # multiplication explicitly rather than `scorevec[i] * rvec[i] * zscore`:
@@ -337,15 +365,15 @@ def _codon_usage_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: li
         cuwinscores = []
         cudists = []
 
-    dist_mean, dist_std = cached_mean_std(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
-    score_mean, score_std = cached_mean_std(ca, 'windowscores', ca.windowscores)
+    dist_transform = cached_normal_transform(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
+    score_transform = cached_normal_transform(ca, 'windowscores', ca.windowscores)
     dist_vals = _windowed_average(cudists, len(sol), winsize)
     score_vals = _windowed_average(cuwinscores, len(sol), winsize)
-    dist_zs = [_zscore(v, dist_mean, dist_std) ** 2 for v in dist_vals]
-    score_zs = [_zscore(v, score_mean, score_std) ** 2 for v in score_vals]
+    dist_zs = [dist_transform.transform(v) ** 2 for v in dist_vals]
+    score_zs = [score_transform.transform(v) ** 2 for v in score_vals]
 
-    gene_mean, gene_std = cached_mean_std(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
-    straight_z = [_zscore(o, gene_mean, gene_std) / 2 for o in cuvec]
+    gene_transform = cached_normal_transform(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
+    straight_z = [gene_transform.transform(o) / 2 for o in cuvec]
 
     return [straight_z[i] * score_zs[i] + straight_z[i] * dist_zs[i] for i in range(len(sol))]
 
@@ -373,8 +401,8 @@ def _codon_pair_bias_term(sol: list, analysis_objects: 'AnalysisObjects', locvec
     else:
         win_scores = [0.0] * num_windows
 
-    win_mean, win_std = cached_mean_std(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
-    win_z = [_zscore(v, win_mean, win_std) ** 2 for v in win_scores]
+    win_transform = cached_normal_transform(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
+    win_z = [win_transform.transform(v) ** 2 for v in win_scores]
     win_change = _windowed_average(win_z, len(sol), winsize)
 
     # Score at position i is the average of the two codon-pairs touching it.
@@ -416,8 +444,8 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
         # exactly, so whichever path (per-individual or batched) runs
         # first populates the cache for both -- see cached_stat()'s
         # docstring.
-        mean, std = cached_mean_std(gc, (field_name, loc), tagged[loc])
-        return _zscore(value, mean, std)
+        transform = cached_normal_transform(gc, (field_name, loc), tagged[loc])
+        return transform.transform(value)
 
     z_by_bucket = {}
     for bucket in ('ExonL50', 'Exon', 'ExonR50', 'Splice'):
@@ -471,8 +499,8 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
             mask = majority_bucket == b
             if not mask.any():
                 continue
-            base_mean, base_std = cached_mean_std(gc, ('windows', name), gc.windows[name])
-            win_z[mask] = _zscore(window_gc[mask], base_mean, base_std) ** 2
+            base_transform = cached_normal_transform(gc, ('windows', name), gc.windows[name])
+            win_z[mask] = base_transform.transform_array(window_gc[mask]) ** 2
         win_z = win_z.tolist()
     else:
         win_z = []

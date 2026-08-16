@@ -38,7 +38,7 @@ its memory-scaling caveat at large k.
 
 import numpy as np
 
-from .change_vector import _zscore, cached_mean_std, cached_stat, calculate_change_vector, registered_terms
+from .change_vector import cached_normal_transform, cached_stat, calculate_change_vector, registered_terms
 from .codon_tables import (
     AA_CODONS,
     CODON_FREQ_BY_INDEX,
@@ -180,8 +180,8 @@ def batch_rare_codon_term(xp, codon_idx, rc, winsize: int = 15):
     scorevec = windowed_average_batched(xp, scorewins, N, winsize)  # (P, N)
 
     overall_rc = rvec.sum(axis=1) / N  # (P,)
-    dmean, dstd = cached_mean_std(rc, 'usagePerGene', rc.usagePerGene)
-    zscore = (xp.zeros_like(overall_rc) if dstd == 0 else (overall_rc - dmean) / dstd) ** 2  # (P,)
+    usage_transform = cached_normal_transform(rc, 'usagePerGene', rc.usagePerGene)
+    zscore = usage_transform.transform_array(overall_rc, xp=xp) ** 2  # (P,)
 
     # rvec gates the signal to rare-codon positions only -- select 0 rather
     # than multiply by the gate (inf * 0 == NaN, see the per-individual
@@ -206,19 +206,20 @@ def batch_codon_usage_term(xp, codon_idx, ca, winsize: int = 15):
         cuwinscores = xp.zeros((P, 0), dtype=float)
         cudists = xp.zeros((P, 0), dtype=float)
 
-    dist_mean, dist_std = cached_mean_std(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
-    score_mean, score_std = cached_mean_std(ca, 'windowscores', ca.windowscores)
+    dist_transform = cached_normal_transform(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
+    score_transform = cached_normal_transform(ca, 'windowscores', ca.windowscores)
     dist_vals = windowed_average_batched(xp, cudists, N, winsize)
     score_vals = windowed_average_batched(xp, cuwinscores, N, winsize)
-    # std==0 branches return a same-shaped zero array, not a bare Python
-    # 0.0 -- see batch_gc_term's z_batch() docstring for why that matters
-    # (anything feeding back into windowed_average_batched needs a real
-    # array with a .shape).
-    dist_zs = (xp.zeros_like(dist_vals) if dist_std == 0 else (dist_vals - dist_mean) / dist_std) ** 2
-    score_zs = (xp.zeros_like(score_vals) if score_std == 0 else (score_vals - score_mean) / score_std) ** 2
+    # transform_array() always returns a real xp array shaped like its
+    # input (the degenerate-baseline case still returns an all-zero array
+    # of that shape, not a bare Python 0.0), so anything feeding back into
+    # windowed_average_batched() below always gets a real array with a
+    # .shape -- see distribution_fit.FittedDistribution's docstring.
+    dist_zs = dist_transform.transform_array(dist_vals, xp=xp) ** 2
+    score_zs = score_transform.transform_array(score_vals, xp=xp) ** 2
 
-    gene_mean, gene_std = cached_mean_std(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
-    straight_z = (xp.zeros_like(cuvec) if gene_std == 0 else (cuvec - gene_mean) / gene_std) / 2
+    gene_transform = cached_normal_transform(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
+    straight_z = gene_transform.transform_array(cuvec, xp=xp) / 2
 
     return straight_z * score_zs + straight_z * dist_zs
 
@@ -248,8 +249,8 @@ def batch_codon_pair_bias_term(xp, codon_idx, cpb, winsize: int = 15):
     else:
         win_scores = xp.zeros((P, num_windows), dtype=float)
 
-    win_mean, win_std = cached_mean_std(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
-    win_z = (xp.zeros_like(win_scores) if win_std == 0 else (win_scores - win_mean) / win_std) ** 2
+    win_transform = cached_normal_transform(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
+    win_z = win_transform.transform_array(win_scores, xp=xp) ** 2
     win_change = windowed_average_batched(xp, win_z, N, winsize)  # (P, N)
 
     pair_change = xp.zeros((P, N), dtype=float)
@@ -282,17 +283,15 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     gc3_mean = 1.0 - per_pos_gc[:, :, 2].mean(axis=1)
 
     def z_batch(value_mean, loc, field_name, tagged):
-        """(value_mean - baseline_mean) / baseline_std, elementwise over
-        the batch. Always returns an xp array of shape (P,), even when
-        std==0 (a same-shaped zero array, not a bare Python 0.0) so every
-        caller can treat the result uniformly. Cache key matches
-        change_vector._gc_term's z_for() exactly, so whichever path runs
-        first populates the cache for both -- see cached_stat()'s
+        """Normal-scores z of value_mean against the baseline's fitted
+        distribution, elementwise over the batch. Always returns an xp
+        array of shape (P,) so every caller can treat the result uniformly
+        (see distribution_fit.FittedDistribution.transform_array()). Cache
+        key matches change_vector._gc_term's z_for() exactly, so whichever
+        path runs first populates the cache for both -- see cached_stat()'s
         docstring."""
-        m, s = cached_mean_std(gc, (field_name, loc), tagged[loc])
-        if s == 0:
-            return xp.zeros_like(value_mean, dtype=float)
-        return (value_mean - m) / s
+        transform = cached_normal_transform(gc, (field_name, loc), tagged[loc])
+        return transform.transform_array(value_mean, xp=xp)
 
     z_by_bucket = {}  # bucket -> (z1, z2, z3), each shape (P,)
     for bucket in _LOCATION_BUCKET_NAMES:
@@ -335,10 +334,10 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
             mask = majority_bucket == b
             if not mask.any():
                 continue
-            m, s = cached_mean_std(gc, ('windows', name), gc.windows[name])
+            transform = cached_normal_transform(gc, ('windows', name), gc.windows[name])
             cols = np.asarray(np.nonzero(mask)[0])
             val = window_gc[:, cols]
-            win_z[:, cols] = (0.0 if s == 0 else (val - m) / s) ** 2
+            win_z[:, cols] = transform.transform_array(val, xp=xp) ** 2
     else:
         win_z = xp.zeros((P, 0), dtype=float)
 

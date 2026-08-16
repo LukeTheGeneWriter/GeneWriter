@@ -19,7 +19,7 @@ import random
 import numpy as np
 import pytest
 
-from genewriter.change_vector import calculate_change_vector
+from genewriter.change_vector import cached_normal_transform, calculate_change_vector
 from genewriter.codon_tables import (
     CODON_FREQS_LIT,
     RARE_CODONS_LIT,
@@ -47,8 +47,19 @@ def _ref_windowed_average(values, target_len, winsize):
     return out
 
 
-def _ref_zscore(value, mean, std):
-    return 0.0 if std == 0 else (value - mean) / std
+# Z-scoring itself is deliberately NOT reimplemented here from raw (mean,
+# std) the way the rest of this file reimplements each term from scratch --
+# distribution_fit.py has its own dedicated test coverage for whether the
+# auto-detected-distribution transform is correct, so re-deriving it here
+# too would just be duplicated (and driftable) test surface for something
+# this file was never trying to catch in the first place (see module
+# docstring: this file exists to catch window-bookkeeping bugs, not z-score
+# formula bugs). Goes through cached_normal_transform() on the exact same
+# analysis_objects sub-object `actual = calculate_change_vector(...)`
+# already populated moments earlier in each test below, so this is a cache
+# hit (cheap) and guaranteed to be looking at the identical fitted
+# transform the real implementation used -- not an independent, possibly
+# divergent refit.
 
 
 def _ref_dist_from_optimal(codons):
@@ -67,8 +78,7 @@ def _ref_rare_codon_term(sol, rc, winsize=15):
     scorewins = [odds.get(sum(win), float('inf')) for win in wins]
     scorevec = _ref_windowed_average(scorewins, len(sol), winsize)
     overall_rc = sum(rvec) / len(rvec)
-    distrib = np.asarray(rc.usagePerGene, dtype=float)
-    zscore = _ref_zscore(overall_rc, distrib.mean(), distrib.std()) ** 2
+    zscore = cached_normal_transform(rc, 'usagePerGene', rc.usagePerGene).transform(overall_rc) ** 2
     return [(scorevec[i] * zscore) if rvec[i] else 0.0 for i in range(len(sol))]
 
 
@@ -78,14 +88,14 @@ def _ref_codon_usage_term(sol, ca, winsize=15):
     cuwins = [sol[i:i + span] for i in range(0, max(len(sol) - ca.windowsize, 0))]
     cuwinscores = [sum(ca.codonFreqsLit[c] for c in win) / ca.windowsize for win in cuwins]
     cudists = [_ref_dist_from_optimal(win) for win in cuwins]
-    dist_mean, dist_std = np.mean(ca.windowdistancesfromoptimal), np.std(ca.windowdistancesfromoptimal)
-    score_mean, score_std = np.mean(ca.windowscores), np.std(ca.windowscores)
+    dist_fit = cached_normal_transform(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
+    score_fit = cached_normal_transform(ca, 'windowscores', ca.windowscores)
     dist_vals = _ref_windowed_average(cudists, len(sol), winsize)
     score_vals = _ref_windowed_average(cuwinscores, len(sol), winsize)
-    dist_zs = [_ref_zscore(v, dist_mean, dist_std) ** 2 for v in dist_vals]
-    score_zs = [_ref_zscore(v, score_mean, score_std) ** 2 for v in score_vals]
-    gene_mean, gene_std = np.mean(ca.codonUsageScoreByGene), np.std(ca.codonUsageScoreByGene)
-    straight_z = [_ref_zscore(o, gene_mean, gene_std) / 2 for o in cuvec]
+    dist_zs = [dist_fit.transform(v) ** 2 for v in dist_vals]
+    score_zs = [score_fit.transform(v) ** 2 for v in score_vals]
+    gene_fit = cached_normal_transform(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
+    straight_z = [gene_fit.transform(o) / 2 for o in cuvec]
     return [straight_z[i] * score_zs[i] + straight_z[i] * dist_zs[i] for i in range(len(sol))]
 
 
@@ -100,8 +110,8 @@ def _ref_codon_pair_bias_term(sol, cpb, winsize=15):
     for win in wins:
         win_pairs = [win[i] + win[i + 1] for i in range(len(win) - 1)]
         win_scores.append(sum(cpb.cpb_lit[p] for p in win_pairs) / len(win_pairs) if win_pairs else 0.0)
-    win_mean, win_std = np.mean(cpb.cpbPerWindow), np.std(cpb.cpbPerWindow)
-    win_z = [_ref_zscore(v, win_mean, win_std) ** 2 for v in win_scores]
+    win_fit = cached_normal_transform(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
+    win_z = [win_fit.transform(v) ** 2 for v in win_scores]
     win_change = _ref_windowed_average(win_z, len(sol), winsize)
     pair_change = []
     for i in range(len(sol)):
@@ -119,16 +129,20 @@ def _ref_gc_term(sol, gc, locvec, winsize=15):
     gc2_mean = np.mean([0 if c[1] in 'GC' else 1 for c in sol])
     gc3_mean = np.mean([0 if c[2] in 'GC' else 1 for c in sol])
 
-    def z_for(loc, tagged, value):
-        arr = np.asarray(tagged[loc], dtype=float)
-        return _ref_zscore(value, arr.mean(), arr.std())
+    def z_for(loc, field_name, tagged, value):
+        # field_name/loc key matches change_vector._gc_term's z_for() cache
+        # key exactly, so this is a cache hit against the fit
+        # calculate_change_vector() already populated moments earlier in
+        # each test below, not an independent (and much slower, called 12x
+        # per test here) refit -- see the module-level comment above.
+        return cached_normal_transform(gc, (field_name, loc), tagged[loc]).transform(value)
 
     z_by_bucket = {}
     for bucket in ('ExonL50', 'Exon', 'ExonR50', 'Splice'):
         z_by_bucket[bucket] = {
-            1: z_for(bucket, gc.taggedGC1, gc1_mean),
-            2: z_for(bucket, gc.taggedGC2, gc2_mean),
-            3: z_for(bucket, gc.taggedGC3, gc3_mean),
+            1: z_for(bucket, 'taggedGC1', gc.taggedGC1, gc1_mean),
+            2: z_for(bucket, 'taggedGC2', gc.taggedGC2, gc2_mean),
+            3: z_for(bucket, 'taggedGC3', gc.taggedGC3, gc3_mean),
         }
 
     def variable_flags(pos):
@@ -152,9 +166,12 @@ def _ref_gc_term(sol, gc, locvec, winsize=15):
         window = continuous[i:i + span]
         loc_window = location_string[i:i + span]
         majority_loc = max(set(loc_window), key=loc_window.count)
-        baseline = np.asarray(gc.windows[TAG_TO_WINDOW_BUCKET[majority_loc]], dtype=float)
+        bucket_name = TAG_TO_WINDOW_BUCKET[majority_loc]
+        # ('windows', bucket_name) matches change_vector._gc_term's cache
+        # key exactly -- cache hit, not a refit (see z_for()'s comment above).
+        window_transform = cached_normal_transform(gc, ('windows', bucket_name), gc.windows[bucket_name])
         window_gc = sum(1 for ch in window if ch in 'GC') / len(window)
-        win_z.append(_ref_zscore(window_gc, baseline.mean(), baseline.std()) ** 2)
+        win_z.append(window_transform.transform(window_gc) ** 2)
     win_z_by_pos = _ref_windowed_average(win_z, len(continuous), winsize)
     per_codon = [np.mean(win_z_by_pos[i:i + 3]) if win_z_by_pos[i:i + 3] else 0.0 for i in range(0, len(win_z_by_pos), 3)]
     per_codon = per_codon[:len(sol)] + [0.0] * max(len(sol) - len(per_codon), 0)
