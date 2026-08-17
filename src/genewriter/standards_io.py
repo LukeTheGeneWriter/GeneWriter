@@ -21,7 +21,11 @@ import os
 from .classes import CodonAnalysis, CodonPairBiasAnalysis, GCAnalysis, KmerAnalysis, RareCodonAnalysis
 from .change_vector import AnalysisObjects
 
-_FILES = {
+# Also the single source of truth for each baseline's output filename --
+# baseline_<name>.py modules (see baseline_pipeline.py) import this directly
+# (STANDARD_FILES['rare_codon'][0]) rather than hardcoding a second copy of
+# these names that could drift from what load_standards() actually expects.
+STANDARD_FILES = {
     'rare_codon': ('RareCodonAnalysis.json', RareCodonAnalysis),
     'codon_usage': ('CodonUsageAnalysis.json', CodonAnalysis),
     'codon_pair_bias': ('CodonPairBiasAnalysis.json', CodonPairBiasAnalysis),
@@ -44,7 +48,7 @@ def _load_one(standards_dir: str, filename: str, cls):
 
 
 def load_standards(standards_dir: str) -> AnalysisObjects:
-    kwargs = {key: _load_one(standards_dir, filename, cls) for key, (filename, cls) in _FILES.items()}
+    kwargs = {key: _load_one(standards_dir, filename, cls) for key, (filename, cls) in STANDARD_FILES.items()}
 
     kwargs['rare_codon'].rare_codon_windows = {
         int(k): v for k, v in kwargs['rare_codon'].rare_codon_windows.items()

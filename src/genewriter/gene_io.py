@@ -47,6 +47,29 @@ def load_genes(directory: str) -> list:
     return [load_gene(p) for p in paths]
 
 
+def chunk_paths(directory: str, chunk_size: int = 750) -> list:
+    """The same sorted glob() load_genes() uses, partitioned into fixed-size
+    chunks of paths -- no gene JSON is touched here, just path partitioning,
+    so a caller (baseline_pipeline.run_pipeline) can decide per chunk_index
+    whether a chunk needs loading at all (e.g. every test already has a shard
+    for it) before reading a single gene file."""
+    paths = sorted(glob.glob(os.path.join(directory, '*.json')))
+    return [paths[i:i + chunk_size] for i in range(0, len(paths), chunk_size)]
+
+
+def load_gene_chunk(paths: list) -> list:
+    """load_gene() for every path in one chunk (one chunk_paths() entry)."""
+    return [load_gene(p) for p in paths]
+
+
+def iter_gene_chunks(directory: str, chunk_size: int = 750):
+    """chunk_paths() + load_gene_chunk() fused: yields (chunk_index, genes)
+    pairs, one chunk resident in memory at a time -- unlike load_genes(),
+    never the whole corpus at once."""
+    for i, paths in enumerate(chunk_paths(directory, chunk_size)):
+        yield i, load_gene_chunk(paths)
+
+
 def protein_coding_isoforms(genes: list):
     """Yield (gene, isoform) for isoforms with a non-empty codon stream,
     skipping computationally-predicted-only transcripts the way every

@@ -298,7 +298,7 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     num_windows = max(len(location_string) - span, 0)
 
     if num_windows > 0:
-        majority_bucket = _majority_window_bucket(location_string, span, num_windows)
+        majority_bucket = majority_window_bucket(location_string, span, num_windows)
 
         window_gc = _sliding_window_view(xp, nt_gc_flat, span, axis=1)[:, :num_windows].mean(axis=2)  # (P, num_windows)
 
@@ -325,12 +325,14 @@ def _np_sliding_sum(bool_arr_1d, span):
     return sliding_window_view(bool_arr_1d.astype(np.int64), span).sum(axis=1)
 
 
-def _majority_window_bucket(location_string: str, span: int, num_windows: int):
+def majority_window_bucket(location_string: str, span: int, num_windows: int):
     """Majority location-bucket per window (3-way argmax over per-bucket
-    windowed counts) -- shared by batch_gc_term() and batch_kmer_term(),
-    both of which need "which of ExonL50/Exon/ExonR50 does this window
-    mostly fall in" for the same location_string/span shape. Always plain
-    numpy regardless of the caller's xp: this depends only on locvec (one
+    windowed counts) -- shared by batch_gc_term() and batch_kmer_term()
+    (and, outside this module, gpu_kmer_count.py's baseline-side k-mer
+    counting, which needs the identical "which of ExonL50/Exon/ExonR50 does
+    this window mostly fall in" logic for the same location_string/span
+    shape -- not underscore-prefixed for that reason). Always plain numpy
+    regardless of the caller's xp: this depends only on locvec (one
     string, shared by the whole batch), not on population size, so there's
     no batch dimension to move to the GPU here -- computed once per call
     and reused across every individual via the callers' own indexing.
@@ -422,7 +424,7 @@ def batch_kmer_term(xp, codon_idx, kmer, locvec: list, winsize: int = 15):
         powers = xp.asarray(np.asarray([4 ** (k - 1 - j) for j in range(k)], dtype=np.int64))
         codes = (windows * powers).sum(axis=2)  # (P, num_wins), each in [0, 4**k)
 
-        majority_bucket = _majority_window_bucket(location_string, k, num_wins)  # (num_wins,) shared
+        majority_bucket = majority_window_bucket(location_string, k, num_wins)  # (num_wins,) shared
         bucket_rows = xp.asarray(majority_bucket)
 
         # Cached per (kmer, k) -- see this function's docstring for the

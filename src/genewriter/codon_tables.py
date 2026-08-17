@@ -175,6 +175,25 @@ GC_FLAGS_BY_INDEX = [tuple(1 if base in 'GC' else 0 for base in codon) for codon
 NT_TO_BASE4 = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 NT_BASE4_BY_CODON_INDEX = [[NT_TO_BASE4[base] for base in codon] for codon in CODON_LIST]
 
+# Inverse of NT_TO_BASE4 -- needed by gpu_kmer_count.py / baseline_kmer.py to
+# turn an observed base-4-encoded k-mer window back into the A/C/G/T string
+# KmerAnalysis.kmer_dict is keyed by, once at finalize() time (the counting
+# side works entirely in integer-code space until then, for the same reason
+# gpu_change_vector.batch_kmer_term() does -- see that module's docstring).
+BASE4_TO_NT = {v: k for k, v in NT_TO_BASE4.items()}
+
+
+def decode_base4_string(code: int, k: int) -> str:
+    """A base-4-encoded k-mer window (an int in [0, 4**k), most-significant
+    digit first -- the same place-value convention
+    gpu_change_vector.batch_kmer_term()'s `codes = (windows * powers).sum(...)`
+    and _encode_kmer_string() both use) back to its k-length A/C/G/T string."""
+    chars = []
+    for _ in range(k):
+        code, digit = divmod(code, 4)
+        chars.append(BASE4_TO_NT[digit])
+    return ''.join(reversed(chars))
+
 
 def encode_codons(codons) -> list:
     """Map an iterable of codon strings to their integer indices (see
