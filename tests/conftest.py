@@ -68,6 +68,22 @@ def make_synthetic_gene(gene_id: int, isoforms: list, gene_name: str = "SYN") ->
     )
 
 
+def make_synthetic_genes(n: int, aa_seq: str = AA_SEQ) -> list:
+    """n synthetic NaturalGenes, each one isoform whose codons are a seeded,
+    per-gene-varied synonymous choice (random_solution) with location tags
+    spanning F(5')/I(interior)/T(3') so every bucket is exercised -- for the
+    baseline_<test>.py chunk-then-finalize-equals-monolithic tests, which
+    need real per-gene/per-window variation to be a meaningful check (unlike
+    test_baseline.py's small hand-picked single-value fixtures)."""
+    genes = []
+    for i in range(n):
+        codons = random_solution(aa_seq, seed=i)
+        loc_tags = (['F'] * 5) + (['I'] * (len(aa_seq) - 10)) + (['T'] * 5)
+        iso = make_synthetic_isoform(aa_seq, lambda aa, j, c=codons: c[j], loc_tags)
+        genes.append(make_synthetic_gene(i, [iso]))
+    return genes
+
+
 @pytest.fixture
 def aa_seq():
     return AA_SEQ
