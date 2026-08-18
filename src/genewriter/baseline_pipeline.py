@@ -120,6 +120,24 @@ def run_pipeline(gene_dir: str, standards_dir: str, chunk_size: int = 750, organ
         )
     ctx = mp.get_context('fork')
 
+    chunks = chunk_paths(gene_dir, chunk_size)
+    if not chunks:
+        # Real bug hit live: chunk_paths() just glob()s gene_dir for *.json
+        # -- if gene_dir is wrong (a stale relative path after a cwd change,
+        # a typo, genes landed somewhere else, etc.), this loop below simply
+        # never executes, and an empty `problems` dict looks IDENTICAL to a
+        # genuinely clean run of a real corpus -- "All chunks completed with
+        # no failures" printed with zero chunks ever having been touched.
+        # That silent false-positive is worse than a loud failure here, so
+        # a gene_dir with no matching gene JSONs at all is treated as a hard
+        # configuration error, not a vacuous success.
+        raise RuntimeError(
+            f"No gene JSON files found in {gene_dir!r} (glob '*.json') -- nothing to run. "
+            f"Check that gene_dir is correct and that the current working directory "
+            f"({os.getcwd()!r}) is what you expect (e.g. after a Drive mount/%cd), "
+            f"rather than silently doing nothing."
+        )
+
     tests = tests if tests is not None else default_test_specs(standards_dir)
     for spec in tests:
         os.makedirs(spec.shard_dir, exist_ok=True)
@@ -127,7 +145,7 @@ def run_pipeline(gene_dir: str, standards_dir: str, chunk_size: int = 750, organ
     wave2 = [t for t in tests if t.wave == 2]
 
     problems = {}
-    for chunk_index, paths in enumerate(chunk_paths(gene_dir, chunk_size)):
+    for chunk_index, paths in enumerate(chunks):
         if resume and all(os.path.exists(_shard_path(t, chunk_index)) for t in tests):
             continue  # every test already has this chunk done -- skip the disk read entirely
 

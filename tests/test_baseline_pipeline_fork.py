@@ -85,6 +85,31 @@ def test_run_pipeline_resumes_without_rereading_completed_chunks(tmp_path):
     assert os.path.getmtime(shard_path) == mtime_before  # not rewritten -- the chunk was skipped entirely
 
 
+def test_run_pipeline_raises_loudly_on_empty_gene_dir(tmp_path):
+    # Real bug hit live: an empty/wrong gene_dir made chunk_paths() return
+    # [], so run_pipeline()'s main loop silently never executed and
+    # returned problems == {} -- indistinguishable from a genuinely clean
+    # run of a real corpus ("All chunks completed with no failures", having
+    # touched zero genes). This must raise instead of returning a vacuous
+    # success.
+    gene_dir = str(tmp_path / 'empty_genes')
+    os.makedirs(gene_dir, exist_ok=True)
+    standards_dir = str(tmp_path / 'Standards')
+    specs = default_test_specs(standards_dir, k_values=(2,), use_gpu_for_kmer=False)
+
+    with pytest.raises(RuntimeError, match="No gene JSON files found"):
+        run_pipeline(gene_dir, standards_dir, chunk_size=3, tests=specs)
+
+
+def test_run_pipeline_raises_loudly_on_nonexistent_gene_dir(tmp_path):
+    gene_dir = str(tmp_path / 'does_not_exist')
+    standards_dir = str(tmp_path / 'Standards')
+    specs = default_test_specs(standards_dir, k_values=(2,), use_gpu_for_kmer=False)
+
+    with pytest.raises(RuntimeError, match="No gene JSON files found"):
+        run_pipeline(gene_dir, standards_dir, chunk_size=3, tests=specs)
+
+
 def test_run_pipeline_one_test_failure_does_not_stop_the_others(tmp_path):
     gene_dir = str(tmp_path / 'genes')
     standards_dir = str(tmp_path / 'Standards')
