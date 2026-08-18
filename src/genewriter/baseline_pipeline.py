@@ -54,6 +54,7 @@ import dataclasses
 import json
 import multiprocessing as mp
 import os
+import time
 
 from . import baseline_codon_pair_bias, baseline_codon_usage, baseline_gc, baseline_kmer, baseline_rare_codon
 from .gene_io import chunk_paths, load_gene_chunk
@@ -114,36 +115,52 @@ def _shard_worker(module, genes: list, shard_path: str, organism: str, kwargs: d
     module.compute_and_write_shard(genes, shard_path, organism=organism, **kwargs)
 
 
-def _run_wave(ctx, specs: list, genes: list, chunk_index: int, organism: str) -> list:
+def _run_wave(ctx, specs: list, genes: list, chunk_index: int, organism: str, verbose: bool = True) -> list:
     procs = []
     for spec in specs:
         shard_path = _shard_path(spec, chunk_index)
         if os.path.exists(shard_path):
+            if verbose:
+                print(f"[run_pipeline]   chunk {chunk_index}: {spec.name} (wave 1) already has a shard -- skipping.", flush=True)
             continue  # this test already has this chunk's shard -- resumable
+        if verbose:
+            print(f"[run_pipeline]   chunk {chunk_index}: {spec.name} (wave 1) starting...", flush=True)
         p = ctx.Process(target=_shard_worker, args=(spec.module, genes, shard_path, organism, spec.kwargs))
         p.start()
-        procs.append((spec, p))
+        procs.append((spec, p, time.perf_counter()))
 
     failures = []
-    for spec, p in procs:
+    for spec, p, t0 in procs:
         p.join()
         if p.exitcode != 0:
             failures.append(spec.name)
+        if verbose:
+            status = 'FAILED' if p.exitcode != 0 else 'done'
+            print(f"[run_pipeline]   chunk {chunk_index}: {spec.name} (wave 1) {status} in {time.perf_counter() - t0:.1f}s.", flush=True)
     return failures
 
 
-def _sequential_group_worker(specs: list, genes: list, chunk_index: int, organism: str, result_queue) -> None:
+def _sequential_group_worker(specs: list, genes: list, chunk_index: int, organism: str, result_queue, verbose: bool = True) -> None:
     failures = []
     for spec in specs:
         shard_path = _shard_path(spec, chunk_index)
         if os.path.exists(shard_path):
+            if verbose:
+                print(f"[run_pipeline]   chunk {chunk_index}: {spec.name} already has a shard -- skipping.", flush=True)
             continue  # this test already has this chunk's shard -- resumable
+        if verbose:
+            print(f"[run_pipeline]   chunk {chunk_index}: {spec.name} starting...", flush=True)
+        t0 = time.perf_counter()
         try:
             spec.module.compute_and_write_shard(genes, shard_path, organism=organism, **spec.kwargs)
+            if verbose:
+                print(f"[run_pipeline]   chunk {chunk_index}: {spec.name} done in {time.perf_counter() - t0:.1f}s.", flush=True)
         except Exception:
             import traceback
             traceback.print_exc()
             failures.append(spec.name)
+            if verbose:
+                print(f"[run_pipeline]   chunk {chunk_index}: {spec.name} FAILED after {time.perf_counter() - t0:.1f}s (see traceback above).", flush=True)
         try:
             # cupy's memory pool doesn't return freed blocks to the driver
             # by default -- without this, gpu_corpus_batch.vram_aware_batch_size()'s
@@ -171,7 +188,7 @@ def _sequential_group_worker(specs: list, genes: list, chunk_index: int, organis
     result_queue.put(failures)
 
 
-def _run_sequential_group(ctx, specs: list, genes: list, chunk_index: int, organism: str) -> list:
+def _run_sequential_group(ctx, specs: list, genes: list, chunk_index: int, organism: str, verbose: bool = True) -> list:
     """Forks ONE process for the whole `specs` group, running each spec's
     compute_and_write_shard() in turn inside it, instead of one process per
     spec (_run_wave()'s shape) -- see this module's own docstring for why
@@ -186,7 +203,7 @@ def _run_sequential_group(ctx, specs: list, genes: list, chunk_index: int, organ
     if not specs:
         return []
     result_queue = ctx.Queue()
-    p = ctx.Process(target=_sequential_group_worker, args=(specs, genes, chunk_index, organism, result_queue))
+    p = ctx.Process(target=_sequential_group_worker, args=(specs, genes, chunk_index, organism, result_queue, verbose))
     p.start()
     # queue.put()-then-join() is only a deadlock risk for payloads large
     # enough to fill the OS pipe buffer (typically 64KB+) -- `failures` is
@@ -211,13 +228,26 @@ def _run_sequential_group(ctx, specs: list, genes: list, chunk_index: int, organ
 
 
 def run_pipeline(gene_dir: str, standards_dir: str, chunk_size: int = 750, organism: str = "human",
-                  tests: list = None, resume: bool = True) -> dict:
+                  tests: list = None, resume: bool = True, verbose: bool = True) -> dict:
     """Runs every registered test over every chunk of genes under gene_dir.
     Returns {chunk_index: {'wave1_failures': [...], 'wave2_failures': [...]}}
     for any chunk where at least one test failed -- a single test's crash on
     a single chunk does not stop the run or affect any other test/chunk.
     Does not call finalize_all() -- that's a separate step, run once after
-    every chunk you care about has succeeded (see finalize_all())."""
+    every chunk you care about has succeeded (see finalize_all()).
+
+    verbose: default True -- prints per-chunk-load and per-spec-dispatch
+    progress (with timing), flushed immediately so it shows up in real time
+    in a Colab cell (default Python stdout buffering can otherwise delay
+    output for a non-interactive process). Real bug hit live: this whole
+    function used to print nothing at all, anywhere, for the entire run --
+    a chunk's gene-loading step alone can take 20+ minutes against
+    Drive-mounted storage (this pipeline never sped that up, only the
+    compute steps after it), and with zero output there was no way to tell
+    "working normally, just I/O-bound" from "hung" from "silently GPU-
+    falling-back" without interrupting and guessing. Set False to match the
+    old silent behavior (e.g. if a caller wants to do its own logging, or
+    for quieter test output)."""
     if 'fork' not in mp.get_all_start_methods():
         raise RuntimeError(
             "baseline_pipeline.run_pipeline() requires the 'fork' multiprocessing start "
@@ -252,14 +282,30 @@ def run_pipeline(gene_dir: str, standards_dir: str, chunk_size: int = 750, organ
     wave1 = [t for t in tests if t.wave == 1]
     wave2 = [t for t in tests if t.wave == 2]
 
+    if verbose:
+        print(f"[run_pipeline] {len(chunks)} chunk(s) found in {gene_dir!r}.", flush=True)
+
     problems = {}
     for chunk_index, paths in enumerate(chunks):
         if resume and all(os.path.exists(_shard_path(t, chunk_index)) for t in tests):
+            if verbose:
+                print(f"[run_pipeline] chunk {chunk_index + 1}/{len(chunks)}: already complete -- skipping.", flush=True)
             continue  # every test already has this chunk done -- skip the disk read entirely
 
+        if verbose:
+            print(f"[run_pipeline] chunk {chunk_index + 1}/{len(chunks)}: loading {len(paths)} gene JSON(s)"
+                  f"{' from Drive-mounted storage (can be slow -- ~1-2s/gene is normal)' if chunk_index == 0 else ''}...",
+                  flush=True)
+        t_load = time.perf_counter()
         genes = load_gene_chunk(paths)
-        wave1_failures = _run_wave(ctx, wave1, genes, chunk_index, organism)
-        wave2_failures = _run_sequential_group(ctx, wave2, genes, chunk_index, organism)  # strictly after wave 1
+        if verbose:
+            print(f"[run_pipeline] chunk {chunk_index + 1}/{len(chunks)}: loaded in {time.perf_counter() - t_load:.1f}s -- running tests...", flush=True)
+
+        t_chunk = time.perf_counter()
+        wave1_failures = _run_wave(ctx, wave1, genes, chunk_index, organism, verbose=verbose)
+        wave2_failures = _run_sequential_group(ctx, wave2, genes, chunk_index, organism, verbose=verbose)  # strictly after wave 1
+        if verbose:
+            print(f"[run_pipeline] chunk {chunk_index + 1}/{len(chunks)}: all tests done in {time.perf_counter() - t_chunk:.1f}s.", flush=True)
         if wave1_failures or wave2_failures:
             problems[chunk_index] = {'wave1_failures': wave1_failures, 'wave2_failures': wave2_failures}
         del genes
