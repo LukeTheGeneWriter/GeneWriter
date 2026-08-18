@@ -3,18 +3,26 @@ plugin design (see baseline_pipeline.py), so this can be edited/tuned
 independently of the other four. compute_and_write_shard()/finalize() are the
 fixed interface baseline_pipeline.TestSpec dispatches through.
 
-The actual statistics logic is untouched, existing code:
-baseline.compute_rare_codon_analysis() already just accumulates over whatever
-`genes` list it's given, so it works correctly as-is whether called on the
-whole corpus (as tests/test_baseline.py does) or on one chunk (as this module
-does) -- this file only adds the shard-write/shard-merge plumbing around it.
+compute_and_write_shard() calls gpu_rare_codon_count.count_rare_codons_for_chunk()
+(xp-injected, numpy or cupy -- see gpu_corpus_batch.select_backend()) as of
+2026-08-19, not baseline.compute_rare_codon_analysis() directly -- verified
+to produce byte-for-byte identical output on the same genes
+(tests/test_baseline_rare_codon.py's test_chunked_finalize_matches_monolithic).
+baseline.compute_rare_codon_analysis() itself is untouched, still used by
+tests/test_baseline.py/local dev/baseline.compute_baselines(), and as that
+correctness-oracle ground truth -- not called from this pipeline anymore.
+
+FORK-SAFETY: cupy import lives inside gpu_corpus_batch.select_backend(),
+called only from inside the forked wave-2 child -- see baseline_pipeline.py's
+own docstring for why this matters.
 """
 
 import dataclasses
 
-from .baseline import compute_rare_codon_analysis
 from .baseline_shard_util import atomic_write_json, concat_lists, load_json_shards, sum_pairwise_by_key, sum_scalar_by_key
 from .classes import RareCodonAnalysis
+from .gpu_corpus_batch import select_backend
+from .gpu_rare_codon_count import count_rare_codons_for_chunk
 from .standards_io import STANDARD_FILES
 
 NAME = 'rare_codon'
@@ -22,8 +30,10 @@ FILENAME = STANDARD_FILES[NAME][0]
 SHARD_EXT = '.json'
 
 
-def compute_and_write_shard(genes: list, shard_path: str, organism: str = "human", winsize: int = 15) -> None:
-    analysis = compute_rare_codon_analysis(genes, organism, winsize)
+def compute_and_write_shard(genes: list, shard_path: str, organism: str = "human", winsize: int = 15,
+                             use_gpu: bool = True, vram_fraction: float = 0.5) -> None:
+    xp = select_backend(use_gpu, NAME)
+    analysis = count_rare_codons_for_chunk(xp, genes, organism, winsize, vram_fraction=vram_fraction)
     atomic_write_json(shard_path, dataclasses.asdict(analysis))
 
 

@@ -127,3 +127,66 @@ def test_run_pipeline_one_test_failure_does_not_stop_the_others(tmp_path):
             continue
         shard_path = os.path.join(spec.shard_dir, f'chunk_0000{spec.module.SHARD_EXT}')
         assert os.path.exists(shard_path)
+
+
+def _make_pid_recording_module(record_path: str):
+    """A fake test module that appends its own os.getpid() to record_path
+    each time it's called -- used to confirm every spec in a wave-2 group
+    really does run inside the SAME forked child, not one process each."""
+    class _Recorder:
+        SHARD_EXT = '.json'
+
+        @staticmethod
+        def compute_and_write_shard(genes, shard_path, organism="human", **kwargs):
+            with open(record_path, 'a') as f:
+                f.write(f'{os.getpid()}\n')
+            with open(shard_path, 'w') as f:
+                json.dump({}, f)
+    return _Recorder
+
+
+def test_run_sequential_group_uses_exactly_one_forked_process_for_the_whole_group(tmp_path):
+    gene_dir = str(tmp_path / 'genes')
+    standards_dir = str(tmp_path / 'Standards')
+    _write_gene_files(gene_dir, 3)
+    record_path = str(tmp_path / 'pids.txt')
+
+    spec_a = PipelineTestSpec('rec_a', _make_pid_recording_module(record_path),
+                               os.path.join(standards_dir, '_partial', 'rec_a'), wave=2)
+    spec_b = PipelineTestSpec('rec_b', _make_pid_recording_module(record_path),
+                               os.path.join(standards_dir, '_partial', 'rec_b'), wave=2)
+
+    parent_pid = os.getpid()
+    problems = run_pipeline(gene_dir, standards_dir, chunk_size=3, tests=[spec_a, spec_b])
+
+    assert problems == {}
+    with open(record_path) as f:
+        pids = [line.strip() for line in f if line.strip()]
+    assert len(pids) == 2
+    assert pids[0] == pids[1]  # both specs ran inside the SAME forked child
+    assert pids[0] != str(parent_pid)  # genuinely forked, not run in the parent
+
+
+def test_run_sequential_group_resume_skips_completed_specs_within_the_group(tmp_path):
+    gene_dir = str(tmp_path / 'genes')
+    standards_dir = str(tmp_path / 'Standards')
+    _write_gene_files(gene_dir, 3)
+    specs = default_test_specs(standards_dir, k_values=(2,), use_gpu_for_kmer=False, use_gpu_for_baselines=False)
+
+    run_pipeline(gene_dir, standards_dir, chunk_size=3, tests=specs)
+    kept_shard_path = os.path.join(specs[0].shard_dir, f'chunk_0000{specs[0].module.SHARD_EXT}')
+    mtime_before = os.path.getmtime(kept_shard_path)
+
+    # Delete a DIFFERENT spec's shard -- forces the chunk to be reprocessed
+    # (run_pipeline's own chunk-level resume check requires every spec to
+    # already have a shard), but within that reprocessed chunk, the
+    # sequential group's own per-spec resume check should still skip
+    # specs[0] specifically, since ITS shard is still on disk.
+    rebuilt_shard_path = os.path.join(specs[1].shard_dir, f'chunk_0000{specs[1].module.SHARD_EXT}')
+    os.remove(rebuilt_shard_path)
+
+    problems = run_pipeline(gene_dir, standards_dir, chunk_size=3, tests=specs, resume=True)
+
+    assert problems == {}
+    assert os.path.getmtime(kept_shard_path) == mtime_before  # not rewritten
+    assert os.path.exists(rebuilt_shard_path)  # rebuilt

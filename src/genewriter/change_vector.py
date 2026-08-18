@@ -467,11 +467,25 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
 
         # Majority location-bucket per window, vectorized as a 3-way argmax
         # over per-bucket windowed counts, instead of Python's
-        # max(set(loc_window), key=loc_window.count) once per window. Note:
-        # that original tie-break was already unspecified (set iteration
-        # order depends on Python's string hashing), so argmax's
-        # first-max-wins tie-break isn't a behavior change so much as
-        # replacing one unspecified tie-break with a deterministic one.
+        # max(set(loc_window), key=loc_window.count) once per window.
+        #
+        # CORRECTION, 2026-08-19 (this comment previously claimed the
+        # rewrite below was tie-break-only -- it is NOT, confirmed with a
+        # concrete non-tie counter-example, see
+        # memory/majority_vote_bucket_discrepancy.md): folding every
+        # nucleotide's raw tag (F/T/I/S) through TAG_TO_WINDOW_BUCKET FIRST
+        # (as bucket_of_nt does, next line) merges S and I into the same
+        # 'Exon' vote-bin BEFORE counting, then votes among the 3
+        # already-folded buckets. baseline.py's original
+        # `max(set(loc_window), key=loc_window.count)` votes among the 4
+        # RAW tags first, then folds only the winner -- a genuinely
+        # different algorithm, not just a different tie-break rule. They
+        # disagree whenever a window mixes S and I against an F/T
+        # plurality, in real (non-tie) cases, not only in ties. This
+        # function (scoring a GA candidate) intentionally still uses the
+        # fold-first convention -- unifying it with baseline.py's
+        # counting-side convention is a deliberate, not-yet-made decision,
+        # see that memory file for why it isn't simply "fixed" here.
         bucket_index = {name: i for i, name in enumerate(_WINDOW_BUCKET_NAMES)}
         bucket_of_nt = np.fromiter(
             (bucket_index[TAG_TO_WINDOW_BUCKET[loc]] for loc in location_string),
@@ -527,6 +541,11 @@ def _kmer_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, win
         # hashing that string is the real cost, not something a numpy
         # windowed reduction helps with (unlike the numeric GC/location
         # reductions this shares its majority-vote logic with).
+        #
+        # Fold-then-vote convention, NOT baseline.compute_kmer_analysis's
+        # raw-tag-vote-then-fold -- same divergence as _gc_term's identical
+        # block above, see that function's own (corrected 2026-08-19)
+        # comment and memory/majority_vote_bucket_discrepancy.md.
         if num_wins > 0:
             bucket_index = {name: i for i, name in enumerate(_WINDOW_BUCKET_NAMES)}
             bucket_of_nt = np.fromiter(

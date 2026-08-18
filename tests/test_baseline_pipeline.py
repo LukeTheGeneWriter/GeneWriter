@@ -32,10 +32,13 @@ def test_default_test_specs_shape(tmp_path):
     names = {s.name for s in specs}
     assert names == {'rare_codon', 'codon_usage', 'codon_pair_bias', 'gc', 'kmer'}
 
+    # All 5 tests share wave 2 (the sequential GPU group) as of 2026-08-19 --
+    # every test is now GPU-capable, so they all run sequentially in one
+    # shared process instead of wave 1's concurrent-processes shape (see
+    # baseline_pipeline.py's own docstring for why).
     waves = {s.name: s.wave for s in specs}
-    assert waves['kmer'] == 2
-    for name in ('rare_codon', 'codon_usage', 'codon_pair_bias', 'gc'):
-        assert waves[name] == 1
+    for name in ('rare_codon', 'codon_usage', 'codon_pair_bias', 'gc', 'kmer'):
+        assert waves[name] == 2
 
     for s in specs:
         assert s.shard_dir == os.path.join(str(tmp_path), '_partial', s.name)

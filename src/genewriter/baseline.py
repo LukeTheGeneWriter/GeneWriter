@@ -93,7 +93,14 @@ def compute_codon_usage_analysis(genes: list, organism: str = "human", winsize: 
                 codon_freqs_by_location[cod][bucket] += 1
 
         just_codons = [cod for cod, _loc in codons]
-        for i in range(0, max(len(just_codons) - winsize, 0)):
+        # Full window count (len - winsize + 1), matching
+        # compute_rare_codon_analysis's own loop above -- never drop the
+        # mathematically valid last window. Used to stop one window short
+        # (`max(len - winsize, 0)`) until 2026-08-19, an inherited,
+        # unintended asymmetry with rare_codon's own convention that had no
+        # deliberate reason behind it -- fixed here, and correspondingly in
+        # gpu_codon_usage_count.py's counting-side equivalent.
+        for i in range(0, len(just_codons) - winsize + 1):
             window = just_codons[i:i + winsize]
             window_score = sum(CODON_FREQS_LIT[c] for c in window) / winsize
             window_scores.append(window_score)
@@ -127,7 +134,9 @@ def compute_codon_pair_bias_analysis(genes: list, organism: str = "human", winsi
         total_pairs += len(pairs)
         per_gene.append(sum(cpb_lit[p] for p in pairs) / len(pairs))
 
-        for i in range(0, max(len(just_codons) - winsize, 0)):
+        # Full window count -- see compute_codon_usage_analysis's matching
+        # comment above; same fix, same reasoning.
+        for i in range(0, len(just_codons) - winsize + 1):
             window = just_codons[i:i + winsize]
             window_pairs = [window[j] + window[j + 1] for j in range(len(window) - 1)]
             if window_pairs:
@@ -169,9 +178,22 @@ def compute_gc_analysis(genes: list, organism: str = "human", winsize: int = 21)
 
         continuous = ''.join(cod for cod, _loc in iso.codons)
         loc_string = ''.join(loc * 3 for _cod, loc in iso.codons)
-        for i in range(0, max(len(continuous) - winsize, 0)):
+        # Full window count -- see compute_codon_usage_analysis's matching
+        # comment above; same fix, same reasoning.
+        for i in range(0, len(continuous) - winsize + 1):
             window = continuous[i:i + winsize]
             loc_window = loc_string[i:i + winsize]
+            # Raw-tag-vote-then-fold: vote among the 4 raw tags (F/T/I/S)
+            # first, fold only the winner through TAG_TO_WINDOW_BUCKET after.
+            # NOT equivalent to gpu_change_vector.majority_window_bucket()'s
+            # fold-then-vote (folds every nt's tag first, so S and I merge
+            # into the same 'Exon' vote-bin before counting) -- the two
+            # disagree whenever a window mixes S and I against an F/T
+            # plurality. This function's raw-tag-vote-then-fold convention is
+            # what gpu_corpus_batch.majority_raw_tag_bucket() reproduces for
+            # the GPU-batched counting path; do not swap this loop's logic
+            # for majority_window_bucket()'s without reading
+            # memory/majority_vote_bucket_discrepancy.md first.
             majority = max(set(loc_window), key=loc_window.count)
             bucket = TAG_TO_WINDOW_BUCKET[majority]
             windows[bucket].append(sum(1 for ch in window if ch in 'GC') / winsize)
@@ -201,9 +223,20 @@ def compute_kmer_analysis(genes: list, organism: str = "human", k_values=(2, 3))
         for _gene, iso in protein_coding_isoforms(genes):
             continuous = ''.join(cod for cod, _loc in iso.codons)
             loc_string = ''.join(loc * 3 for _cod, loc in iso.codons)
+            # Window count deliberately NOT changed to the "full" convention
+            # compute_codon_usage_analysis/compute_codon_pair_bias_analysis/
+            # compute_gc_analysis got 2026-08-19 -- kmer's own "one short"
+            # convention is left as-is, a separate, not-yet-decided
+            # follow-up (see memory/majority_vote_bucket_discrepancy.md).
             for i in range(0, max(len(continuous) - k, 0)):
                 window = continuous[i:i + k]
                 loc_window = loc_string[i:i + k]
+                # Raw-tag-vote-then-fold -- same convention as
+                # compute_gc_analysis's identical line above, NOT equivalent
+                # to gpu_change_vector.majority_window_bucket()'s
+                # fold-then-vote (which gpu_kmer_count.py's counting side
+                # already uses, disagreeing with this function -- see
+                # memory/majority_vote_bucket_discrepancy.md).
                 majority = max(set(loc_window), key=loc_window.count)
                 bucket = TAG_TO_WINDOW_BUCKET[majority]
                 loc_totals[bucket] += 1

@@ -298,6 +298,9 @@ def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):
     num_windows = max(len(location_string) - span, 0)
 
     if num_windows > 0:
+        # Fold-then-vote convention -- NOT baseline.compute_gc_analysis's
+        # raw-tag-vote-then-fold. See majority_window_bucket()'s own
+        # docstring and memory/majority_vote_bucket_discrepancy.md.
         majority_bucket = majority_window_bucket(location_string, span, num_windows)
 
         window_gc = _sliding_window_view(xp, nt_gc_flat, span, axis=1)[:, :num_windows].mean(axis=2)  # (P, num_windows)
@@ -328,14 +331,29 @@ def _np_sliding_sum(bool_arr_1d, span):
 def majority_window_bucket(location_string: str, span: int, num_windows: int):
     """Majority location-bucket per window (3-way argmax over per-bucket
     windowed counts) -- shared by batch_gc_term() and batch_kmer_term()
-    (and, outside this module, gpu_kmer_count.py's baseline-side k-mer
-    counting, which needs the identical "which of ExonL50/Exon/ExonR50 does
-    this window mostly fall in" logic for the same location_string/span
-    shape -- not underscore-prefixed for that reason). Always plain numpy
-    regardless of the caller's xp: this depends only on locvec (one
-    string, shared by the whole batch), not on population size, so there's
-    no batch dimension to move to the GPU here -- computed once per call
-    and reused across every individual via the callers' own indexing.
+    (and, outside this module, gpu_kmer_count.py's counting side, which
+    needs the identical "which of ExonL50/Exon/ExonR50 does this window
+    mostly fall in" logic for the same location_string/span shape -- not
+    underscore-prefixed for that reason). Always plain numpy regardless of
+    the caller's xp: this depends only on locvec (one string, shared by the
+    whole batch), not on population size, so there's no batch dimension to
+    move to the GPU here -- computed once per call and reused across every
+    individual via the callers' own indexing.
+
+    FOLD-THEN-VOTE, not baseline.py's raw-tag-vote-then-fold: folds every
+    nucleotide's raw tag (F/T/I/S) through TAG_TO_WINDOW_BUCKET FIRST
+    (merging S and I into the same 'Exon' vote-bin), then votes among the 3
+    already-folded buckets. baseline.compute_gc_analysis()/
+    compute_kmer_analysis() vote among the 4 RAW tags first, then fold only
+    the winner -- a genuinely different algorithm (not just a different
+    tie-break), confirmed to disagree in real, non-tie cases whenever a
+    window mixes S and I against an F/T plurality. gpu_kmer_count.py's
+    counting side already calls this function and so already disagrees with
+    its own stated baseline.compute_kmer_analysis oracle for this reason --
+    not fixed, out of scope; gpu_gc_count.py deliberately does NOT call this
+    function for the same reason (uses
+    gpu_corpus_batch.majority_raw_tag_bucket() instead). See
+    memory/majority_vote_bucket_discrepancy.md for the full investigation.
 
     Returns an int array of shape (num_windows,), values indexing
     _WINDOW_BUCKET_NAMES. Assumes num_windows > 0 (callers already guard
@@ -424,6 +442,9 @@ def batch_kmer_term(xp, codon_idx, kmer, locvec: list, winsize: int = 15):
         powers = xp.asarray(np.asarray([4 ** (k - 1 - j) for j in range(k)], dtype=np.int64))
         codes = (windows * powers).sum(axis=2)  # (P, num_wins), each in [0, 4**k)
 
+        # Fold-then-vote convention -- NOT baseline.compute_kmer_analysis's
+        # raw-tag-vote-then-fold. See majority_window_bucket()'s own
+        # docstring and memory/majority_vote_bucket_discrepancy.md.
         majority_bucket = majority_window_bucket(location_string, k, num_wins)  # (num_wins,) shared
         bucket_rows = xp.asarray(majority_bucket)
 

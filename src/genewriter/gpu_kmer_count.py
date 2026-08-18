@@ -35,13 +35,25 @@ manufactures a bogus cross-gene k-mer at a join point.
 
 Batch size (in total nucleotides, not isoform count -- isoform length varies
 too much for a fixed isoform-count cap to bound memory usefully) is derived
-from *actually free* GPU memory when running on cupy (_vram_aware_batch_size()
-queries cupy.cuda.Device().mem_info() directly, once per chunk) -- enough to
-batch aggressively for real utilization without risking an OOM on whatever
-GPU tier happens to be attached (T4 vs. an RTX 3050 vs. an A100 all report
-very different free_bytes). Falls back to a large fixed default on the numpy
-backend, where there's no VRAM ceiling to respect but batching is still worth
-it for fewer, bigger Python-level dispatches.
+from *actually free* GPU memory when running on cupy
+(gpu_corpus_batch.vram_aware_batch_size() queries cupy.cuda.Device().mem_info()
+directly, once per chunk) -- enough to batch aggressively for real
+utilization without risking an OOM on whatever GPU tier happens to be
+attached (T4 vs. an RTX 3050 vs. an A100 all report very different
+free_bytes). Falls back to a large fixed default on the numpy backend, where
+there's no VRAM ceiling to respect but batching is still worth it for fewer,
+bigger Python-level dispatches.
+
+concat_isoform_batch()/vram_aware_batch_size() are gpu_corpus_batch.py's
+shared, granularity-agnostic versions (this module was their original
+source, factored out 2026-08-19 when 4 sibling gpu_<name>_count.py modules
+needed the same scaffolding at codon granularity). This module's OWN "stop
+one window short" (`M - k`) window-count convention and its `valid`-mask
+construction are deliberately NOT delegated to gpu_corpus_batch.valid_window_mask()
+-- that function implements the different, "never drop a window" convention
+the other 4 modules use; kmer's own convention is left alone on purpose (a
+separate, not-yet-decided follow-up, see
+memory/majority_vote_bucket_discrepancy.md).
 """
 
 import numpy as np
@@ -49,6 +61,8 @@ import numpy as np
 from .codon_tables import NT_BASE4_BY_CODON_INDEX, encode_codons
 from .gene_io import protein_coding_isoforms
 from .gpu_change_vector import _sliding_window_view, majority_window_bucket
+from .gpu_corpus_batch import concat_isoform_batch as _shared_concat_isoform_batch
+from .gpu_corpus_batch import vram_aware_batch_size as _shared_vram_aware_batch_size
 
 _WINDOW_BUCKET_NAMES = ('ExonL50', 'Exon', 'ExonR50')
 
@@ -79,9 +93,18 @@ def count_kmers_for_isoform(xp, nt_base4, loc_string: str, k: int) -> tuple:
     Window count follows the same `num_wins = max(M - k, 0)` convention as
     baseline.compute_kmer_analysis and gpu_change_vector.batch_kmer_term
     (both deliberately stop one window short of the naive M-k+1 -- a
-    long-standing convention inherited from the original notebook, kept here
-    so this module's counts agree with baseline.py's byte-for-byte, which
-    tests/test_gpu_kmer_count.py cross-checks directly)."""
+    long-standing convention inherited from the original notebook).
+
+    Majority-bucket assignment (majority_window_bucket(), fold-then-vote)
+    does NOT always agree with baseline.compute_kmer_analysis's own
+    raw-tag-vote-then-fold algorithm -- they can disagree in real, non-tie
+    cases whenever a window mixes 'S' and 'I' tags against an 'F'/'T'
+    plurality (see memory/majority_vote_bucket_discrepancy.md). This
+    module's own tests (tests/test_gpu_kmer_count.py) check against
+    hand-counted expectations, not a direct comparison against
+    baseline.compute_kmer_analysis -- there is currently no test asserting
+    byte-for-byte agreement between the two (test_baseline_kmer.py uses
+    pytest.approx specifically because of this)."""
     M = nt_base4.shape[0]
     num_wins = max(M - k, 0)
     counts = {name: xp.zeros(4 ** k, dtype=xp.int64) for name in _WINDOW_BUCKET_NAMES}
@@ -93,7 +116,7 @@ def count_kmers_for_isoform(xp, nt_base4, loc_string: str, k: int) -> tuple:
     powers = xp.asarray(np.asarray([4 ** (k - 1 - j) for j in range(k)], dtype=np.int64))
     codes = (windows * powers).sum(axis=1)  # (num_wins,), each in [0, 4**k)
 
-    majority = majority_window_bucket(loc_string, k, num_wins)  # (num_wins,) always numpy
+    majority = majority_window_bucket(loc_string, k, num_wins)  # (num_wins,) always numpy -- fold-then-vote, see this function's own docstring
     majority = majority if xp is np else xp.asarray(majority)
 
     for b, name in enumerate(_WINDOW_BUCKET_NAMES):
@@ -110,6 +133,7 @@ def count_kmers_for_isoform(xp, nt_base4, loc_string: str, k: int) -> tuple:
 _DEFAULT_CPU_BATCH_NT = 5_000_000  # no VRAM ceiling on numpy; still batch for fewer, bigger dispatches
 _MIN_BATCH_NT = 100_000  # floor so a very tight VRAM estimate never shrinks batches into per-isoform-again territory
 _VRAM_SAFETY_FACTOR = 2  # doubles the raw per-nt estimate below to cover cupy allocator overhead/temporaries this doesn't explicitly account for
+
 
 
 def _estimate_bytes_per_nt(max_k: int) -> int:
@@ -132,45 +156,25 @@ def _estimate_bytes_per_nt(max_k: int) -> int:
 
 def _vram_aware_batch_size(xp, k_values, vram_fraction: float = 0.5) -> int:
     """Max total nucleotides to concatenate into one count_kmers_for_batch()
-    call. On the numpy backend there's no VRAM ceiling to respect, so this
-    just returns a large fixed default. On cupy, queries *actually free*
-    GPU memory (cupy.cuda.Device().mem_info()) once and budgets a fraction
-    of it (vram_fraction -- default 0.5, leaving headroom rather than
-    planning to consume every free byte) -- this is what makes batch sizing
-    adapt automatically to whatever GPU is attached (a T4's free memory
-    looks nothing like an RTX 3050's or an A100's), instead of a fixed
-    isoform-count cap that would either underutilize a big GPU or risk OOM
-    on a small one.
-    """
-    if xp is np:
-        return _DEFAULT_CPU_BATCH_NT
-    free_bytes, _total_bytes = xp.cuda.Device().mem_info  # property, not a method -- no ()
-    budget = int(free_bytes * vram_fraction)
-    bytes_per_nt = _estimate_bytes_per_nt(max(k_values))
-    return max(budget // bytes_per_nt, _MIN_BATCH_NT)
+    call. Thin wrapper over the shared gpu_corpus_batch.vram_aware_batch_size()
+    -- this function's own job is just translating k_values into the
+    k-mer-specific bytes_per_nt estimate (_estimate_bytes_per_nt()); the
+    actual VRAM query / fixed-default / floor logic all lives in the shared
+    function now (see module docstring)."""
+    return _shared_vram_aware_batch_size(
+        xp, _estimate_bytes_per_nt(max(k_values)), vram_fraction=vram_fraction,
+        default_cpu_batch=_DEFAULT_CPU_BATCH_NT, min_batch=_MIN_BATCH_NT,
+    )
 
 
 def _concat_isoform_batch(xp, encoded_isoforms: list) -> tuple:
     """encoded_isoforms: list of (nt_base4, loc_string) pairs, each already
-    produced by encode_isoform_nt_base4(). Returns (flat_nt, flat_loc,
-    starts, lengths):
-      flat_nt: every isoform's nt_base4 concatenated on `xp`, one array.
-      flat_loc: every isoform's loc_string concatenated (plain Python str
-        concat -- cheap, and majority_window_bucket() always runs on plain
-        numpy/Python regardless of xp anyway, see its own docstring).
-      starts/lengths: plain Python lists (one entry per isoform in this
-        batch -- small, never worth moving to the GPU), each isoform's own
-        span within flat_nt/flat_loc. Consumed by count_kmers_for_batch()
-        to build the valid-window mask.
-    """
-    lengths = [int(nt.shape[0]) for nt, _loc in encoded_isoforms]
-    starts = list(np.cumsum([0] + lengths[:-1]))
-    if encoded_isoforms:
-        flat_nt = xp.concatenate([nt for nt, _loc in encoded_isoforms])
-    else:
-        flat_nt = xp.zeros(0, dtype=xp.int64)
-    flat_loc = ''.join(loc for _nt, loc in encoded_isoforms)
-    return flat_nt, flat_loc, starts, lengths
+    produced by encode_isoform_nt_base4(). Thin wrapper over the shared
+    gpu_corpus_batch.concat_isoform_batch() -- see module docstring. Kept as
+    a local name (rather than importing concat_isoform_batch directly at
+    every call site) so tests/test_gpu_kmer_count.py's existing references
+    to this name don't need to change."""
+    return _shared_concat_isoform_batch(xp, encoded_isoforms)
 
 
 def count_kmers_for_batch(xp, flat_nt, flat_loc: str, starts: list, lengths: list, k: int) -> tuple:
@@ -207,7 +211,7 @@ def count_kmers_for_batch(xp, flat_nt, flat_loc: str, starts: list, lengths: lis
     powers = xp.asarray(np.asarray([4 ** (k - 1 - j) for j in range(k)], dtype=np.int64))
     codes = (windows * powers).sum(axis=1)  # (max_start,)
 
-    majority = majority_window_bucket(flat_loc, k, max_start)  # (max_start,) always numpy
+    majority = majority_window_bucket(flat_loc, k, max_start)  # (max_start,) always numpy -- fold-then-vote, see count_kmers_for_isoform's docstring
     valid_arr = valid if xp is np else xp.asarray(valid)
     majority = majority if xp is np else xp.asarray(majority)
 

@@ -7,14 +7,14 @@ end. See gpu_kmer_count.py for the counting itself.
 
 FORK-SAFETY, load-bearing -- see baseline_pipeline.py's own docstring for the
 full picture: this module (and gpu_kmer_count.py, which it calls) never
-imports cupy at module scope. _select_backend() imports cupy *inside* the
-function body, which only ever executes already inside the forked wave-2
-child process baseline_pipeline.run_pipeline() spawns per chunk. This keeps
-the *parent* process itself free of any CUDA context for the whole run, so
-every subsequent chunk's fork() call forks from a CUDA-context-free parent --
-forking a process that has already initialized CUDA is a well-known crash
-hazard. Do not move `import cupy` to this file's top level; that would
-silently reintroduce it.
+imports cupy at module scope. gpu_corpus_batch.select_backend() imports cupy
+*inside* its function body, which only ever executes already inside the
+forked wave-2 child process baseline_pipeline.run_pipeline() spawns per
+chunk. This keeps the *parent* process itself free of any CUDA context for
+the whole run, so every subsequent chunk's fork() call forks from a
+CUDA-context-free parent -- forking a process that has already initialized
+CUDA is a well-known crash hazard. Do not move `import cupy` to this file's
+top level; that would silently reintroduce it.
 """
 
 import glob
@@ -25,6 +25,7 @@ import numpy as np
 from . import gpu_kmer_count
 from .classes import KmerAnalysis
 from .codon_tables import decode_base4_string
+from .gpu_corpus_batch import select_backend
 from .standards_io import STANDARD_FILES
 
 NAME = 'kmer'
@@ -32,19 +33,6 @@ FILENAME = STANDARD_FILES[NAME][0]
 SHARD_EXT = '.npz'
 
 _WINDOW_BUCKET_NAMES = ('ExonL50', 'Exon', 'ExonR50')
-
-
-def _select_backend(use_gpu: bool):
-    """cupy import lives here, and only here -- see module docstring."""
-    if not use_gpu:
-        return np
-    try:
-        import cupy as xp
-        xp.cuda.Device(0).use()
-        return xp
-    except Exception as e:
-        print(f"[baseline_kmer] GPU unavailable ({e!r}) -- falling back to numpy for this chunk.")
-        return np
 
 
 def _atomic_write_npz(path: str, **arrays) -> None:
@@ -61,7 +49,7 @@ def _atomic_write_npz(path: str, **arrays) -> None:
 
 def compute_and_write_shard(genes: list, shard_path: str, organism: str = "human",
                              k_values=range(2, 11), use_gpu: bool = True, vram_fraction: float = 0.5) -> None:
-    xp = _select_backend(use_gpu)
+    xp = select_backend(use_gpu, NAME)
     raw, loc_totals = gpu_kmer_count.count_kmers_for_chunk(xp, genes, k_values, vram_fraction=vram_fraction)
     payload = {}
     for k in k_values:
