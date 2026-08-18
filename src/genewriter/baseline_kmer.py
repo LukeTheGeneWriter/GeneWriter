@@ -60,9 +60,9 @@ def _atomic_write_npz(path: str, **arrays) -> None:
 
 
 def compute_and_write_shard(genes: list, shard_path: str, organism: str = "human",
-                             k_values=range(2, 11), use_gpu: bool = True) -> None:
+                             k_values=range(2, 11), use_gpu: bool = True, vram_fraction: float = 0.5) -> None:
     xp = _select_backend(use_gpu)
-    raw, loc_totals = gpu_kmer_count.count_kmers_for_chunk(xp, genes, k_values)
+    raw, loc_totals = gpu_kmer_count.count_kmers_for_chunk(xp, genes, k_values, vram_fraction=vram_fraction)
     payload = {}
     for k in k_values:
         for name in _WINDOW_BUCKET_NAMES:
