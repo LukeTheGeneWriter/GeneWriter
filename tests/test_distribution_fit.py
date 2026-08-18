@@ -100,6 +100,46 @@ def test_transform_array_handles_2d_input():
     np.testing.assert_allclose(result, (values_2d - mean) / std, atol=1e-6)
 
 
+def test_value_at_zscore_is_the_inverse_of_transform_for_normal_data():
+    # seed=0 matches test_normal_data_selects_norm_and_matches_classic_zscore_exactly
+    # above -- reliably selects 'norm' (AIC can occasionally favor a
+    # flexible family's ability to fit in-sample noise on other seeds).
+    rng = np.random.default_rng(0)
+    data = rng.normal(10.0, 3.0, 5000)
+    fd = fit_normal_transform(data)
+    assert fd.family == 'norm'
+    mean, std = fd.params
+
+    assert fd.value_at_zscore(0.0) == pytest.approx(mean, abs=1e-6)
+    assert fd.value_at_zscore(1.0) == pytest.approx(mean + std, abs=1e-6)
+    assert fd.value_at_zscore(-1.0) == pytest.approx(mean - std, abs=1e-6)
+
+
+def test_value_at_zscore_round_trips_through_transform_for_skewed_data():
+    rng = np.random.default_rng(1)
+    data = rng.exponential(scale=2.0, size=5000) + 1.0
+    fd = fit_normal_transform(data)
+    assert fd.family != 'norm'
+
+    for z in (-1.5, -0.5, 0.0, 0.5, 1.5, 2.0):
+        value = fd.value_at_zscore(z)
+        assert fd.transform(value) == pytest.approx(z, abs=1e-3)
+
+
+def test_value_at_zscore_asymmetric_half_widths_for_skewed_data():
+    # Mirrors test_boltzmann_shaped_data_treats_deviations_asymmetrically,
+    # from the other direction: the raw-unit distance from center to z=+1
+    # should differ from the distance to z=-1 for a genuinely skewed shape.
+    rng = np.random.default_rng(1)
+    data = rng.exponential(scale=2.0, size=5000) + 1.0
+    fd = fit_normal_transform(data)
+
+    center = fd.value_at_zscore(0.0)
+    hi_half_width = fd.value_at_zscore(1.0) - center
+    lo_half_width = center - fd.value_at_zscore(-1.0)
+    assert hi_half_width != pytest.approx(lo_half_width, rel=0.05)
+
+
 def test_out_of_range_values_clamp_instead_of_extrapolating():
     rng = np.random.default_rng(4)
     data = rng.normal(0.0, 1.0, 5000)

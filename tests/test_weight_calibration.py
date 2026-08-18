@@ -15,6 +15,35 @@ def test_term_coefficients_of_variation_covers_every_per_gene_term(analysis_obje
     assert all(cv > 0 for cv in cvs.values())
 
 
+def test_term_coefficients_of_variation_matches_classic_cv_for_gaussian_baseline(analysis_objects):
+    # For a genuinely normal baseline, the shape-aware measure must reduce
+    # to the exact old std/mean formula -- no behavior change for baselines
+    # that really were Gaussian (same principle distribution_fit.py's own
+    # transform() already follows).
+    rng = np.random.default_rng(7)
+    data = rng.normal(20.0, 2.0, 5000)
+    analysis_objects.codon_usage.codonUsageScoreByGene = data.tolist()
+
+    cvs = term_coefficients_of_variation(analysis_objects)
+    classic_cv = abs(data.std() / data.mean())
+    assert cvs['CodonUsage'] == pytest.approx(classic_cv, rel=0.02)
+
+
+def test_term_coefficients_of_variation_differs_from_naive_cv_for_skewed_baseline(analysis_objects):
+    # Not asserting which number is "more correct" here (see this module's
+    # own comment for that reasoning) -- just confirming the shape-aware
+    # measure genuinely reads from the fitted quantiles instead of silently
+    # falling back to the old std/mean formula for a baseline that visibly
+    # isn't Gaussian.
+    rng = np.random.default_rng(9)
+    data = rng.lognormal(mean=0.0, sigma=1.2, size=5000)  # strongly right-skewed
+    analysis_objects.gc.gcPerGene = data.tolist()
+
+    cvs = term_coefficients_of_variation(analysis_objects)
+    naive_cv = abs(data.std() / data.mean())
+    assert cvs['GC'] != pytest.approx(naive_cv, rel=0.05)
+
+
 def test_tighter_natural_distribution_gets_a_higher_weight(analysis_objects):
     """A term whose per-gene baseline is almost constant (tightly conserved
     in nature -- low CV) should come out with a larger calibrated weight

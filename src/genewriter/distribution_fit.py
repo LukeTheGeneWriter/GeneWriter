@@ -126,6 +126,25 @@ class FittedDistribution:
         """Scalar path -- change_vector.py's per-individual terms."""
         return float(_interp(np, np.asarray(value, dtype=float), self.grid_x, self.grid_z))
 
+    def value_at_zscore(self, z: float) -> float:
+        """Inverse of transform(): the raw value whose normal-score equals
+        z -- e.g. value_at_zscore(1.0) is "one equivalent standard
+        deviation above the fitted center," in the baseline's own raw
+        units, whatever the fitted shape actually is. For family == 'norm'
+        this is exactly `mean + z * std`.
+
+        Walks the same (grid_x, grid_z) lookup table transform() does, just
+        in the other direction -- valid because grid_z is monotonic
+        non-decreasing in grid_x by construction (a fitted CDF is
+        non-decreasing, and norm.ppf is strictly increasing on (0, 1)), so
+        _interp() can be reused as-is with the grid arguments swapped.
+
+        Not meaningful for family == 'degenerate' (grid_z is constant
+        there, so there's no well-defined inverse) -- callers should check
+        `.family` first, same as transform()'s other callers already do.
+        """
+        return float(_interp(np, np.asarray(z, dtype=float), self.grid_z, self.grid_x))
+
     def transform_array(self, arr, xp=np):
         """Array path -- change_vector.py's own vectorized bucket-window
         scoring (xp=np implicitly) and gpu_change_vector.py's batched terms

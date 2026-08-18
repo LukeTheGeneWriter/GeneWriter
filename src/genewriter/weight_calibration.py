@@ -52,7 +52,7 @@ _MIN_CV = 1e-6
 
 
 def term_coefficients_of_variation(analysis_objects: AnalysisObjects) -> dict:
-    """Coefficient of variation (std / |mean|) of each term's per-gene score
+    """Shape-aware coefficient of variation of each term's per-gene score
     across the natural-gene baseline in analysis_objects -- only for terms
     with a per-gene array available (see _PER_GENE_FIELDS).
 
@@ -60,19 +60,55 @@ def term_coefficients_of_variation(analysis_objects: AnalysisObjects) -> dict:
     intolerant of perturbation). High value: real genes vary a lot (loosely
     conserved -- tolerant).
 
-    A term is omitted if its baseline has fewer than 2 genes' worth of data
-    or a mean of exactly 0 -- nothing meaningful to divide by either way.
+    Deliberately NOT a plain std / |mean| on the raw array (what this used
+    to be, and what a "coefficient of variation" usually means): that
+    quietly assumes symmetry, and for several of the shapes
+    distribution_fit.py already knows real per-gene baselines can take
+    (e.g. CodonPairBias's Boltzmann/gamma-ish tail), plain CV doesn't just
+    get *distorted* by skew, it can become uninformative outright -- an
+    exponential distribution has std == mean by mathematical necessity, so
+    CV sits at ~1.0 for that whole family regardless of how tightly or
+    loosely nature actually conserves the metric, i.e. it measures the
+    shape family, not the thing this function is trying to answer.
+
+    Fix used here: reuse the already-fitted distribution
+    (cached_normal_transform(), no extra fitting cost) and read off the raw
+    value one normal-equivalent std above and below its own fitted center
+    (FittedDistribution.value_at_zscore(+-1)), then average the two
+    half-widths into one spread number. For a genuinely Gaussian baseline
+    this reduces to the exact old std (matching this module's existing
+    "no change for normal baselines" principle), but it no longer inherits
+    a symmetric distribution's assumptions for a skewed one.
+
+    Determines a single scalar for each measurement, regardless of the
+    natural form of its distribution, to weigh its importance. This may
+    require tuning in the future, but also may not -- if it does, the
+    likely next step is producing a *pair* of values (upper/lower
+    half-width) instead of averaging them, to describe asymmetry in "how
+    tight nature is about this metric" in either direction, rather than
+    collapsing it to one number the way this does today.
+
+    A term is omitted if its baseline has fewer than 2 genes' worth of data,
+    its fit came back degenerate (every observation identical), or its
+    fitted center is exactly 0 -- nothing meaningful to divide by either way.
     """
     result = {}
     for term_name, (attr, field_name) in _PER_GENE_FIELDS.items():
-        values = getattr(getattr(analysis_objects, attr), field_name)
+        baseline_obj = getattr(analysis_objects, attr)
+        values = getattr(baseline_obj, field_name)
         arr = np.asarray(values, dtype=float)
         if arr.size < 2:
             continue
-        mean = arr.mean()
-        if mean == 0:
+        transform = cached_normal_transform(baseline_obj, field_name, values)
+        if transform.family == 'degenerate':
             continue
-        result[term_name] = max(abs(arr.std() / mean), _MIN_CV)
+        center = transform.value_at_zscore(0.0)
+        if center == 0:
+            continue
+        hi = transform.value_at_zscore(1.0)
+        lo = transform.value_at_zscore(-1.0)
+        half_width = (abs(hi - center) + abs(center - lo)) / 2.0
+        result[term_name] = max(half_width / abs(center), _MIN_CV)
     return result
 
 
