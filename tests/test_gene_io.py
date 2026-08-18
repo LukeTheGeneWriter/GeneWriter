@@ -64,6 +64,51 @@ def test_load_gene_chunk_returns_natural_genes(tmp_path):
     assert [g.geneID for g in genes] == [0, 1, 2]
 
 
+def test_load_gene_chunk_preserves_order_with_concurrent_workers(tmp_path):
+    # The real point of using ThreadPoolExecutor.map() (not as_completed()):
+    # results come back in the SAME order as the input paths regardless of
+    # which thread actually finishes first -- confirmed with more paths than
+    # workers, so multiple batches of concurrent reads are involved, not
+    # just one round where "concurrent" and "sequential" would look the same.
+    paths = [_write_gene(tmp_path, i) for i in range(20)]
+
+    genes = load_gene_chunk(paths, max_workers=4)
+
+    assert [g.geneID for g in genes] == list(range(20))
+
+
+def test_load_gene_chunk_max_workers_one_matches_sequential_fallback(tmp_path):
+    paths = [_write_gene(tmp_path, i) for i in range(5)]
+
+    genes = load_gene_chunk(paths, max_workers=1)
+
+    assert [g.geneID for g in genes] == [0, 1, 2, 3, 4]
+
+
+def test_load_gene_chunk_empty_paths_returns_empty_list():
+    assert load_gene_chunk([]) == []
+    assert load_gene_chunk([], max_workers=1) == []
+
+
+def test_load_genes_preserves_order_with_concurrent_workers(tmp_path):
+    # Compares against chunk_paths()'s own sorted-path order, not a naive
+    # numeric range -- load_genes()/chunk_paths() both sort filenames as
+    # STRINGS (glob.glob + sorted()), so e.g. "10.json" sorts before
+    # "2.json" lexicographically. The property under test is "load_genes()
+    # doesn't scramble whatever order glob's sort produced", not "gene IDs
+    # come back in numeric order" (chunk_paths()'s own docstring makes no
+    # numeric-order promise either).
+    for i in range(15):
+        _write_gene(tmp_path, i)
+    expected_order = [int(os.path.basename(p).removesuffix('.json'))
+                       for chunk in chunk_paths(str(tmp_path), chunk_size=100) for p in chunk]
+
+    genes = load_genes(str(tmp_path), max_workers=4)
+
+    assert [g.geneID for g in genes] == expected_order
+    assert sorted(expected_order) == list(range(15))  # sanity: same genes, just not numeric order
+
+
 def test_iter_gene_chunks_yields_index_and_genes(tmp_path):
     for i in range(5):
         _write_gene(tmp_path, i)

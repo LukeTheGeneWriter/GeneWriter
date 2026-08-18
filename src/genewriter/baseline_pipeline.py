@@ -6,7 +6,14 @@ it's importable/testable outside a notebook (matching gene_io.py/baseline.py's
 existing shape).
 
 Per chunk of genes (gene_io.chunk_paths/load_gene_chunk):
-  1. Load the chunk once, into this (parent) process's memory.
+  1. Load the chunk once, into this (parent) process's memory --
+     load_gene_chunk() itself loads concurrently via a thread pool
+     (gene_io.py's `load_workers`/_DEFAULT_MAX_WORKERS), since the real cost
+     there is Drive/FUSE round-trip *latency* per file, not local CPU work --
+     see that module's own docstring for why threads help despite the GIL
+     and Colab's single CPU core (this is a genuinely different bottleneck
+     from the CPU/GPU-bound compute steps below, which is why this pipeline
+     uses multiprocessing for those and threading for this).
   2. Wave 1: fork one child process per wave-1 TestSpec, concurrently. Each
      child already has the chunk's genes for free via copy-on-write (no
      re-read, no IPC serialization of the gene list) -- it just calls its
@@ -56,7 +63,7 @@ import multiprocessing as mp
 import os
 import time
 
-from . import baseline_codon_pair_bias, baseline_codon_usage, baseline_gc, baseline_kmer, baseline_rare_codon
+from . import baseline_codon_pair_bias, baseline_codon_usage, baseline_gc, baseline_kmer, baseline_rare_codon, gene_io
 from .gene_io import chunk_paths, load_gene_chunk
 
 
@@ -228,7 +235,8 @@ def _run_sequential_group(ctx, specs: list, genes: list, chunk_index: int, organ
 
 
 def run_pipeline(gene_dir: str, standards_dir: str, chunk_size: int = 750, organism: str = "human",
-                  tests: list = None, resume: bool = True, verbose: bool = True) -> dict:
+                  tests: list = None, resume: bool = True, verbose: bool = True,
+                  load_workers: int = gene_io._DEFAULT_MAX_WORKERS) -> dict:
     """Runs every registered test over every chunk of genes under gene_dir.
     Returns {chunk_index: {'wave1_failures': [...], 'wave2_failures': [...]}}
     for any chunk where at least one test failed -- a single test's crash on
@@ -242,12 +250,19 @@ def run_pipeline(gene_dir: str, standards_dir: str, chunk_size: int = 750, organ
     output for a non-interactive process). Real bug hit live: this whole
     function used to print nothing at all, anywhere, for the entire run --
     a chunk's gene-loading step alone can take 20+ minutes against
-    Drive-mounted storage (this pipeline never sped that up, only the
-    compute steps after it), and with zero output there was no way to tell
+    Drive-mounted storage, and with zero output there was no way to tell
     "working normally, just I/O-bound" from "hung" from "silently GPU-
     falling-back" without interrupting and guessing. Set False to match the
     old silent behavior (e.g. if a caller wants to do its own logging, or
-    for quieter test output)."""
+    for quieter test output).
+
+    load_workers: threads used to load each chunk's gene JSONs concurrently
+    (gene_io.load_gene_chunk()) -- the real lever for that 20+ minute load
+    time, since it's network/FUSE round-trip *latency* per file against
+    Drive-mounted storage, not local CPU work (see gene_io.py's module
+    docstring for why threads help here despite the GIL, and Colab's single
+    CPU core). Tune down if you see Drive API rate-limit errors, up if a
+    real run shows headroom -- see gene_io._DEFAULT_MAX_WORKERS."""
     if 'fork' not in mp.get_all_start_methods():
         raise RuntimeError(
             "baseline_pipeline.run_pipeline() requires the 'fork' multiprocessing start "
@@ -293,11 +308,12 @@ def run_pipeline(gene_dir: str, standards_dir: str, chunk_size: int = 750, organ
             continue  # every test already has this chunk done -- skip the disk read entirely
 
         if verbose:
-            print(f"[run_pipeline] chunk {chunk_index + 1}/{len(chunks)}: loading {len(paths)} gene JSON(s)"
-                  f"{' from Drive-mounted storage (can be slow -- ~1-2s/gene is normal)' if chunk_index == 0 else ''}...",
+            print(f"[run_pipeline] chunk {chunk_index + 1}/{len(chunks)}: loading {len(paths)} gene JSON(s) "
+                  f"({load_workers} concurrent worker(s))"
+                  f"{' -- Drive-mounted storage can still take a while even threaded, especially for the first chunk' if chunk_index == 0 else ''}...",
                   flush=True)
         t_load = time.perf_counter()
-        genes = load_gene_chunk(paths)
+        genes = load_gene_chunk(paths, max_workers=load_workers)
         if verbose:
             print(f"[run_pipeline] chunk {chunk_index + 1}/{len(chunks)}: loaded in {time.perf_counter() - t_load:.1f}s -- running tests...", flush=True)
 
