@@ -6,6 +6,8 @@ Purpose: context transfer for whoever (human or Claude) picks this up next. Date
 
 Unlike v1, this document describes code that exists, runs, and is tested — not a proposal. Where it says something works, it means `pytest` passes on it. Where it says something isn't done, it isn't started. The original 14 notebooks are still in the repo root, unmodified, and are now considered historical/reference material — the live code is `src/genewriter/`.
 
+**Scope note, added 2026-08-19**: this document is a snapshot of the GA/change-vector scoring engine specifically (§1-6 below), last updated 2026-07-24, and does not cover the *baseline-generation* pipeline (`baseline_pipeline.py`, `Baseline_Pipeline.ipynb`, the corpus-wide `Standards/*.json` statistics the GA scoring engine consumes) — that subsystem was rebuilt substantially since this doc was written (chunked/GPU-batched loading, all 5 tests GPU-accelerated, confirmed working live in Colab) and is covered by `HANDOFF_2026-08-19.md` instead. If you're picking up work on how baselines get computed rather than how the GA scores against them, start there, not here.
+
 1. Environment — read before doing anything else
 
 **There is no usable Python on native Windows on this machine.** `python`/`python3` resolve to a Microsoft Store stub, not a real interpreter. All development and testing happens via **WSL (Ubuntu)**. From the repo root:
