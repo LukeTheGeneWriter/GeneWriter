@@ -10,6 +10,7 @@ from genewriter import ga
 from genewriter.change_vector import calculate_change_vector, score_changevec
 from genewriter.classes import Proposed_Solution
 from genewriter.visualize import (
+    _assign_similarity_band,
     _percentile_rank,
     _sanitize_for_color,
     _size_by_count,
@@ -18,8 +19,11 @@ from genewriter.visualize import (
     fitness_color_values,
     load_population_json,
     load_population_trajectory,
+    nucleotide_identity_to_reference,
+    plot_population_similarity_to_reference,
     plot_population_trajectory,
     plot_population_tsne,
+    similarity_band_counts,
     subsample_population,
 )
 
@@ -304,6 +308,80 @@ def test_animate_population_trajectory_frame_only_shows_that_generations_points(
     assert scatter.get_offsets().shape[0] == 6  # still just one generation's worth, not 12 or 18
     import matplotlib.pyplot as plt
     plt.close(fig)
+
+
+def test_nucleotide_identity_to_reference_identical_sequence_is_100(aa_seq, analysis_objects):
+    pop = _population(aa_seq, analysis_objects, n=3)
+    reference = pop[0].codons
+    identities = nucleotide_identity_to_reference(pop, reference)
+    assert identities[0] == pytest.approx(100.0)
+
+
+def test_nucleotide_identity_to_reference_counts_partial_codon_matches():
+    # CTG vs CTC differ at exactly 1 of their 3 nucleotides -- a
+    # codon-CHOICE metric (codon_distance_matrix) would just call this
+    # position "different"; nucleotide identity should still credit the 2
+    # matching bases.
+    reference = ['ATG', 'CTG', 'AAA']
+    individual = Proposed_Solution(['ATG', 'CTC', 'AAA'], 1, {})
+    identities = nucleotide_identity_to_reference([individual], reference)
+    assert identities[0] == pytest.approx(100.0 * 8 / 9)
+
+
+def test_nucleotide_identity_to_reference_rejects_length_mismatch():
+    reference = ['ATG', 'CTG', 'AAA']
+    individual = Proposed_Solution(['ATG', 'CTG'], 1, {})
+    with pytest.raises(ValueError, match="matching lengths"):
+        nucleotide_identity_to_reference([individual], reference)
+
+
+def test_nucleotide_identity_to_reference_rejects_empty_reference():
+    with pytest.raises(ValueError, match="empty"):
+        nucleotide_identity_to_reference([], [])
+
+
+def test_similarity_band_counts_is_cumulative():
+    identities = np.array([100.0, 99.5, 97.0, 92.0, 80.0])
+    counts = similarity_band_counts(identities, thresholds=(99, 95, 90))
+    # 99.5 is also >= 95 and >= 90 -- a tighter-claim individual is always
+    # counted in every looser band too, matching how claim coverage nests.
+    assert counts == {99: 2, 95: 3, 90: 4}
+
+
+def test_assign_similarity_band_picks_tightest_met_threshold():
+    identities = np.array([100.0, 99.5, 97.0, 92.0, 80.0])
+    bands = _assign_similarity_band(identities, thresholds_desc=[99, 95, 90])
+    assert bands.tolist() == [0, 0, 1, 2, 3]  # last one (80%) meets none -> band index 3
+
+
+def test_plot_population_similarity_to_reference_returns_figure_and_full_counts(aa_seq, analysis_objects):
+    pop = _population(aa_seq, analysis_objects, n=12)
+    reference = pop[0].codons  # a real member -- guarantees at least one 100%-identical point
+    fig, band_counts, identities = plot_population_similarity_to_reference(
+        pop, reference, thresholds=(99.9, 99, 95, 90, 85), max_points=100,
+    )
+    assert len(identities) == len(pop)
+    assert identities[0] == pytest.approx(100.0)
+    assert band_counts[max(band_counts)] >= 1  # the reference itself meets its own tightest band
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def test_plot_population_similarity_to_reference_subsamples_large_populations(aa_seq, analysis_objects):
+    pop = _population(aa_seq, analysis_objects, n=30)
+    reference = pop[0].codons
+    fig, band_counts, identities = plot_population_similarity_to_reference(pop, reference, max_points=10)
+    # band_counts/identities cover the FULL population, unaffected by the plot's own subsampling
+    assert len(identities) == 30
+    assert sum(1 for v in identities if v == pytest.approx(100.0)) >= 1
+    assert "10 of 30" in fig.axes[0].get_title()
+    import matplotlib.pyplot as plt
+    plt.close(fig)
+
+
+def test_plot_population_similarity_to_reference_rejects_empty_population():
+    with pytest.raises(ValueError, match="empty"):
+        plot_population_similarity_to_reference([], ['ATG'])
 
 
 def test_animate_population_trajectory_saves_gif(tmp_path, aa_seq, analysis_objects, weights):

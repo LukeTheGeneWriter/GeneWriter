@@ -17,6 +17,14 @@ before embedding: exact t-SNE on a precomputed distance matrix is O(P^2)
 memory (a 50,000-individual population would need a ~20GB float64
 distance matrix), and a scatter plot of that many overlapping points
 isn't visually useful anyway -- see plot_population_tsne's max_points.
+
+Also here: plot_population_similarity_to_reference(), a different question
+from the rest of the module -- not "why is the GA favoring this genotype"
+but "how much of the population sits within X% nucleotide identity of one
+fixed reference sequence" (e.g. a patent attorney's actual filing
+candidate). Reuses the same t-SNE embedding machinery for spatial layout,
+but colors by discrete similarity band to that one reference instead of a
+continuous fitness/term scale.
 """
 
 import glob
@@ -96,6 +104,164 @@ def codon_distance_matrix(pop: list) -> np.ndarray:
         return np.zeros((len(pop), len(pop)), dtype=float)
     codon_idx = np.asarray([encode_codons(p.codons) for p in pop])
     return squareform(pdist(codon_idx, metric='hamming'))
+
+
+def nucleotide_identity_to_reference(pop: list, reference_codons: list) -> np.ndarray:
+    """Per-individual nucleotide-level percent identity (0-100) to one fixed
+    reference codon sequence -- e.g. a specific sequence a patent attorney
+    is evaluating for filing, or the natural CDS itself.
+
+    Deliberately literal-nucleotide, not codon_distance_matrix()'s codon-
+    CHOICE Hamming distance: two different codons that still share 1-2 of
+    their 3 nucleotides (e.g. CTG vs CTC) count as partially identical here,
+    matching how percent identity is actually reported for nucleic acid
+    sequence claims (BLAST-style alignment identity), not the GA's own
+    coarser internal genotype-similarity proxy used for t-SNE clustering.
+
+    Every individual (and the reference) must have the same codon-list
+    length -- true within one GA run/schedule, since every individual there
+    encodes the same fixed amino acid sequence via synonymous substitutions
+    only. Raises ValueError on a length mismatch rather than silently
+    truncating/broadcasting, since a coverage number computed against the
+    wrong-length pair would be meaningless (a patent-claim-scope figure
+    someone might actually act on).
+    """
+    ref_len = len(reference_codons)
+    if ref_len == 0:
+        raise ValueError("reference_codons is empty")
+    ref_nt = ''.join(reference_codons)
+    values = np.empty(len(pop), dtype=float)
+    for i, p in enumerate(pop):
+        if len(p.codons) != ref_len:
+            raise ValueError(
+                f"individual {i} has {len(p.codons)} codons, reference has {ref_len} -- "
+                f"nucleotide identity requires matching lengths (same amino acid sequence)"
+            )
+        nt = ''.join(p.codons)
+        matches = sum(a == b for a, b in zip(nt, ref_nt))
+        values[i] = 100.0 * matches / len(ref_nt)
+    return values
+
+
+def similarity_band_counts(identities: np.ndarray, thresholds=(99.9, 99, 95, 90, 85)) -> dict:
+    """For each threshold T in `thresholds`, how many individuals have
+    nucleotide identity >= T -- the "how many viable outputs would a claim
+    of at least T% identity cover" number a patent attorney actually wants.
+
+    Cumulative by construction (an individual 99.9% identical to the
+    reference is also counted in the >=99%, >=95%, ... bins), matching how
+    a percent-identity claim's coverage nests: a tighter claim's coverage is
+    always a subset of a looser one's. Returns a dict keyed by threshold
+    (sorted descending), not a list, so callers don't have to remember
+    positional order.
+    """
+    return {t: int(np.sum(identities >= t)) for t in sorted(set(thresholds), reverse=True)}
+
+
+def _assign_similarity_band(identities: np.ndarray, thresholds_desc: list) -> np.ndarray:
+    """Per-individual index into thresholds_desc (already sorted descending)
+    -- 0 = meets the tightest threshold, ..., len(thresholds_desc) = meets
+    none of them. Unlike similarity_band_counts()'s cumulative counts, this
+    assigns each point to exactly one (its best/tightest-met) band, for
+    discrete per-point scatter coloring.
+    """
+    bands = np.full(identities.shape, len(thresholds_desc), dtype=int)
+    unassigned = np.ones(identities.shape, dtype=bool)
+    for band_idx, t in enumerate(thresholds_desc):
+        meets = unassigned & (identities >= t)
+        bands[meets] = band_idx
+        unassigned &= ~meets
+    return bands
+
+
+def plot_population_similarity_to_reference(
+    pop: list,
+    reference_codons: list,
+    thresholds: tuple = (99.9, 99, 95, 90, 85),
+    max_points: int = 4000,
+    perplexity: float = 30.0,
+    random_state: int = 0,
+    size_by_count: bool = True,
+    size_range: tuple = (4.0, 24.0),
+    figsize: tuple = (9.0, 8.0),
+):
+    """t-SNE scatter (same codon-choice-Hamming embedding as
+    plot_population_tsne()) with points discretely colored by which
+    similarity-to-reference band (see similarity_band_counts()) each falls
+    into. Built for the "patent attorney wants to file a percent-identity
+    claim on `reference_codons`" case: shows both how many viable outputs a
+    given threshold would cover (the legend counts) and whether the ones
+    falling outside a tighter band cluster together spatially -- a distinct
+    genotype neighborhood that might be worth its own separate claim -- or
+    are just scattered noise near the boundary.
+
+    reference_codons: the specific sequence being evaluated for coverage --
+        e.g. one individual from `pop` picked as the actual filing
+        candidate, or an externally supplied sequence (must have the same
+        codon count as every individual in pop -- same amino acid
+        sequence). Not required to itself be a member of pop.
+    thresholds: percent-identity cutoffs, e.g. the default
+        (99.9, 99, 95, 90, 85) -- order doesn't matter, sorted descending
+        internally.
+
+    Band counts and the full per-individual identity array are computed
+    against the FULL population (O(P * sequence length), cheap -- not the
+    O(P^2) t-SNE embedding), not just the plotted subsample, so the
+    coverage numbers are exact even when max_points forces the scatter
+    itself to subsample for rendering.
+
+    Returns (fig, band_counts, identities): band_counts is
+    similarity_band_counts()'s dict over the FULL population; identities is
+    the full per-individual percent-identity array (same order as pop) --
+    both returned alongside the figure so the real numbers are available
+    without having to read them off the plot.
+    """
+    import matplotlib.pyplot as plt
+    from sklearn.manifold import TSNE
+
+    if not pop:
+        raise ValueError("pop is empty -- nothing to plot")
+
+    thresholds_desc = sorted(set(thresholds), reverse=True)
+    identities = nucleotide_identity_to_reference(pop, reference_codons)
+    band_counts = similarity_band_counts(identities, thresholds_desc)
+
+    sampled = subsample_population(pop, max_points, rng=random.Random(random_state))
+    sampled_identities = nucleotide_identity_to_reference(sampled, reference_codons)
+    n = len(sampled)
+    effective_perplexity = min(perplexity, max(n - 1, 1))
+
+    dist = codon_distance_matrix(sampled)
+    coords = TSNE(
+        n_components=2, metric='precomputed', init='random',
+        perplexity=effective_perplexity, random_state=random_state,
+    ).fit_transform(dist)
+
+    bands = _assign_similarity_band(sampled_identities, thresholds_desc)
+    sizes = _size_by_count(sampled, size_range) if size_by_count else None
+
+    fig, ax = plt.subplots(figsize=figsize)
+    cmap = plt.get_cmap('viridis', len(thresholds_desc) + 1)
+    band_labels = [f">= {t:g}%" for t in thresholds_desc] + [f"< {thresholds_desc[-1]:g}%"]
+    band_full_counts = [band_counts[t] for t in thresholds_desc] + [len(pop) - band_counts[thresholds_desc[-1]]]
+
+    for band_idx, label in enumerate(band_labels):
+        mask = bands == band_idx
+        if not np.any(mask):
+            continue
+        ax.scatter(
+            coords[mask, 0], coords[mask, 1],
+            s=sizes[mask] if sizes is not None else None,
+            color=cmap(band_idx),
+            label=f"{label} ({band_full_counts[band_idx]} of {len(pop)} total)",
+        )
+
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.legend(loc='best', fontsize=8, title='Identity to reference')
+    ax.set_title(f"Population similarity to reference sequence ({n} of {len(pop)} shown)")
+    fig.tight_layout()
+    return fig, band_counts, identities
 
 
 def fitness_color_values(pop: list, weights: dict, color_by: str) -> np.ndarray:
