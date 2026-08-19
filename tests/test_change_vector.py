@@ -1,5 +1,7 @@
+import dataclasses
 import math
 
+import numpy as np
 import pytest
 
 from genewriter.change_vector import cached_mean_std, cached_stat, calculate_change_vector, score_changevec
@@ -31,6 +33,118 @@ def test_codon_pair_bias_term_is_not_empty(aa_seq, analysis_objects):
     cpb = vecs['CodonPairBias']
     assert len(cpb) == len(sol)
     assert any(v != 0.0 for v in cpb)
+
+
+def test_codon_pair_bias_term_gives_zero_distance_to_the_single_best_pair(analysis_objects):
+    """The highest-scoring pair anywhere in cpb_lit is taken as 0 distance
+    from optimal -- a candidate built entirely from that one pair should
+    score exactly 0 at every position, since it's already the best possible
+    pairing (see change_vector._codon_pair_bias_term's docstring)."""
+    cpb_lit = analysis_objects.codon_pair_bias.cpb_lit
+    best_pair, _best_score = max(cpb_lit.items(), key=lambda kv: kv[1])
+    sol = [best_pair[:3], best_pair[3:]]
+
+    scores = calculate_change_vector(sol, analysis_objects)['CodonPairBias']
+    assert scores == pytest.approx([0.0, 0.0], abs=1e-9)
+
+
+def test_codon_pair_bias_term_scopes_in_on_the_worse_of_two_adjacent_pairings(analysis_objects):
+    """A position touching only a near-optimal pairing should score lower
+    than a position touching only a poor one -- mutation pressure should
+    concentrate on the worst pairing, not the best."""
+    cpb_lit = analysis_objects.codon_pair_bias.cpb_lit
+    best_pair, _ = max(cpb_lit.items(), key=lambda kv: kv[1])
+    codon_a, codon_b = best_pair[:3], best_pair[3:]
+    # Worst possible continuation from codon_b, so position 2 touches only
+    # a poor pairing while position 0 touches only the near-optimal one.
+    codon_c = min(
+        (pair[3:] for pair in cpb_lit if pair[:3] == codon_b),
+        key=lambda c2: cpb_lit[codon_b + c2],
+    )
+    sol = [codon_a, codon_b, codon_c]
+
+    scores = calculate_change_vector(sol, analysis_objects)['CodonPairBias']
+    assert scores[2] > scores[0]
+
+
+def test_codon_pair_bias_term_multiplier_is_neutral_when_sequence_is_typical(aa_seq, analysis_objects):
+    """When the candidate's own average pair score sits right where
+    cpbPerGene says natural genes typically land, the global multiplier is
+    ~1x (neutral) -- the returned score should match the raw local
+    distance-from-optimal signal, not be scaled up or down."""
+    sol = _random_solution(aa_seq)
+    cpb = analysis_objects.codon_pair_bias
+    pairs = [sol[i] + sol[i + 1] for i in range(len(sol) - 1)]
+    max_score = max(cpb.cpb_lit.values())
+    pair_distance = [max_score - cpb.cpb_lit[p] for p in pairs]
+    expected_local = []
+    for i in range(len(sol)):
+        if i == 0:
+            expected_local.append(pair_distance[0])
+        elif i == len(sol) - 1:
+            expected_local.append(pair_distance[-1])
+        else:
+            expected_local.append((pair_distance[i - 1] + pair_distance[i]) / 2)
+
+    overall = sum(cpb.cpb_lit[p] for p in pairs) / len(pairs)
+    rng = np.random.default_rng(0)
+    typical_cpb = dataclasses.replace(cpb, cpbPerGene=rng.normal(overall, max(overall * 0.05, 1.0), 5000).tolist())
+    typical_ao = dataclasses.replace(analysis_objects, codon_pair_bias=typical_cpb)
+
+    actual = calculate_change_vector(sol, typical_ao)['CodonPairBias']
+    assert actual == pytest.approx(expected_local, rel=0.05)
+
+
+def test_codon_pair_bias_term_scales_up_when_whole_sequence_is_below_the_natural_mean(aa_seq, analysis_objects):
+    """A candidate whose overall pairing sits far BELOW what cpbPerGene
+    says is typical should get uniformly larger CodonPairBias scores than
+    the identical candidate scored against a baseline centered on its own
+    average -- the global multiplier layered on top of the local per-pair
+    signal, not replacing it."""
+    sol = _random_solution(aa_seq)
+    cpb = analysis_objects.codon_pair_bias
+    pairs = [sol[i] + sol[i + 1] for i in range(len(sol) - 1)]
+    overall = sum(cpb.cpb_lit[p] for p in pairs) / len(pairs)
+
+    rng = np.random.default_rng(0)
+    typical_cpb = dataclasses.replace(cpb, cpbPerGene=rng.normal(overall, max(overall * 0.05, 1.0), 5000).tolist())
+    # Baseline centered well ABOVE the candidate's own average -> the
+    # candidate sits below this (inflated) mean -> should amplify.
+    skewed_cpb = dataclasses.replace(cpb, cpbPerGene=rng.normal(overall * 5 + 1000, max(overall * 0.05, 1.0), 5000).tolist())
+
+    typical_scores = calculate_change_vector(sol, dataclasses.replace(analysis_objects, codon_pair_bias=typical_cpb))['CodonPairBias']
+    skewed_scores = calculate_change_vector(sol, dataclasses.replace(analysis_objects, codon_pair_bias=skewed_cpb))['CodonPairBias']
+
+    assert all(skewed >= typical - 1e-9 for typical, skewed in zip(typical_scores, skewed_scores))
+    assert any(skewed > typical + 1e-9 for typical, skewed in zip(typical_scores, skewed_scores))
+
+
+def test_codon_pair_bias_term_multiplier_does_not_amplify_when_sequence_is_above_the_natural_mean(aa_seq, analysis_objects):
+    """Asymmetric on purpose (Luke's explicit call): sitting ABOVE
+    cpbPerGene's mean isn't punished the way sitting below it is --
+    over-optimizing CPB specifically is already handled by the change
+    vector's overall term interplay, not by this term chasing "too good."
+    A candidate scored against a baseline centered well below its own
+    average (so the candidate sits above that mean) should score the same
+    as against a baseline centered exactly on its own average (multiplier
+    ~1x in both cases), not get amplified the way below-mean does."""
+    sol = _random_solution(aa_seq)
+    cpb = analysis_objects.codon_pair_bias
+    pairs = [sol[i] + sol[i + 1] for i in range(len(sol) - 1)]
+    overall = sum(cpb.cpb_lit[p] for p in pairs) / len(pairs)
+
+    rng = np.random.default_rng(0)
+    typical_cpb = dataclasses.replace(cpb, cpbPerGene=rng.normal(overall, max(overall * 0.05, 1.0), 5000).tolist())
+    # Baseline centered well BELOW the candidate's own average -> the
+    # candidate sits above this (deflated) mean -> should NOT amplify.
+    below_mean_baseline = dataclasses.replace(
+        cpb, cpbPerGene=rng.normal(max(overall - overall * 0.8, 1.0), max(overall * 0.05, 1.0), 5000).tolist(),
+    )
+
+    typical_scores = calculate_change_vector(sol, dataclasses.replace(analysis_objects, codon_pair_bias=typical_cpb))['CodonPairBias']
+    above_scores = calculate_change_vector(sol, dataclasses.replace(analysis_objects, codon_pair_bias=below_mean_baseline))['CodonPairBias']
+
+    assert above_scores == pytest.approx(typical_scores, rel=0.05)
 
 
 def test_kmer_term_does_not_drop_last_codon(aa_seq, analysis_objects):

@@ -378,7 +378,26 @@ def _codon_usage_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: li
 
 
 @register_term('CodonPairBias')
-def _codon_pair_bias_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsize: int = 15) -> list:
+def _codon_pair_bias_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list) -> list:
+    """Two-layer design, mirroring _gc_term's local/global split but
+    multiplicative rather than additive (Luke's explicit call): a LOCAL
+    per-position "distance from optimal" (how far this position's own
+    codon pairing is from the single best pairing anywhere in cpb_lit),
+    scaled by a GLOBAL per-sequence multiplier (how far BELOW natural
+    genes' own per-gene average this whole candidate's average pairing
+    sits -- asymmetric on purpose, see the multiplier's own comment below)
+    -- so mutation pressure concentrates on the worst individual pairings,
+    and does so more aggressively when the candidate is poorly paired
+    overall.
+
+    Previously this term multiplied a local *windowed z-score* (via
+    cpbPerWindow) by the *raw* cpb_lit score at each position -- backwards
+    from the intended "low score = bad = needs fixing" semantics (a raw
+    score is highest exactly where a pairing is already best, the opposite
+    of a change-vector signal that should peak where fixing is most
+    needed), and never touched cpbPerGene (the one baseline field suited to
+    a whole-sequence signal) at all. Replaced entirely below.
+    """
     cpb = analysis_objects.codon_pair_bias
     if len(sol) < 2:
         return [0.0] * len(sol)
@@ -386,35 +405,51 @@ def _codon_pair_bias_term(sol: list, analysis_objects: 'AnalysisObjects', locvec
     pairs = [sol[i] + sol[i + 1] for i in range(len(sol) - 1)]
     pair_scores = [cpb.cpb_lit[p] for p in pairs]
 
-    span = max(cpb.windowsize - 1, 2)
-    # A window of `span` codons produces span-1 adjacent pairs, which are
-    # exactly pair_scores[i:i+span-1] (each window's own pair sequence is
-    # just a slice of the pairs already computed above) -- so this reduces
-    # to a plain windowed mean of pair_scores, instead of rebuilding and
-    # re-scoring each window's pairs from scratch.
-    num_windows = max(len(sol) - cpb.windowsize, 0)
-    pair_span = span - 1
-    pair_scores_arr = np.asarray(pair_scores, dtype=float)
-    if num_windows > 0 and pair_span >= 1 and len(pair_scores_arr) >= pair_span:
-        win_scores = sliding_window_view(pair_scores_arr, pair_span)[:num_windows].mean(axis=1).tolist()
-    else:
-        win_scores = [0.0] * num_windows
+    # Distance from optimal: the single highest-scoring pair anywhere in
+    # the literal lookup is "0 distance" -- already optimal, nothing for
+    # this term to fix there. A rare/poor pairing sits far below that
+    # ceiling, so the distance is large exactly where mutation pressure
+    # should concentrate. cpb_lit is a fixed literal table (never mutated
+    # for the life of an analysis object, same assumption cached_stat()'s
+    # other callers already make), so its max is cheap to cache once rather
+    # than rescanning all ~4096 entries on every call.
+    max_score = cached_stat(cpb, 'cpb_max_score', lambda: max(cpb.cpb_lit.values()))
+    pair_distance = [max_score - s for s in pair_scores]
 
-    win_transform = cached_normal_transform(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
-    win_z = [win_transform.transform(v) ** 2 for v in win_scores]
-    win_change = _windowed_average(win_z, len(sol), winsize)
-
-    # Score at position i is the average of the two codon-pairs touching it.
+    # Local layer: score at position i is the average distance-from-optimal
+    # of the (up to two) codon-pairs touching it.
     pair_change = []
     for i in range(len(sol)):
         if i == 0:
-            pair_change.append(pair_scores[0])
+            pair_change.append(pair_distance[0])
         elif i == len(sol) - 1:
-            pair_change.append(pair_scores[-1])
+            pair_change.append(pair_distance[-1])
         else:
-            pair_change.append((pair_scores[i - 1] + pair_scores[i]) / 2)
+            pair_change.append((pair_distance[i - 1] + pair_distance[i]) / 2)
 
-    return [win_change[i] * pair_change[i] for i in range(len(sol))]
+    # Global multiplier: how far BELOW natural genes' per-gene average
+    # (cpbPerGene) this WHOLE candidate's own average pair score sits --
+    # asymmetric on purpose (Luke's explicit call): under-mean CPB is
+    # genuinely bad and should amplify local mutation pressure, but
+    # above-mean isn't a problem worth chasing here -- over-optimizing CPB
+    # specifically is already checked by the change vector's overall term
+    # interplay (other terms de-prioritize a candidate that over-indexes on
+    # any one axis), not by this term artificially punishing "too good."
+    # Only the below-mean half of the normal-score is squared (z clamped to
+    # <=0 first); at or above the mean, that clamp is 0, so the multiplier
+    # is exactly 1.0 -- neutral, not zero. Baseline 1.0 (not 0.0) even in
+    # the bad-deviation case's zero-crossing so a merely-typical sequence
+    # still passes the local distance signal through unscaled instead of
+    # silently zeroing out every position's score -- the multiplicative
+    # counterpart of _gc_term's additive seq_deviation (an additive "~0
+    # boost when on-spec" becomes a multiplicative "~1x, i.e. no-op, when
+    # on-spec" here).
+    overall_cpb = sum(pair_scores) / len(pair_scores)
+    seq_transform = cached_normal_transform(cpb, 'cpbPerGene', cpb.cpbPerGene)
+    below_mean_z = min(seq_transform.transform(overall_cpb), 0.0)
+    global_multiplier = 1.0 + below_mean_z ** 2
+
+    return [v * global_multiplier for v in pair_change]
 
 
 @register_term('GC')

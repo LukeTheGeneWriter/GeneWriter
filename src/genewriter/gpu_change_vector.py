@@ -222,8 +222,13 @@ def batch_codon_usage_term(xp, codon_idx, ca, winsize: int = 15):
     return straight_z * score_zs + straight_z * dist_zs
 
 
-def batch_codon_pair_bias_term(xp, codon_idx, cpb, winsize: int = 15):
-    """codon_idx: (P, N) int array. cpb: CodonPairBiasAnalysis. Returns (P, N)."""
+def batch_codon_pair_bias_term(xp, codon_idx, cpb):
+    """codon_idx: (P, N) int array. cpb: CodonPairBiasAnalysis. Returns (P, N).
+
+    Batched counterpart of change_vector._codon_pair_bias_term() -- see its
+    docstring for the local-distance/global-multiplier design and why it
+    replaced the old windowed-z-times-raw-score formula. Same two layers
+    here, vectorized across the population (P) dimension."""
     P, N = codon_idx.shape
     if N < 2:
         return xp.zeros((P, N), dtype=float)
@@ -235,29 +240,39 @@ def batch_codon_pair_bias_term(xp, codon_idx, cpb, winsize: int = 15):
             i, j = CODON_TO_INDEX[pair[:3]], CODON_TO_INDEX[pair[3:]]
             table[i, j] = score
         return table
-    cpb_table = xp.asarray(cached_stat(cpb, 'cpb_table', _build_cpb_table))
+    cpb_table_np = cached_stat(cpb, 'cpb_table', _build_cpb_table)
+    cpb_table = xp.asarray(cpb_table_np)
 
-    pair_scores = cpb_table[codon_idx[:, :-1], codon_idx[:, 1:]]  # (P, N-1)
+    pair_scores = cpb_table[codon_idx[:, :-1], codon_idx[:, 1:]]  # (P, N-1), raw favorability, high=good
 
-    span = max(cpb.windowsize - 1, 2)
-    pair_span = span - 1
-    num_windows = max(N - cpb.windowsize, 0)
-    if num_windows > 0 and pair_span >= 1 and pair_scores.shape[1] >= pair_span:
-        win_scores = _sliding_window_view(xp, pair_scores, pair_span, axis=1)[:, :num_windows].mean(axis=2)
-    else:
-        win_scores = xp.zeros((P, num_windows), dtype=float)
-
-    win_transform = cached_normal_transform(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
-    win_z = win_transform.transform_array(win_scores, xp=xp) ** 2
-    win_change = windowed_average_batched(xp, win_z, N, winsize)  # (P, N)
+    # Local layer: distance from optimal (see change_vector._codon_pair_
+    # bias_term's docstring) -- cpb_lit is a fixed literal table, so its max
+    # is cached once rather than rescanned every call.
+    max_score = cached_stat(cpb, 'cpb_max_score', lambda: max(cpb.cpb_lit.values()))
+    pair_distance = max_score - pair_scores  # (P, N-1)
 
     pair_change = xp.zeros((P, N), dtype=float)
-    pair_change[:, 0] = pair_scores[:, 0]
-    pair_change[:, -1] = pair_scores[:, -1]
+    pair_change[:, 0] = pair_distance[:, 0]
+    pair_change[:, -1] = pair_distance[:, -1]
     if N > 2:
-        pair_change[:, 1:-1] = (pair_scores[:, :-1] + pair_scores[:, 1:]) / 2
+        pair_change[:, 1:-1] = (pair_distance[:, :-1] + pair_distance[:, 1:]) / 2
 
-    return win_change * pair_change
+    # Global multiplier: how far BELOW cpbPerGene's mean (natural genes'
+    # own per-gene average pair scores) this candidate's own average sits
+    # -- asymmetric on purpose (see change_vector._codon_pair_bias_term's
+    # matching comment): under-mean CPB amplifies local mutation pressure,
+    # above-mean doesn't, since over-optimizing CPB specifically is already
+    # checked by the change vector's overall term interplay, not by this
+    # term punishing "too good." Clamping z to <=0 before squaring means
+    # at/above the mean the multiplier is exactly 1.0 (neutral, not zero).
+    # overall_cpb matches cpbPerGene's own construction exactly (mean of a
+    # gene's own pair scores).
+    overall_cpb = pair_scores.mean(axis=1)  # (P,)
+    seq_transform = cached_normal_transform(cpb, 'cpbPerGene', cpb.cpbPerGene)
+    below_mean_z = xp.minimum(seq_transform.transform_array(overall_cpb, xp=xp), 0.0)  # (P,)
+    global_multiplier = 1.0 + below_mean_z ** 2  # (P,)
+
+    return pair_change * global_multiplier.reshape(P, 1)
 
 
 def batch_gc_term(xp, codon_idx, gc, locvec: list, winsize: int = 15):

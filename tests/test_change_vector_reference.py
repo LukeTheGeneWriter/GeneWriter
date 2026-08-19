@@ -98,29 +98,36 @@ def _ref_codon_usage_term(sol, ca, winsize=15):
     return [straight_z[i] * score_zs[i] + straight_z[i] * dist_zs[i] for i in range(len(sol))]
 
 
-def _ref_codon_pair_bias_term(sol, cpb, winsize=15):
+def _ref_codon_pair_bias_term(sol, cpb):
     if len(sol) < 2:
         return [0.0] * len(sol)
     pairs = [sol[i] + sol[i + 1] for i in range(len(sol) - 1)]
     pair_scores = [cpb.cpb_lit[p] for p in pairs]
-    span = max(cpb.windowsize - 1, 2)
-    wins = [sol[i:i + span] for i in range(0, max(len(sol) - cpb.windowsize, 0))]
-    win_scores = []
-    for win in wins:
-        win_pairs = [win[i] + win[i + 1] for i in range(len(win) - 1)]
-        win_scores.append(sum(cpb.cpb_lit[p] for p in win_pairs) / len(win_pairs) if win_pairs else 0.0)
-    win_fit = cached_normal_transform(cpb, 'cpbPerWindow', cpb.cpbPerWindow)
-    win_z = [win_fit.transform(v) ** 2 for v in win_scores]
-    win_change = _ref_windowed_average(win_z, len(sol), winsize)
+
+    # Distance from optimal: the single best-scoring pair in the whole
+    # lookup is 0 distance (already optimal); a rare/poor pairing is far
+    # below that ceiling. See change_vector._codon_pair_bias_term's
+    # docstring for the full design this mirrors.
+    max_score = max(cpb.cpb_lit.values())
+    pair_distance = [max_score - s for s in pair_scores]
+
     pair_change = []
     for i in range(len(sol)):
         if i == 0:
-            pair_change.append(pair_scores[0])
+            pair_change.append(pair_distance[0])
         elif i == len(sol) - 1:
-            pair_change.append(pair_scores[-1])
+            pair_change.append(pair_distance[-1])
         else:
-            pair_change.append((pair_scores[i - 1] + pair_scores[i]) / 2)
-    return [win_change[i] * pair_change[i] for i in range(len(sol))]
+            pair_change.append((pair_distance[i - 1] + pair_distance[i]) / 2)
+
+    # Asymmetric on purpose -- see change_vector._codon_pair_bias_term's
+    # matching comment: only below-mean deviation amplifies.
+    overall_cpb = sum(pair_scores) / len(pair_scores)
+    seq_fit = cached_normal_transform(cpb, 'cpbPerGene', cpb.cpbPerGene)
+    below_mean_z = min(seq_fit.transform(overall_cpb), 0.0)
+    global_multiplier = 1.0 + below_mean_z ** 2
+
+    return [v * global_multiplier for v in pair_change]
 
 
 def _ref_gc_term(sol, gc, locvec, winsize=15):
