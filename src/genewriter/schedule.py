@@ -81,7 +81,9 @@ from .ga import (
     flatten_generation,
     generate_seed,
     kill_off,
+    kill_off_by_term,
     kill_off_outside_natural_range,
+    mark_protected,
     merge_replicate,
     merge_replicate_exact,
     merge_replicates_batch,
@@ -376,10 +378,62 @@ def _step_kill_off(pop: list, ctx: ScheduleContext, params: dict) -> list:
     """Proportional cull: remove `percent_cut`% (default 30) of total
     replicate count, weighted toward individuals most in need of mutation.
     See ga.kill_off(). Refreshes change vectors exactly first -- see module
-    docstring."""
+    docstring.
+
+    `protect` (optional): list of [metric, top_fraction] pairs, same shape
+    as the "protect" step's `criteria` -- exempts qualifying individuals
+    from THIS cull only, without permanently setting .protected the way
+    the "protect" step does. e.g. {"kind": "kill_off", "percent_cut": 40,
+    "protect": [["fitness", 0.1]]} spares the top 10% by fitness from just
+    this round's stochastic dying, but they're fair game again next time
+    unless a separate "protect" step (or this same `protect` option on a
+    later kill_off) says otherwise. See ga.kill_off()'s `protect_criteria`
+    param."""
     percent_cut = params.get("percent_cut", 30)
+    protect_criteria = params.get("protect")
     pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
-    return kill_off(pop, ctx.weights, percent_cut=percent_cut)
+    return kill_off(pop, ctx.weights, percent_cut=percent_cut, protect_criteria=protect_criteria)
+
+
+@register_step("kill_off_by_term")
+def _step_kill_off_by_term(pop: list, ctx: ScheduleContext, params: dict) -> list:
+    """Like "kill_off", but the cull pressure comes from a single
+    change-vector term's own score instead of the full weighted aggregate
+    -- e.g. {"kind": "kill_off_by_term", "term": "CodonPairBias",
+    "percent_cut": 20} removes 20% of total replicate count weighted
+    toward the worst CPB offenders specifically, without that pressure
+    being diluted by every other term. See ga.kill_off_by_term(). Refreshes
+    change vectors exactly first -- see module docstring.
+
+    `term` is required (must be a registered change-vector term name, e.g.
+    'CodonPairBias', 'Uracil' -- see change_vector.registered_terms()).
+    `percent_cut` defaults to 30, same as "kill_off". `protect` (optional):
+    same one-cull-only exemption as "kill_off"'s `protect` -- see that
+    step's docstring."""
+    term = params["term"]
+    percent_cut = params.get("percent_cut", 30)
+    protect_criteria = params.get("protect")
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
+    return kill_off_by_term(pop, term, percent_cut=percent_cut, protect_criteria=protect_criteria, weights=ctx.weights)
+
+
+@register_step("protect")
+def _step_protect(pop: list, ctx: ScheduleContext, params: dict) -> list:
+    """Shields qualifying individuals from "kill_off"/"kill_off_by_term"/
+    "select" for the rest of the run (until a brand-new genotype replaces
+    them). See ga.mark_protected() for the full semantics -- union across
+    criteria, "lowest score = best", monotonic (never unprotects).
+
+    `criteria` is required: a list of [metric, top_fraction] pairs, e.g.
+    {"kind": "protect", "criteria": [["fitness", 0.10], ["Uracil", 0.40]]}
+    protects the best 10% by overall weighted fitness UNION the best 40%
+    by Uracil depletion alone. `metric` is "fitness" or any registered
+    change-vector term name. Refreshes change vectors exactly first, same
+    as "kill_off"/"select"/"flatten" -- a protection decision needs
+    accurate scores, not growth's cheaper diffed approximation."""
+    criteria = params["criteria"]
+    pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
+    return mark_protected(pop, ctx.weights, criteria)
 
 
 @register_step("natural_range_cutoff")

@@ -30,15 +30,16 @@ Kmer is now batched too (batch_kmer_term()): its substring->score lookup
 was a hash-map operation over arbitrary-length k-mer strings, not a natural
 fit for array vectorization -- fixed by re-encoding every k-mer window as a
 base-4 integer (A/C/G/T -> 0..3, codon_tables.NT_TO_BASE4) so the baseline's
-fold_enrich scores become one flat (num_buckets, 4**k) array, and the
-per-window lookup becomes array indexing (`table[bucket, code]`) instead of
-a dict lookup -- see batch_kmer_term()'s docstring for the full design and
-its memory-scaling caveat at large k.
+fold_enrich values (run through change_vector._fold_enrich_to_needs_fixing_
+score() -- NOT used raw, see that function's docstring) become one flat
+(num_buckets, 4**k) array, and the per-window lookup becomes array indexing
+(`table[bucket, code]`) instead of a dict lookup -- see batch_kmer_term()'s
+docstring for the full design and its memory-scaling caveat at large k.
 """
 
 import numpy as np
 
-from .change_vector import cached_normal_transform, cached_stat, calculate_change_vector, registered_terms
+from .change_vector import _fold_enrich_to_needs_fixing_score, cached_normal_transform, cached_stat, calculate_change_vector, registered_terms
 from .codon_tables import (
     AA_CODONS,
     CODON_FREQ_BY_INDEX,
@@ -398,19 +399,25 @@ def _encode_kmer_string(seq: str, k: int) -> int:
 
 
 def _build_kmer_score_table(kmer_by_seq: dict, k: int) -> np.ndarray:
-    """(num_buckets, 4**k) float array of fold_enrich scores for one k,
-    built once per batch_kmer_term() call (not per individual -- same cost
-    class as batch_codon_pair_bias_term() building its cpb_table from a
-    dict). Default 1.0 for a k-mer/bucket combination never observed in the
-    baseline, matching _kmer_term's identical `entry is None` /
-    `.get(bucket, {}).get('fold_enrich', 1.0)` defaults exactly."""
-    table = np.ones((len(_WINDOW_BUCKET_NAMES), 4 ** k), dtype=float)
+    """(num_buckets, 4**k) float array of "needs fixing" scores for one k
+    (see change_vector._fold_enrich_to_needs_fixing_score() -- NOT raw
+    fold_enrich directly, since 2026-08-19: a k-mer's literal fold_enrich
+    has "higher = more over-represented", not "higher = worse", the
+    opposite of every other term's convention), built once per
+    batch_kmer_term() call (not per individual -- same cost class as
+    batch_codon_pair_bias_term() building its cpb_table from a dict).
+    Default fold_enrich=1.0 (transformed) for a k-mer/bucket combination
+    never observed in the baseline, matching _kmer_term's identical
+    `entry is None` / `.get(bucket, {}).get('fold_enrich', 1.0)` defaults
+    exactly, just run through the same transform as every real entry."""
+    default_score = _fold_enrich_to_needs_fixing_score(1.0)
+    table = np.full((len(_WINDOW_BUCKET_NAMES), 4 ** k), default_score, dtype=float)
     for seq, buckets in kmer_by_seq.items():
         idx = _encode_kmer_string(seq, k)
         for b, name in enumerate(_WINDOW_BUCKET_NAMES):
             entry = buckets.get(name)
             if entry is not None:
-                table[b, idx] = entry.get('fold_enrich', 1.0)
+                table[b, idx] = _fold_enrich_to_needs_fixing_score(entry.get('fold_enrich', 1.0))
     return table
 
 
@@ -424,8 +431,10 @@ def batch_kmer_term(xp, codon_idx, kmer, locvec: list, winsize: int = 15):
     which doesn't fit a numeric array lookup the way every other term's
     baseline data does. Fixed here by re-encoding every k-mer window as a
     base-4 integer (A/C/G/T -> 0..3, codon_tables.NT_TO_BASE4/
-    NT_BASE4_BY_CODON_INDEX) so the baseline's fold_enrich scores become one
-    flat (num_buckets, 4**k) table (_build_kmer_score_table()) and the
+    NT_BASE4_BY_CODON_INDEX) so the baseline's fold_enrich values (each run
+    through change_vector._fold_enrich_to_needs_fixing_score() -- NOT used
+    raw, see that function's docstring for why) become one flat
+    (num_buckets, 4**k) table (_build_kmer_score_table()) and the
     per-window score becomes one `table[bucket, code]` fancy-index gather
     across the *whole batch at once*, instead of a per-window,
     per-individual Python dict lookup.

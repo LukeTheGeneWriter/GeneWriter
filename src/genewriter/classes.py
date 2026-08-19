@@ -61,6 +61,15 @@ class Proposed_Solution:
     codons: list
     number: int
     change_vecs: dict
+    # Shields this individual from ga.kill_off()/kill_off_by_term()/
+    # select_survivors() -- set by ga.mark_protected() (see that function's
+    # docstring), never inherited by a new genotype (growth's freshly
+    # created individuals always start unprotected, same as .number/
+    # .change_vecs being freshly computed rather than copied from a
+    # parent). Trailing default so every existing positional
+    # Proposed_Solution(codons, number, change_vecs) call across the
+    # codebase stays valid unchanged.
+    protected: bool = False
 
 
 @dataclass

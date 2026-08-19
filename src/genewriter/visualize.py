@@ -43,10 +43,12 @@ from .codon_tables import encode_codons
 def load_population_json(path: str) -> list:
     """Reload a population saved by ga.save_gen() -- lets this be pointed
     at a previously-saved generation, not just an in-memory `pop` right
-    after a live run_ga()/run_schedule() call."""
+    after a live run_ga()/run_schedule() call. entry.get('protected',
+    False) rather than entry['protected'] -- a checkpoint saved before
+    Proposed_Solution.protected existed has no such key at all."""
     with open(path) as f:
         data = json.load(f)
-    return [Proposed_Solution(entry['codons'], entry['number'], entry['change_vecs']) for entry in data]
+    return [Proposed_Solution(entry['codons'], entry['number'], entry['change_vecs'], entry.get('protected', False)) for entry in data]
 
 
 _GEN_FILENAME_RE = re.compile(r"gen(\d+)\.json$")

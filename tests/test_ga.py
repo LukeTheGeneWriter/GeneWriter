@@ -75,6 +75,180 @@ def test_kill_off_terminates_when_every_individual_is_at_minimum(aa_seq, weights
     assert result == []
 
 
+def test_kill_off_never_reduces_a_protected_individuals_count(aa_seq, weights):
+    n = len(aa_seq)
+    unfit_vecs = {'RareCodons': [1000.0] * n, 'CodonUsage': [1000.0] * n,
+                  'CodonPairBias': [1000.0] * n, 'GC': [1000.0] * n, 'Kmer': [1000.0] * n}
+    protected = Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(unfit_vecs), protected=True)
+    others = [Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(unfit_vecs)) for _ in range(3)]
+    pop = [protected] + others
+
+    result = ga.kill_off(pop, weights, percent_cut=100)
+    kept = {tuple(p.codons): p for p in result}
+    assert tuple(protected.codons) in kept
+    assert kept[tuple(protected.codons)].number == 5
+
+
+def test_kill_off_by_term_targets_only_the_specified_term(aa_seq):
+    """Weighted toward the worst scorers on ONE term, not the aggregate --
+    CodonPairBias is bad for half the population and good for the other
+    half, with every OTHER term identical for everyone, so a plain
+    (aggregate) kill_off would show no preference at all but
+    kill_off_by_term('CodonPairBias', ...) should strongly favor keeping
+    the CPB-good half."""
+    n = len(aa_seq)
+    good_cpb = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {
+        'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+        'CodonPairBias': [0.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n,
+    }) for _ in range(10)]
+    bad_cpb = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {
+        'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+        'CodonPairBias': [1000.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n,
+    }) for _ in range(10)]
+
+    survivors_from_good = 0
+    trials = 30
+    for _ in range(trials):
+        pop = [Proposed_Solution(list(p.codons), p.number, dict(p.change_vecs)) for p in good_cpb + bad_cpb]
+        result = ga.kill_off_by_term(pop, 'CodonPairBias', percent_cut=50)
+        result_codons = {tuple(p.codons) for p in result}
+        survivors_from_good += sum(1 for p in good_cpb if tuple(p.codons) in result_codons)
+
+    # Expected under the score-weighted bias: nearly all 10 good-CPB slots
+    # survive a 50%-of-mass cut every trial (chance would be ~5/10).
+    assert survivors_from_good / trials > 8.0
+
+
+def test_kill_off_by_term_rejects_unknown_term(aa_seq, weights):
+    n = len(aa_seq)
+    pop = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {
+        'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+        'CodonPairBias': [0.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n,
+    })]
+    with pytest.raises(ValueError, match="Unknown metric"):
+        ga.kill_off_by_term(pop, "NotARealTerm", percent_cut=30)
+
+
+def test_kill_off_protect_criteria_shields_without_setting_protected(aa_seq, weights):
+    """A one-off exemption, not a permanent flag: an individual spared by
+    `protect_criteria` this cull must NOT come out with .protected=True,
+    and must be a fair target again on a later kill_off call that doesn't
+    pass protect_criteria."""
+    n = len(aa_seq)
+    unfit_vecs = {'RareCodons': [1000.0] * n, 'CodonUsage': [1000.0] * n,
+                  'CodonPairBias': [1000.0] * n, 'GC': [1000.0] * n, 'Kmer': [1000.0] * n}
+    fit_vecs = _zero_vecs(n)
+    fit = Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(fit_vecs))
+    unfit = [Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(unfit_vecs)) for _ in range(3)]
+    pop = [fit] + unfit
+
+    result = ga.kill_off(pop, weights, percent_cut=100, protect_criteria=[("fitness", 0.25)])
+    kept = {tuple(p.codons): p for p in result}
+    assert tuple(fit.codons) in kept
+    assert kept[tuple(fit.codons)].number == 5
+    assert kept[tuple(fit.codons)].protected is False
+
+    # No protect_criteria this time -- the same individual is now killable.
+    result2 = ga.kill_off(result, weights, percent_cut=100)
+    assert result2 == []
+
+
+def test_kill_off_by_term_protect_criteria_shields_without_setting_protected(aa_seq):
+    n = len(aa_seq)
+    good_cpb = {'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+                'CodonPairBias': [0.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n}
+    bad_cpb = {'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+               'CodonPairBias': [1000.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n}
+    good = Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(good_cpb))
+    bad = [Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(bad_cpb)) for _ in range(3)]
+    pop = [good] + bad
+
+    # protect_criteria targets fitness, not CodonPairBias -- confirms the
+    # exemption ranking is independent of what the cull itself is scored
+    # by. All-zero-everything `good` is also the best by "fitness" here.
+    weights = {'RareCodons': 1.0, 'CodonUsage': 1.0, 'CodonPairBias': 1.0, 'GC': 1.0, 'Kmer': 1.0}
+    result = ga.kill_off_by_term(pop, 'CodonPairBias', percent_cut=100,
+                                  protect_criteria=[("fitness", 0.25)], weights=weights)
+    kept = {tuple(p.codons): p for p in result}
+    assert tuple(good.codons) in kept
+    assert kept[tuple(good.codons)].protected is False
+
+
+def test_kill_off_by_term_never_reduces_a_protected_individuals_count(aa_seq):
+    n = len(aa_seq)
+    bad_cpb = {'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+               'CodonPairBias': [1000.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n}
+    protected = Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(bad_cpb), protected=True)
+    others = [Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(bad_cpb)) for _ in range(3)]
+    pop = [protected] + others
+
+    result = ga.kill_off_by_term(pop, 'CodonPairBias', percent_cut=100)
+    kept = {tuple(p.codons): p for p in result}
+    assert tuple(protected.codons) in kept
+    assert kept[tuple(protected.codons)].number == 5
+
+
+def test_mark_protected_protects_the_best_fraction_by_term(aa_seq, weights):
+    n = len(aa_seq)
+    good = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {
+        'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+        'CodonPairBias': [0.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n,
+    }) for _ in range(2)]
+    bad = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {
+        'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+        'CodonPairBias': [1000.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n,
+    }) for _ in range(8)]
+    pop = good + bad
+
+    ga.mark_protected(pop, weights, criteria=[("CodonPairBias", 0.2)])
+    protected_codons = {tuple(p.codons) for p in pop if p.protected}
+    assert protected_codons == {tuple(p.codons) for p in good}
+
+
+def test_mark_protected_unions_multiple_criteria(aa_seq, weights):
+    n = len(aa_seq)
+
+    def _vecs(rare, cu, cpb, gc, kmer, uracil):
+        return {'RareCodons': [rare] * n, 'CodonUsage': [cu] * n, 'CodonPairBias': [cpb] * n,
+                'GC': [gc] * n, 'Kmer': [kmer] * n, 'Uracil': [uracil] * n}
+
+    fitness_best = Proposed_Solution(ga.generate_seed(aa_seq), 1, _vecs(0, 0, 0, 0, 0, 50))
+    uracil_best = Proposed_Solution(ga.generate_seed(aa_seq), 1, _vecs(100, 100, 100, 100, 100, 0))
+    others = [Proposed_Solution(ga.generate_seed(aa_seq), 1, _vecs(100, 100, 100, 100, 100, 50)) for _ in range(3)]
+    pop = [fitness_best, uracil_best] + others
+    weights_with_uracil = dict(weights, Uracil=1.0)
+
+    ga.mark_protected(pop, weights_with_uracil, criteria=[("fitness", 0.2), ("Uracil", 0.2)])
+    assert fitness_best.protected
+    assert uracil_best.protected
+    assert not any(p.protected for p in others)
+
+
+def test_mark_protected_does_not_unprotect_previously_protected_individuals(aa_seq, weights):
+    n = len(aa_seq)
+    p1 = Proposed_Solution(ga.generate_seed(aa_seq), 1, _zero_vecs(n), protected=True)
+    p2 = Proposed_Solution(ga.generate_seed(aa_seq), 1, {
+        'RareCodons': [1000.0] * n, 'CodonUsage': [1000.0] * n, 'CodonPairBias': [1000.0] * n,
+        'GC': [1000.0] * n, 'Kmer': [1000.0] * n,
+    })
+    pop = [p1, p2]
+    # A criterion nobody qualifies for (top_fraction=0) must still leave
+    # p1's pre-existing protection intact rather than resetting it.
+    ga.mark_protected(pop, weights, criteria=[("fitness", 0.0)])
+    assert p1.protected
+    assert not p2.protected
+
+
+def test_mark_protected_rejects_unknown_metric(aa_seq, weights):
+    n = len(aa_seq)
+    pop = [Proposed_Solution(ga.generate_seed(aa_seq), 1, {
+        'RareCodons': [0.0] * n, 'CodonUsage': [0.0] * n,
+        'CodonPairBias': [0.0] * n, 'GC': [0.0] * n, 'Kmer': [0.0] * n,
+    })]
+    with pytest.raises(ValueError, match="Unknown metric"):
+        ga.mark_protected(pop, weights, criteria=[("NotAThing", 0.5)])
+
+
 def test_kill_off_outside_natural_range_drops_only_the_outlier_genotype(analysis_objects):
     """Hard cutoff, unlike kill_off(): a genotype whose own aggregate
     RareCodons rate is 9 std devs from the natural per-gene baseline mean
@@ -309,6 +483,22 @@ def test_select_survivors_is_a_noop_when_already_at_or_under_target(aa_seq, weig
     pop = [Proposed_Solution(ga.generate_seed(aa_seq), 1, _zero_vecs(len(aa_seq))) for _ in range(3)]
     result = ga.select_survivors(pop, weights, target_size=10)
     assert len(result) == 3
+
+
+def test_select_survivors_never_removes_a_protected_individual(aa_seq, weights):
+    """Protection is a hard guarantee, target_size a soft cap it can only
+    be exceeded by -- target_size=0 tries to remove everyone, but the one
+    protected individual (despite scoring as badly as everyone else) must
+    still come back."""
+    n = len(aa_seq)
+    unfit_vecs = {'RareCodons': [1000.0] * n, 'CodonUsage': [1000.0] * n,
+                  'CodonPairBias': [1000.0] * n, 'GC': [1000.0] * n, 'Kmer': [1000.0] * n}
+    protected = Proposed_Solution(ga.generate_seed(aa_seq), 1, dict(unfit_vecs), protected=True)
+    others = [Proposed_Solution(ga.generate_seed(aa_seq), 1, dict(unfit_vecs)) for _ in range(9)]
+    pop = [protected] + others
+
+    result = ga.select_survivors(pop, weights, target_size=0)
+    assert result == [protected]
 
 
 def test_select_survivors_is_biased_toward_keeping_low_score_individuals(aa_seq, weights):

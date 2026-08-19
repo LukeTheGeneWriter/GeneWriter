@@ -307,7 +307,17 @@ CONFIG = dict(
     #   input      {"count": N}                       -- add N random seeds
     #   growth     {"rate", "mutation_chance",         -- reproduce every
     #               "directed_fraction", "lookahead"}     individual
-    #   kill_off   {"percent_cut"}                     -- proportional cull
+    #   kill_off   {"percent_cut", "protect"}          -- proportional cull,
+    #               aggregate weighted score. "protect" (optional):
+    #               [[metric, top_fraction], ...] -- exempt the qualifying
+    #               top_fraction from THIS cull only, without permanently
+    #               setting .protected the way the "protect" step does
+    #   kill_off_by_term {"term", "percent_cut", "protect"} -- proportional
+    #               cull, one term's score only; same optional "protect"
+    #   protect    {"criteria": [[metric, top_fraction], ...]} -- PERMANENTLY
+    #               shield the best top_fraction by "fitness" or one term
+    #               (union across criteria) from kill_off/kill_off_by_term/
+    #               select until a new genotype replaces the individual
     #   select     {"target_size"}                     -- cap distinct pop
     #   flatten    {"recursion_limit"}                 -- breadth trade
     #   save       {}                                  -- checkpoint now

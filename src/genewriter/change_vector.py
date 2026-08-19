@@ -556,6 +556,35 @@ def _gc_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsi
     return [mutable[i] * (per_codon[i] + seq_deviation) for i in range(len(sol))]
 
 
+def _fold_enrich_to_needs_fixing_score(fold_enrich: float) -> float:
+    """Converts a k-mer's literal fold_enrich (observed/expected count
+    ratio in the natural-gene baseline -- 1.0 = exactly as expected, >1 =
+    over-represented, <1 = under-represented, 0 = never observed at all)
+    into a "how much does this position need fixing" score, matching
+    every other term's "higher score = worse" convention.
+
+    Real asymmetry fixed 2026-08-19 (Luke's finding): the previous version
+    used fold_enrich directly as the score. That's backwards for roughly
+    half the scale -- an over-represented k-mer (fold_enrich=3) scored
+    HIGHER (flagged as worse) than an under-represented one (fold_enrich=
+    0.1 scored only 0.1, barely flagged at all), even though an unusually
+    ABSENT k-mer is at least as suspicious a deviation from nature as an
+    unusually common one -- arguably more so, since it means this exact
+    local context essentially never occurs in real genes at all.
+
+    1/(fold_enrich + 0.1) (Luke's chosen formula, not a z-score/distance-
+    from-optimal the way CodonPairBias's redesign used -- k values here
+    range 2-10, each with its own baseline and no single shared "best
+    possible" fold_enrich to measure distance from, unlike CodonPairBias's
+    one literal cpb_lit table) fixes the direction and stays finite
+    everywhere fold_enrich >= 0 can reach: 10.0 at fold_enrich=0 (never
+    observed -- the worst case, now correctly the HIGHEST score) falling
+    toward 0 as fold_enrich grows (heavily over-represented -- correctly
+    closer to benign). The +0.1 floor is a deliberate bound, not a
+    smoothing nicety -- without it fold_enrich=0 would divide by zero."""
+    return 1.0 / (fold_enrich + 0.1)
+
+
 @register_term('Kmer')
 def _kmer_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsize: int = 15) -> list:
     kmer = analysis_objects.kmer
@@ -598,9 +627,10 @@ def _kmer_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, win
         win_scores = []
         for seq_win, bucket in zip(seq_wins, majority_buckets):
             entry = kmer_by_seq.get(seq_win)
-            win_scores.append(1.0 if entry is None else entry.get(bucket, {}).get('fold_enrich', 1.0))
+            raw_fold_enrich = 1.0 if entry is None else entry.get(bucket, {}).get('fold_enrich', 1.0)
+            win_scores.append(_fold_enrich_to_needs_fixing_score(raw_fold_enrich))
 
-        overall = sum(win_scores) / len(win_scores) if win_scores else 1.0
+        overall = sum(win_scores) / len(win_scores) if win_scores else _fold_enrich_to_needs_fixing_score(1.0)
         by_pos = _windowed_average(win_scores, len(continuous), winsize)
         by_pos_arr = np.asarray(by_pos, dtype=float) * overall
         num_full_codons = len(by_pos_arr) // 3

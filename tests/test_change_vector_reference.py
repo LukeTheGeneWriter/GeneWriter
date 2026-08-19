@@ -183,11 +183,12 @@ def _ref_kmer_term(sol, kmer, locvec, winsize=15):
             majority_loc = max(set(loc_win), key=loc_win.count)
             entry = kmer_by_seq.get(seq_win)
             if entry is None:
-                win_scores.append(1.0)
+                win_scores.append(1.0 / 1.1)
                 continue
             bucket = TAG_TO_WINDOW_BUCKET[majority_loc]
-            win_scores.append(entry.get(bucket, {}).get('fold_enrich', 1.0))
-        overall = sum(win_scores) / len(win_scores) if win_scores else 1.0
+            raw_fold_enrich = entry.get(bucket, {}).get('fold_enrich', 1.0)
+            win_scores.append(1.0 / (raw_fold_enrich + 0.1))
+        overall = sum(win_scores) / len(win_scores) if win_scores else 1.0 / 1.1
         by_pos = _ref_windowed_average(win_scores, len(continuous), winsize)
         by_pos = [v * overall for v in by_pos]
         per_codon = [np.mean(by_pos[i:i + 3]) if by_pos[i:i + 3] else 0.0 for i in range(0, len(by_pos), 3)]

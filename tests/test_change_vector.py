@@ -168,6 +168,46 @@ def test_kmer_term_does_not_drop_last_codon(aa_seq, analysis_objects):
     assert vecs_a['Kmer'][-1] != 0.0 or vecs_b['Kmer'][-1] != 0.0
 
 
+def test_fold_enrich_to_needs_fixing_score_bounds_and_direction():
+    from genewriter.change_vector import _fold_enrich_to_needs_fixing_score as f
+
+    # Never-observed (fold_enrich=0) is the worst case -- bounded at 10,
+    # not unbounded (the +0.1 floor is load-bearing, not just smoothing).
+    assert f(0.0) == pytest.approx(10.0)
+    # Neutral (exactly as expected in nature) sits well below that.
+    assert f(1.0) == pytest.approx(1.0 / 1.1)
+    # Heavily over-represented approaches 0 (benign), never negative.
+    assert 0.0 <= f(1000.0) < 0.01
+    # Monotonically decreasing in fold_enrich -- rarer is always scored
+    # worse than more common, the direction the old raw-fold_enrich
+    # formula had backwards.
+    assert f(0.01) > f(0.1) > f(1.0) > f(10.0) > f(1000.0)
+
+
+def test_kmer_term_penalizes_under_represented_kmers_more_than_over_represented(aa_seq, analysis_objects):
+    """The actual fix, end to end (not just the helper in isolation): a
+    k-mer that's rare in nature (low fold_enrich) must score WORSE (higher
+    change-vector value) than one that's common (high fold_enrich) -- the
+    old raw-fold_enrich formula had this backwards."""
+    sol = _random_solution(aa_seq)
+
+    def _kmer_with_uniform_fold_enrich(value):
+        bases = "ACGT"
+        dimers = {
+            a + b: {bucket: {'p': 0.01, 'fold_enrich': value} for bucket in ('ExonL50', 'Exon', 'ExonR50')}
+            for a in bases for b in bases
+        }
+        return dataclasses.replace(analysis_objects.kmer, kmer_dict={'2': dimers})
+
+    rare_ao = dataclasses.replace(analysis_objects, kmer=_kmer_with_uniform_fold_enrich(0.01))
+    common_ao = dataclasses.replace(analysis_objects, kmer=_kmer_with_uniform_fold_enrich(100.0))
+
+    rare_scores = calculate_change_vector(sol, rare_ao)['Kmer']
+    common_scores = calculate_change_vector(sol, common_ao)['Kmer']
+
+    assert sum(rare_scores) > sum(common_scores)
+
+
 def test_dist_from_optimal_accepts_plain_codon_strings(aa_seq, analysis_objects):
     """Original bug: dist_from_optimal() was called with windows of plain
     codon strings but its body did `for codon, location in codons`, which

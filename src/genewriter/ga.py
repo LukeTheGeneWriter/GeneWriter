@@ -677,15 +677,25 @@ def select_survivors(pop: list, weights: dict, target_size: int) -> list:
     algorithm for weighted sampling without replacement (ranking by
     ln(u)/w is order-equivalent to ranking by u**(1/w), just numerically
     stable), and runs in O(n log k) via a heap.
+
+    Individuals with .protected == True (see mark_protected()) are never
+    candidates for removal -- if there are more protected individuals than
+    target_size allows, the returned population exceeds target_size rather
+    than removing a protected one; protection is a hard guarantee,
+    target_size a soft cap it can only be exceeded by, never violated.
     """
     pop = list(pop)
     num_to_remove = len(pop) - target_size
     if num_to_remove <= 0:
         return pop
-    die_weights = [_finite_nonneg(score_changevec(p.change_vecs, weights)) for p in pop]
+    removable = [i for i, p in enumerate(pop) if not p.protected]
+    num_to_remove = min(num_to_remove, len(removable))
+    if num_to_remove <= 0:
+        return pop
+    die_weights = [_finite_nonneg(score_changevec(pop[i].change_vecs, weights)) for i in removable]
     keys = [math.log(max(random.random(), 1e-300)) / w for w in die_weights]
-    victim_indices = set(heapq.nlargest(num_to_remove, range(len(pop)), key=lambda i: keys[i]))
-    return [p for i, p in enumerate(pop) if i not in victim_indices]
+    victims = {removable[j] for j in heapq.nlargest(num_to_remove, range(len(removable)), key=lambda j: keys[j])}
+    return [p for i, p in enumerate(pop) if i not in victims]
 
 
 def _flatten_round(pop: list, aa_seq: str, analysis_objects: AnalysisObjects, locvec: list = None, xp=None, chunk_size: int = None) -> list:
@@ -797,10 +807,90 @@ def flatten_generation(
     return pop
 
 
-def kill_off(pop: list, weights: dict, percent_cut: int = 30) -> list:
+def _score_by_metric(pop: list, weights: dict, metric: str) -> list:
+    """One score per individual for `metric` -- "fitness" (score_changevec(),
+    the full weighted aggregate) or a single registered change-vector term
+    name (summed the same way score_changevec() reduces each term before
+    weighting: sum(), not mean, for a directly comparable scale). Shared by
+    mark_protected()/_top_fraction_indices() and kill_off_by_term(). Raises
+    ValueError naming the valid options for an unrecognized term, rather
+    than a bare KeyError."""
+    if metric == "fitness":
+        return [_finite_nonneg(score_changevec(p.change_vecs, weights)) for p in pop]
+    if pop and metric not in pop[0].change_vecs:
+        raise ValueError(f"Unknown metric {metric!r} -- must be 'fitness' or one of {sorted(pop[0].change_vecs)}.")
+    return [_finite_nonneg(sum(p.change_vecs[metric])) for p in pop]
+
+
+def _top_fraction_indices(pop: list, weights: dict, criteria: list) -> set:
+    """Indices into pop that rank in the top `top_fraction` (best -- i.e.
+    lowest score, "needs the least mutation") for ANY of the given
+    (metric, top_fraction) pairs in `criteria` -- a UNION across criteria,
+    not an intersection. Read-only ranking step shared by two different
+    USES: mark_protected() turns the result into a permanent
+    Proposed_Solution.protected flag; kill_off()/kill_off_by_term()'s
+    optional `protect_criteria` uses it to exempt those indices from just
+    one cull, without ever touching .protected. See mark_protected()'s
+    docstring for what "lowest score = best" means and why."""
+    qualifying = set()
+    for metric, top_fraction in criteria:
+        scores = _score_by_metric(pop, weights, metric)
+        cutoff_count = math.ceil(len(pop) * top_fraction)
+        if cutoff_count <= 0:
+            continue
+        qualifying.update(heapq.nsmallest(cutoff_count, range(len(pop)), key=lambda i: scores[i]))
+    return qualifying
+
+
+def _kill_off_by_scores(pop: list, scores: list, percent_cut: int, immune: set = None) -> list:
+    """Shared weighted-random mass-removal loop behind kill_off() and
+    kill_off_by_term() -- percent_cut% of TOTAL replicate mass removed,
+    weighted toward high-score individuals (score = "how much this
+    individual needs mutation", whatever the caller's `scores` measures),
+    one unit at a time; an individual whose count reaches 0 is dropped.
+    The two callers differ only in what "most in need" means -- kill_off()'s
+    weighted aggregate score_changevec() vs. kill_off_by_term()'s single
+    term.
+
+    Individuals with .protected == True, OR whose index is in `immune`
+    (default none -- see kill_off()/kill_off_by_term()'s `protect_criteria`,
+    computed via _top_fraction_indices()), are never candidates: their
+    score is forced to 0 up front (same mechanism the loop already uses to
+    retire an exhausted individual), so random.choices() can never select
+    them regardless of how badly they'd otherwise score. The loop's own
+    stop condition checks the (possibly zeroed) scores directly rather
+    than raw .number, so it still terminates correctly even when every
+    remaining individual with mass left is protected/immune.
+    """
+    immune = immune or ()
+    total = sum(p.number for p in pop)
+    num_to_kill = total * percent_cut // 100
+    scores = [0.0 if (p.protected or i in immune or p.number <= 0) else s for i, (p, s) in enumerate(zip(pop, scores))]
+
+    while num_to_kill > 0 and any(s > 0 for s in scores):
+        idx = random.choices(range(len(pop)), weights=scores)[0]
+        pop[idx].number -= 1
+        num_to_kill -= 1
+        if pop[idx].number <= 0:
+            scores[idx] = 0.0
+    return [p for p in pop if p.number > 0]
+
+
+def kill_off(pop: list, weights: dict, percent_cut: int = 30, protect_criteria: list = None) -> list:
     """Reduce the population's total replicate count by percent_cut%,
     weighted toward individuals whose change vector says they most need it,
-    and drop any individual whose count reaches zero.
+    and drop any individual whose count reaches zero. See
+    _kill_off_by_scores() for the shared mechanics, including how
+    .protected individuals (mark_protected()) are shielded.
+
+    protect_criteria: optional list of (metric, top_fraction) pairs, same
+    shape/semantics as mark_protected()'s `criteria` -- individuals that
+    qualify are exempt from THIS cull only (see _top_fraction_indices()),
+    without ever setting .protected. Use this for "don't let this
+    particular stochastic cull touch the top 10% by fitness" as a one-off,
+    vs. mark_protected()/the "protect" schedule step's permanent-until-
+    replaced version of the same ranking. None (default): unchanged, only
+    .protected individuals are exempt.
 
     The original floored `number` at 1 (`if pop[i].number > 1: ...`), so no
     individual was ever fully culled -- the distinct-individual count could
@@ -811,18 +901,67 @@ def kill_off(pop: list, weights: dict, percent_cut: int = 30) -> list:
     number can reach 0, dead individuals are dropped, and the loop stops
     once nothing is left to kill.
     """
-    total = sum(p.number for p in pop)
-    num_to_kill = total * percent_cut // 100
-    scores = [_finite_nonneg(score_changevec(p.change_vecs, weights)) for p in pop]
+    scores = _score_by_metric(pop, weights, "fitness")
+    immune = _top_fraction_indices(pop, weights, protect_criteria) if protect_criteria else None
+    return _kill_off_by_scores(pop, scores, percent_cut, immune=immune)
 
-    while num_to_kill > 0 and any(p.number > 0 for p in pop):
-        idx = random.choices(range(len(pop)), weights=scores)[0]
-        if pop[idx].number > 0:
-            pop[idx].number -= 1
-            num_to_kill -= 1
-            if pop[idx].number == 0:
-                scores[idx] = 0.0
-    return [p for p in pop if p.number > 0]
+
+def kill_off_by_term(pop: list, term: str, percent_cut: int = 30, protect_criteria: list = None, weights: dict = None) -> list:
+    """Like kill_off(), but weighted toward a single change-vector term's
+    own score instead of the full weighted aggregate -- e.g. "remove 20%
+    of total mass, weighted toward the worst CodonPairBias offenders"
+    without that pressure being diluted/rebalanced by every other term the
+    way weights-based kill_off() is. See _kill_off_by_scores() for the
+    shared removal mechanics, including how .protected individuals are
+    shielded.
+
+    `term` must be a real registered change-vector term name (e.g.
+    'CodonPairBias', 'Uracil') -- raises ValueError naming the valid
+    options otherwise, rather than a bare KeyError.
+
+    protect_criteria/weights: same one-off exemption as kill_off()'s
+    `protect_criteria` -- see its docstring. `weights` is only actually
+    read if protect_criteria includes a "fitness" entry (term-only
+    criteria never need it); required in that case, ignored otherwise."""
+    scores = _score_by_metric(pop, weights, term)
+    immune = _top_fraction_indices(pop, weights, protect_criteria) if protect_criteria else None
+    return _kill_off_by_scores(pop, scores, percent_cut, immune=immune)
+
+
+def mark_protected(pop: list, weights: dict, criteria: list) -> list:
+    """Sets .protected = True on every individual that ranks in the top
+    `top_fraction` (best -- i.e. lowest score, "needs the least mutation")
+    for ANY of the given (metric, top_fraction) pairs in `criteria` -- a
+    UNION across criteria, not an intersection (see _top_fraction_indices(),
+    the shared ranking step this uses). e.g. criteria=[("fitness", 0.10),
+    ("Uracil", 0.40)] protects whichever individuals are in the best 10% by
+    overall weighted fitness, PLUS whichever are in the best 40% by Uracil
+    depletion alone, even if those two groups barely overlap.
+
+    metric is "fitness" (score_changevec(), the same weighted aggregate
+    kill_off()/select_survivors() rank by) or any single registered
+    change-vector term name, summed the same way kill_off_by_term() does.
+    "Lowest score = best" throughout this codebase's convention (every
+    term is a "how much does this position/candidate need fixing" signal)
+    -- top_fraction=0.10 keeps the 10% with the SMALLEST score, not the
+    largest.
+
+    Monotonic: only ever sets .protected True, never clears it -- calling
+    this multiple times across a schedule (or passing multiple criteria at
+    once) only ever grows the protected set -- a PERMANENT shield, unlike
+    kill_off()/kill_off_by_term()'s `protect_criteria`, which uses the
+    identical ranking for a one-cull-only exemption instead. Protected
+    individuals are shielded from kill_off()/kill_off_by_term()/
+    select_survivors() until a brand-new genotype replaces them -- growth's
+    new genotypes always start unprotected, same as
+    Proposed_Solution.protected's own field default.
+
+    Mutates pop's individuals in place and returns pop, matching
+    kill_off()/select_survivors()'s existing mutate-then-filter
+    convention."""
+    for i in _top_fraction_indices(pop, weights, criteria):
+        pop[i].protected = True
+    return pop
 
 
 def kill_off_outside_natural_range(pop: list, analysis_objects: AnalysisObjects, threshold: float) -> list:
@@ -869,7 +1008,7 @@ def save_gen(pop: list, gen: int, save_dir: str, run_name: str) -> str:
     os.makedirs(run_dir, exist_ok=True)
     path = os.path.join(run_dir, f"gen{gen}.json")
     with open(path, 'w') as f:
-        json.dump([{'codons': p.codons, 'number': p.number, 'change_vecs': p.change_vecs} for p in pop], f)
+        json.dump([{'codons': p.codons, 'number': p.number, 'change_vecs': p.change_vecs, 'protected': p.protected} for p in pop], f)
     return path
 
 

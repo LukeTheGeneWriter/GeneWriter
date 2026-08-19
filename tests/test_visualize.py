@@ -168,6 +168,7 @@ def test_save_gen_writes_into_a_run_name_subdirectory(tmp_path, aa_seq, analysis
 
 def test_load_population_json_round_trips_with_save_gen(tmp_path, aa_seq, analysis_objects):
     pop = _population(aa_seq, analysis_objects, n=4)
+    pop[0].protected = True
     path = ga.save_gen(pop, 0, str(tmp_path), "test_run")
     loaded = load_population_json(path)
     assert len(loaded) == len(pop)
@@ -175,6 +176,18 @@ def test_load_population_json_round_trips_with_save_gen(tmp_path, aa_seq, analys
         assert reloaded.codons == original.codons
         assert reloaded.number == original.number
         assert reloaded.change_vecs == original.change_vecs
+        assert reloaded.protected == original.protected
+    assert loaded[0].protected is True
+    assert loaded[1].protected is False
+
+
+def test_load_population_json_defaults_protected_false_for_old_checkpoints(tmp_path):
+    """A checkpoint saved before Proposed_Solution.protected existed has no
+    'protected' key at all -- must load as False, not raise a KeyError."""
+    path = tmp_path / "old_checkpoint.json"
+    path.write_text(json.dumps([{"codons": ["ATG"], "number": 1, "change_vecs": {}}]))
+    loaded = load_population_json(str(path))
+    assert loaded[0].protected is False
 
 
 def test_plot_population_tsne_returns_figure_with_one_subplot_per_mode(aa_seq, analysis_objects, weights):

@@ -16,7 +16,8 @@ def ctx(aa_seq, analysis_objects, weights):
 
 def test_registered_steps_includes_the_builtin_kinds():
     assert set(sched.registered_steps()) == {
-        'input', 'growth', 'directed_growth', 'kill_off', 'natural_range_cutoff', 'select', 'flatten', 'save', 'repeat',
+        'input', 'growth', 'directed_growth', 'kill_off', 'kill_off_by_term', 'protect',
+        'natural_range_cutoff', 'select', 'flatten', 'save', 'repeat',
     }
 
 
@@ -115,6 +116,60 @@ def test_step_kill_off_reduces_total_replicate_count(ctx):
     total_before = sum(p.number for p in seeded)
     result = sched.run_steps(seeded, ctx, [{"kind": "kill_off", "percent_cut": 50}])
     assert sum(p.number for p in result) < total_before
+
+
+def test_step_kill_off_by_term_reduces_total_replicate_count(ctx):
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 20}])
+    total_before = sum(p.number for p in seeded)
+    result = sched.run_steps(seeded, ctx, [{"kind": "kill_off_by_term", "term": "CodonPairBias", "percent_cut": 50}])
+    assert sum(p.number for p in result) < total_before
+
+
+def test_step_kill_off_by_term_requires_term_param(ctx):
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 3}])
+    with pytest.raises(KeyError):
+        sched.run_steps(seeded, ctx, [{"kind": "kill_off_by_term", "percent_cut": 50}])
+
+
+def test_step_kill_off_inline_protect_shields_without_setting_protected(ctx):
+    """The `protect` option on a "kill_off" step is a one-cull-only
+    exemption, not the permanent "protect" step's flag -- the top 20% by
+    fitness must survive a 100% cut here, but come out with .protected
+    still False (a later plain kill_off can still remove them)."""
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 20}])
+    result = sched.run_steps(seeded, ctx, [
+        {"kind": "kill_off", "percent_cut": 100, "protect": [["fitness", 0.2]]},
+    ])
+    assert len(result) > 0
+    assert all(not p.protected for p in result)
+
+
+def test_step_kill_off_by_term_inline_protect_shields_without_setting_protected(ctx):
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 20}])
+    result = sched.run_steps(seeded, ctx, [
+        {"kind": "kill_off_by_term", "term": "CodonPairBias", "percent_cut": 100, "protect": [["fitness", 0.2]]},
+    ])
+    assert len(result) > 0
+    assert all(not p.protected for p in result)
+
+
+def test_step_protect_shields_everyone_when_top_fraction_is_one(ctx):
+    """A protect step with top_fraction=1.0 marks the whole population
+    protected -- a subsequent kill_off must then remove nothing at all."""
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
+    total_before = sum(p.number for p in seeded)
+    protected = sched.run_steps(seeded, ctx, [{"kind": "protect", "criteria": [["fitness", 1.0]]}])
+    assert all(p.protected for p in protected)
+
+    result = sched.run_steps(protected, ctx, [{"kind": "kill_off", "percent_cut": 100}])
+    assert sum(p.number for p in result) == total_before
+    assert len(result) == len(protected)
+
+
+def test_step_protect_requires_criteria_param(ctx):
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 3}])
+    with pytest.raises(KeyError):
+        sched.run_steps(seeded, ctx, [{"kind": "protect"}])
 
 
 def test_step_natural_range_cutoff_cuts_nothing_at_an_astronomical_threshold(ctx):
