@@ -56,11 +56,46 @@ def test_step_input_merges_into_existing_population_rather_than_replacing_it(ctx
     assert sum(p.number for p in result) == 17
 
 
+def test_step_input_clamps_count_to_remaining_sequence_space(monkeypatch, analysis_objects, weights):
+    # "MC": M has 1 synonymous codon, C has 2 -- only 2 distinct sequences
+    # exist for this aa_seq at all, so a requested count of 1000 must be
+    # clamped down to 2, not passed through unchanged.
+    tiny_ctx = sched.ScheduleContext(aa_seq="MC", weights=weights, analysis_objects=analysis_objects)
+    real_seed_population = sched.seed_population
+
+    def _spy_seed_population(new_seeds, *args, **kwargs):
+        _spy_seed_population.seen = len(new_seeds)
+        return real_seed_population(new_seeds, *args, **kwargs)
+
+    monkeypatch.setattr(sched, "seed_population", _spy_seed_population)
+    sched.run_steps([], tiny_ctx, [{"kind": "input", "count": 1000}])
+    assert _spy_seed_population.seen == 2
+
+
 def test_step_growth_reproduces_and_dedups_within_the_step(ctx):
     seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 1}])
     result = sched.run_steps(seeded, ctx, [{"kind": "growth", "rate": 5, "mutation_chance": 0.3}])
     codons_seen = [tuple(p.codons) for p in result]
     assert len(codons_seen) == len(set(codons_seen)), "growth step produced duplicate genotypes as separate entries"
+
+
+def test_step_growth_clamps_rate_to_remaining_sequence_space(monkeypatch, analysis_objects, weights):
+    # "MC" again: space=2, and after seeding one individual only 1 distinct
+    # genotype is left uncovered -- a requested rate of 1000 must clamp down
+    # to that 1 remaining slot, not pass through unchanged (directed_fraction
+    # forced to 0.0 so every replicate takes the random-mutation path this
+    # spy watches).
+    tiny_ctx = sched.ScheduleContext(aa_seq="MC", weights=weights, analysis_objects=analysis_objects)
+    seeded = sched.run_steps([], tiny_ctx, [{"kind": "input", "count": 1}])
+    real_replicate = sched.replicate_and_mutate_random
+
+    def _spy_replicate(sol, aa_seq, nreplicates=10, mutation_rate=0.05):
+        _spy_replicate.seen = nreplicates
+        return real_replicate(sol, aa_seq, nreplicates=nreplicates, mutation_rate=mutation_rate)
+
+    monkeypatch.setattr(sched, "replicate_and_mutate_random", _spy_replicate)
+    sched.run_steps(seeded, tiny_ctx, [{"kind": "growth", "rate": 1000, "directed_fraction": 0.0}])
+    assert _spy_replicate.seen == 1
 
 
 def test_step_kill_off_reduces_total_replicate_count(ctx):
@@ -86,6 +121,25 @@ def test_step_select_caps_population_size(ctx):
     seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 30}])
     result = sched.run_steps(seeded, ctx, [{"kind": "select", "target_size": 5}])
     assert len(result) == 5
+
+
+def test_step_select_clamps_target_size_to_sequence_space(monkeypatch, analysis_objects, weights):
+    # "MC": only 2 distinct sequences exist for this aa_seq at all, so a
+    # requested target_size of 1000 must clamp down to 2, not pass through
+    # unchanged -- checked by spying on select_survivors directly, since a
+    # tiny population can't itself exceed 2 individuals to prove the clamp
+    # engaged rather than select_survivors' own len(pop) behavior.
+    tiny_ctx = sched.ScheduleContext(aa_seq="MC", weights=weights, analysis_objects=analysis_objects)
+    seeded = sched.run_steps([], tiny_ctx, [{"kind": "input", "count": 1}])
+    real_select_survivors = sched.select_survivors
+
+    def _spy_select_survivors(pop, weights, target_size):
+        _spy_select_survivors.seen = target_size
+        return real_select_survivors(pop, weights, target_size)
+
+    monkeypatch.setattr(sched, "select_survivors", _spy_select_survivors)
+    sched.run_steps(seeded, tiny_ctx, [{"kind": "select", "target_size": 1000}])
+    assert _spy_select_survivors.seen == 2
 
 
 def test_step_flatten_collapses_everyone_to_one_copy(ctx):

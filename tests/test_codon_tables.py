@@ -16,6 +16,7 @@ from genewriter.codon_tables import (
     VARIABLE_FLAGS_BY_INDEX,
     decode_codons,
     encode_codons,
+    sequence_space_size,
     validate_aa_sequence,
 )
 
@@ -109,3 +110,22 @@ def test_validate_aa_sequence_rejects_star_anywhere():
 def test_validate_aa_sequence_rejects_empty_string():
     with pytest.raises(ValueError, match="empty"):
         validate_aa_sequence("")
+
+
+def test_sequence_space_size_is_the_product_of_per_residue_synonym_counts():
+    # M (1 codon) * A (4 codons) * S (6 codons) = 24
+    assert sequence_space_size("MAS") == 24
+
+
+def test_sequence_space_size_of_empty_sequence_is_one():
+    # The empty product -- zero residues means exactly one (trivial, empty)
+    # sequence, not zero.
+    assert sequence_space_size("") == 1
+
+
+def test_sequence_space_size_stays_exact_for_a_long_protein():
+    # Regression guard against ever switching this to float/np.prod: a
+    # float64 can't represent this exactly (it's already beyond 2**53), but
+    # a plain Python int must.
+    aa_seq = "L" * 100  # leucine: 6 synonymous codons
+    assert sequence_space_size(aa_seq) == 6 ** 100

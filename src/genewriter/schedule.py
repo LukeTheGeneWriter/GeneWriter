@@ -73,6 +73,7 @@ import random
 from dataclasses import dataclass, field
 
 from .change_vector import AnalysisObjects
+from .codon_tables import sequence_space_size
 from .ga import (
     directed_evolution,
     directed_evolution_batch,
@@ -91,6 +92,21 @@ from .ga import (
 )
 
 _STEP_REGISTRY = {}
+
+
+def _remaining_space(aa_seq: str, already_covered: int) -> int:
+    """How many more distinct codon sequences for aa_seq are even possible
+    to generate, given `already_covered` distinct individuals already in
+    play. codon_tables.sequence_space_size(aa_seq) is a hard, finite
+    ceiling -- the exact count of synonymous sequences that exist at all --
+    so requesting more than this remaining headroom guarantees wasted
+    duplicate-collision work (a seed/replicate that can only ever land on a
+    genotype already covered). Real-scale proteins' space is astronomically
+    larger than any population size used here (100 residues alone is
+    already ~3**100), so this is a no-op in practice for anything but a
+    short peptide, where over-requesting a round-number count like 50,000
+    is otherwise easy to do by accident."""
+    return max(sequence_space_size(aa_seq) - already_covered, 0)
 
 
 def register_step(kind: str):
@@ -166,8 +182,13 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     most, since none of these genotypes has a parent to cheaply diff
     against. Seeds come from ctx.seed_fn (ga.generate_seed by default --
     see ScheduleContext.seed_fn) rather than a hardcoded call, so a trained
-    codon_ngram.CodonNgramModel can be substituted."""
-    count = params["count"]
+    codon_ngram.CodonNgramModel can be substituted.
+
+    `count` is clamped to _remaining_space(ctx.aa_seq, len(pop)) -- can't
+    usefully generate more distinct seeds than the protein's finite
+    synonymous-codon space has left uncovered; see that function's
+    docstring."""
+    count = min(params["count"], _remaining_space(ctx.aa_seq, len(pop)))
     seed_fn = ctx.seed_fn or generate_seed
     new_seeds = [seed_fn(ctx.aa_seq) for _ in range(count)]
     new_index = seed_population(new_seeds, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
@@ -198,7 +219,16 @@ def _do_growth(
     same classification draw as growth, just always landing on directed")
     and because merge_replicates_batch()/replicate_and_mutate_random()
     have no useful work to do on an empty individual list anyway.
+
+    `rate` is clamped to _remaining_space(ctx.aa_seq, len(pop)) -- no
+    individual can be usefully asked for more replicates than there are
+    distinct codon sequences left uncovered in the whole protein's space,
+    since every replicate beyond that is guaranteed to land on a genotype
+    already in pop (deduped away for free by pop_index, but still a wasted
+    draw/score). Only binds for very short peptides in practice -- see
+    _remaining_space()'s docstring.
     """
+    rate = min(rate, _remaining_space(ctx.aa_seq, len(pop)))
     pop_index = {tuple(p.codons): p for p in pop}
 
     if ctx.xp is not None and lookahead:
@@ -358,8 +388,12 @@ def _step_natural_range_cutoff(pop: list, ctx: ScheduleContext, params: dict) ->
 def _step_select(pop: list, ctx: ScheduleContext, params: dict) -> list:
     """Cap the population to `target_size` distinct individuals. See
     ga.select_survivors(). Refreshes change vectors exactly first -- see
-    module docstring."""
-    target_size = params["target_size"]
+    module docstring.
+
+    `target_size` is clamped to codon_tables.sequence_space_size(ctx.aa_seq)
+    -- a population can never usefully hold more distinct individuals than
+    the protein's finite synonymous-codon space contains in total."""
+    target_size = min(params["target_size"], sequence_space_size(ctx.aa_seq))
     pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
     return select_survivors(pop, ctx.weights, target_size)
 

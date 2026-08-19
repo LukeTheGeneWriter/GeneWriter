@@ -76,6 +76,20 @@ def generate_codon_vec(aa_seq: str) -> list:
     return [codon_choices_for_aa(aa) for aa in aa_seq.upper()]
 
 
+def sequence_space_size(aa_seq: str) -> int:
+    """Exact count of distinct codon sequences that translate to aa_seq --
+    the product, over every residue, of that residue's synonymous-codon
+    count (len(codon_choices_for_aa(aa))). A plain Python int (not
+    float/np.prod): this routinely exceeds float64's exact-integer range
+    for anything but a short peptide (a 500-residue protein's space is on
+    the order of 3**500), and Python ints are arbitrary-precision, so the
+    result stays exact regardless of aa_seq's length."""
+    space = 1
+    for choices in generate_codon_vec(aa_seq):
+        space *= len(choices)
+    return space
+
+
 # The 20 standard single-letter amino acid codes -- AA_CODONS' keys minus
 # '*' (the stop-codon entry). Shared by aa_motif_index.py's query
 # validation and any caller accepting a custom protein sequence (e.g.
