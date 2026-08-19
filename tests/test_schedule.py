@@ -331,8 +331,9 @@ def test_step_save_writes_a_checkpoint(tmp_path, aa_seq, analysis_objects, weigh
     seeded = sched.run_steps([], ctx_with_save, [{"kind": "input", "count": 3}])
     sched.run_steps(seeded, ctx_with_save, [{"kind": "save"}])
 
-    files = os.listdir(tmp_path)
-    assert any(f.startswith("test_run_gen") for f in files)
+    run_dir = os.path.join(tmp_path, "test_run")
+    assert os.path.isdir(run_dir)
+    assert any(f.startswith("gen") for f in os.listdir(run_dir))
 
 
 def test_step_repeat_runs_the_nested_schedule_the_requested_number_of_times(ctx):

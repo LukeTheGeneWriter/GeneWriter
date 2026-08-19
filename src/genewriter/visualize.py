@@ -49,20 +49,20 @@ def load_population_json(path: str) -> list:
     return [Proposed_Solution(entry['codons'], entry['number'], entry['change_vecs']) for entry in data]
 
 
-_GEN_FILENAME_RE = re.compile(r"_gen(\d+)\.json$")
+_GEN_FILENAME_RE = re.compile(r"gen(\d+)\.json$")
 
 
 def load_population_trajectory(save_dir: str, run_name: str) -> list:
     """Every generation checkpoint ga.save_gen() wrote for one run
-    (save_dir/run_name -- see that function's `{run_name}_gen{gen}.json`
-    naming), loaded and sorted into generation order.
+    (save_dir/run_name/gen{gen}.json -- see that function's docstring),
+    loaded and sorted into generation order.
 
     Returns list of (gen: int, pop: list[Proposed_Solution]) tuples.
     Raises FileNotFoundError if no checkpoint matches -- e.g. save_dir was
     None for the run that produced final_pop, so ga.save_gen()/schedule.py's
     "save" step never actually wrote anything to reload here.
     """
-    pattern = os.path.join(save_dir, f"{run_name}_gen*.json")
+    pattern = os.path.join(save_dir, run_name, "gen*.json")
     entries = []
     for path in glob.glob(pattern):
         match = _GEN_FILENAME_RE.search(path)

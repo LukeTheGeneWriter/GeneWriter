@@ -772,8 +772,14 @@ def kill_off_outside_natural_range(pop: list, analysis_objects: AnalysisObjects,
 
 
 def save_gen(pop: list, gen: int, save_dir: str, run_name: str) -> str:
-    os.makedirs(save_dir, exist_ok=True)
-    path = os.path.join(save_dir, f"{run_name}_gen{gen}.json")
+    """Writes one generation checkpoint to save_dir/run_name/gen{gen}.json --
+    one subdirectory per run_name (created if needed), rather than every
+    run's checkpoints mixed flat into save_dir distinguished only by a
+    filename prefix. See visualize.load_population_trajectory(), the
+    matching reader for this layout."""
+    run_dir = os.path.join(save_dir, run_name)
+    os.makedirs(run_dir, exist_ok=True)
+    path = os.path.join(run_dir, f"gen{gen}.json")
     with open(path, 'w') as f:
         json.dump([{'codons': p.codons, 'number': p.number, 'change_vecs': p.change_vecs} for p in pop], f)
     return path

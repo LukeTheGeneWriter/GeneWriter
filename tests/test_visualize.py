@@ -1,4 +1,5 @@
 import json
+import os
 
 import matplotlib
 matplotlib.use('Agg')  # headless -- no display available in CI/WSL
@@ -153,6 +154,16 @@ def test_subsample_population_caps_at_max_points(aa_seq, analysis_objects):
     sampled = subsample_population(pop, 5, rng=__import__('random').Random(0))
     assert len(sampled) == 5
     assert all(p in pop for p in sampled)
+
+
+def test_save_gen_writes_into_a_run_name_subdirectory(tmp_path, aa_seq, analysis_objects):
+    pop = _population(aa_seq, analysis_objects, n=2)
+    path = ga.save_gen(pop, 3, str(tmp_path), "myrun")
+    assert path == os.path.join(str(tmp_path), "myrun", "gen3.json")
+    assert os.path.isfile(path)
+    # save_dir itself holds only the per-run subdirectory, no loose files
+    # mixed in alongside it.
+    assert os.listdir(tmp_path) == ["myrun"]
 
 
 def test_load_population_json_round_trips_with_save_gen(tmp_path, aa_seq, analysis_objects):

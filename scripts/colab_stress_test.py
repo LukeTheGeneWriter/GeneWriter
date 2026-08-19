@@ -751,8 +751,8 @@ if __name__ == "__main__":
 #   # docstring). Needs final_pop from cell 2 -- if that wasn't captured
 #   # (e.g. you ran main() directly instead), reload the latest saved
 #   # generation from RUN_GA_OPTIONS['save_dir'] instead (see that dict's
-#   # save_dir/run_name -- save_gen() writes one {run_name}_gen{N}.json per
-#   # generation there, so the run doesn't have to be re-run or even have
+#   # save_dir/run_name -- save_gen() writes one save_dir/run_name/gen{N}.json
+#   # per generation there, so the run doesn't have to be re-run or even have
 #   # finished to visualize its most recent generation).
 #   from genewriter.visualize import plot_population_tsne
 #   import matplotlib.pyplot as plt
