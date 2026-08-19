@@ -74,6 +74,7 @@ from dataclasses import dataclass, field
 
 from .change_vector import AnalysisObjects
 from .codon_tables import sequence_space_size
+from .gpu_change_vector import suggest_chunk_size
 from .ga import (
     directed_evolution,
     directed_evolution_batch,
@@ -89,6 +90,7 @@ from .ga import (
     save_gen,
     seed_population,
     select_survivors,
+    suggest_population_size,
 )
 
 _STEP_REGISTRY = {}
@@ -147,9 +149,13 @@ class ScheduleContext:
     # flatten_generation()) -- see that function's docstring for what it
     # bounds and why: population size and protein length both multiply
     # into some of its intermediate arrays, so a long enough protein can
-    # OOM at a population size that was previously fine. None (default):
-    # unchanged, each call still batches its whole input in one xp pass.
-    # Only relevant when xp is set.
+    # OOM at a population size that was previously fine. None here (a
+    # ScheduleContext built directly rather than via run_schedule()) keeps
+    # the original unbounded-batch behavior -- run_schedule() itself
+    # replaces None with gpu_change_vector.suggest_chunk_size()'s VRAM-aware
+    # default before constructing this dataclass, so callers going through
+    # the normal entry point get the safer/faster default automatically;
+    # see run_schedule()'s own docstring. Only relevant when xp is set.
     chunk_size: int = None
     # Diagnostic-only, no effect on results: `progress` prints each step's
     # kind, timing, and resulting population size as it runs (see
@@ -184,11 +190,20 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     see ScheduleContext.seed_fn) rather than a hardcoded call, so a trained
     codon_ngram.CodonNgramModel can be substituted.
 
-    `count` is clamped to _remaining_space(ctx.aa_seq, len(pop)) -- can't
-    usefully generate more distinct seeds than the protein's finite
-    synonymous-codon space has left uncovered; see that function's
-    docstring."""
-    count = min(params["count"], _remaining_space(ctx.aa_seq, len(pop)))
+    `count` is optional -- if omitted, ga.suggest_population_size() picks a
+    hardware-aware default (as many distinct seeds as available system RAM
+    can hold, up to the protein's finite synonymous-codon space) instead of
+    a hand-picked constant, so short runs don't accidentally under-explore
+    a large protein's neighborhood just because nobody tuned `count` for
+    that specific target. An explicit `count` is still clamped to
+    _remaining_space(ctx.aa_seq, len(pop)) as before -- can't usefully
+    generate more distinct seeds than the protein's space has left
+    uncovered, whether that number came from the caller or from the
+    auto-sized default."""
+    requested = params.get("count")
+    if requested is None:
+        requested = suggest_population_size(ctx.aa_seq, ctx.analysis_objects, already_covered=len(pop), locvec=ctx.locvec)
+    count = min(requested, _remaining_space(ctx.aa_seq, len(pop)))
     seed_fn = ctx.seed_fn or generate_seed
     new_seeds = [seed_fn(ctx.aa_seq) for _ in range(count)]
     new_index = seed_population(new_seeds, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
@@ -390,10 +405,17 @@ def _step_select(pop: list, ctx: ScheduleContext, params: dict) -> list:
     ga.select_survivors(). Refreshes change vectors exactly first -- see
     module docstring.
 
-    `target_size` is clamped to codon_tables.sequence_space_size(ctx.aa_seq)
-    -- a population can never usefully hold more distinct individuals than
-    the protein's finite synonymous-codon space contains in total."""
-    target_size = min(params["target_size"], sequence_space_size(ctx.aa_seq))
+    `target_size` is optional -- if omitted, ga.suggest_population_size()
+    picks a hardware-aware default (as large as available system RAM
+    reasonably allows) instead of a hand-picked constant, same reasoning as
+    "input"'s `count`. An explicit `target_size` is still clamped to
+    codon_tables.sequence_space_size(ctx.aa_seq) as before -- a population
+    can never usefully hold more distinct individuals than the protein's
+    finite synonymous-codon space contains in total."""
+    requested = params.get("target_size")
+    if requested is None:
+        requested = suggest_population_size(ctx.aa_seq, ctx.analysis_objects, locvec=ctx.locvec)
+    target_size = min(requested, sequence_space_size(ctx.aa_seq))
     pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
     return select_survivors(pop, ctx.weights, target_size)
 
@@ -487,9 +509,18 @@ def run_schedule(
         ga.generate_seed.
     chunk_size: caps how many individuals any single xp-batched call in this
         schedule processes at once -- see ScheduleContext.chunk_size. None
-        (default) keeps the original behavior of batching each step's whole
-        input in one xp pass. Only relevant when xp is set.
+        (default, and only relevant when xp is set) no longer means "one
+        unchunked pass across the whole population" -- that shape is what
+        actually OOM'd on a real Colab run once population size grew large
+        enough (see memory/colab_stress_test_stale_paste_oom.md). Instead,
+        gpu_change_vector.suggest_chunk_size() picks a VRAM-aware default:
+        queries actually-free GPU memory and sizes chunk_size to use it,
+        so a bigger GPU automatically gets bigger (faster) batches with no
+        manual tuning, while still bounding peak memory. Pass an explicit
+        chunk_size to override this and get the old fixed-cap behavior.
     """
+    if chunk_size is None and xp is not None:
+        chunk_size = suggest_chunk_size(xp, len(aa_seq))
     ctx = ScheduleContext(aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects,
                            locvec=locvec, save_dir=save_dir, run_name=run_name, xp=xp,
                            progress=progress, progress_every=progress_every, seed_fn=seed_fn,

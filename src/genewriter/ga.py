@@ -49,17 +49,19 @@ of thousands of individuals) rather than any specific bug report:
     sampling-without-replacement algorithm (see its docstring), O(n log k).
 """
 
+import dataclasses
 import heapq
 import json
 import math
 import os
 import random
+import sys
 
 import numpy as np
 
 from .change_vector import AnalysisObjects, calculate_change_vector, diff_change_vector, require_weights, score_changevec
 from .classes import Proposed_Solution
-from .codon_tables import generate_codon_vec
+from .codon_tables import generate_codon_vec, sequence_space_size
 from .gpu_change_vector import batch_calculate_change_vectors
 
 _MAX_FINITE_WEIGHT = 1e12
@@ -294,6 +296,92 @@ def degree_of_degeneracy(aa_seq: str) -> int:
 def generate_seed(aa_seq: str) -> list:
     codon_vec = generate_codon_vec(aa_seq)
     return [random.choice(choices) for choices in codon_vec]
+
+
+def _deep_sizeof(obj, _seen: set = None) -> int:
+    """Recursive memory footprint via sys.getsizeof(), walking dict/list/
+    tuple/set containers AND dataclass instances (none of which count their
+    own contents/fields in their own getsizeof() -- a bare
+    sys.getsizeof(Proposed_Solution(...)) is just its small object header,
+    a real bug caught live: an earlier version of this function returned
+    the same tiny constant regardless of aa_seq length, since it never
+    descended into a dataclass instance's fields at all). Used to measure
+    a real Proposed_Solution's actual RAM cost rather than guessing at an
+    analytical formula, so the estimate automatically stays correct if
+    change_vector.py's registered terms ever change (more/fewer terms,
+    e.g. Uracil, or different per-position value types) without needing a
+    matching update here. _seen guards against double-counting an object
+    reachable two ways -- not expected for a single Proposed_Solution's
+    own tree, but cheap insurance."""
+    seen = _seen if _seen is not None else set()
+    obj_id = id(obj)
+    if obj_id in seen:
+        return 0
+    seen.add(obj_id)
+    size = sys.getsizeof(obj)
+    if isinstance(obj, dict):
+        size += sum(_deep_sizeof(k, seen) + _deep_sizeof(v, seen) for k, v in obj.items())
+    elif dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        size += sum(_deep_sizeof(getattr(obj, f.name), seen) for f in dataclasses.fields(obj))
+    elif isinstance(obj, (list, tuple, set, frozenset)):
+        size += sum(_deep_sizeof(item, seen) for item in obj)
+    return size
+
+
+def estimate_bytes_per_individual(aa_seq: str, analysis_objects: AnalysisObjects, locvec: list = None) -> int:
+    """Real measured in-memory footprint of one Proposed_Solution for this
+    aa_seq -- builds one real seed and scores it exactly once
+    (calculate_change_vector(), the cheap per-individual path -- this is a
+    single call, not a batch), then walks the result with _deep_sizeof()
+    rather than an analytical guess. Used by suggest_population_size() to
+    size "input"/"select" defaults against available system RAM."""
+    sol = generate_seed(aa_seq)
+    vecs = calculate_change_vector(sol, analysis_objects, locvec)
+    return _deep_sizeof(Proposed_Solution(sol, 1, vecs))
+
+
+def available_ram_bytes(default: int = 2 * 1024 ** 3) -> int:
+    """Free system RAM in bytes, queried via os.sysconf (SC_AVPHYS_PAGES *
+    SC_PAGE_SIZE) -- works with no extra dependency on any POSIX system,
+    which covers every environment this codebase actually runs GA work on
+    (WSL, Colab -- see memory/dev_environment.md: no native Windows Python
+    at all). Falls back to `default` (2GB, a conservative guess) if
+    sysconf isn't available or doesn't expose these keys, rather than
+    raising and blocking sizing entirely on an unexpected platform."""
+    try:
+        return os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+    except (ValueError, OSError, AttributeError):
+        return default
+
+
+def suggest_population_size(aa_seq: str, analysis_objects: AnalysisObjects, already_covered: int = 0,
+                             locvec: list = None, ram_fraction: float = 0.5) -> int:
+    """How many distinct individuals it's reasonable to seed/hold for
+    aa_seq, maximizing use of available hardware instead of a hand-picked
+    fixed constant -- the smaller of two real ceilings:
+
+      - codon_tables.sequence_space_size(aa_seq) minus already_covered --
+        can't produce more distinct sequences than mathematically exist
+        (same ceiling schedule._remaining_space() already enforces on top
+        of whatever this suggests, e.g. against an explicit count).
+      - available system RAM (available_ram_bytes() * ram_fraction)
+        divided by one individual's real measured footprint
+        (estimate_bytes_per_individual()) -- the population lives entirely
+        in host memory as a list of Proposed_Solution for the life of a
+        run, so this is the real constraint on how large it can grow
+        without risking the process (or the whole Colab VM) running out of
+        RAM.
+
+    ram_fraction (default 0.5) leaves headroom rather than planning to
+    consume every free byte, the same reasoning gpu_corpus_batch.
+    vram_aware_batch_size()'s vram_fraction already uses on the VRAM side
+    -- other things (the interpreter itself, gene corpus data still
+    resident, Colab's own overhead) already share that RAM.
+    """
+    space_ceiling = max(sequence_space_size(aa_seq) - already_covered, 0)
+    bytes_per_individual = max(estimate_bytes_per_individual(aa_seq, analysis_objects, locvec), 1)
+    ram_ceiling = int(available_ram_bytes() * ram_fraction) // bytes_per_individual
+    return min(space_ceiling, ram_ceiling)
 
 
 def codvec_to_str(codvecs: list) -> list:

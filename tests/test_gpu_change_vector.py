@@ -26,6 +26,7 @@ from genewriter.gpu_change_vector import (
     batch_kmer_term,
     batch_rare_codon_term,
     encode_population,
+    suggest_chunk_size,
     windowed_average_batched,
 )
 
@@ -392,3 +393,10 @@ def test_batched_and_per_individual_paths_share_the_baseline_stat_cache(analysis
 
     batched = batch_calculate_change_vectors(pop, analysis_objects, xp=np)
     _assert_rows_close(per_individual, [r['CodonUsage'] for r in batched])
+
+
+def test_suggest_chunk_size_numpy_backend_returns_the_fixed_default():
+    """No VRAM ceiling to respect on the numpy backend -- see
+    gpu_corpus_batch.vram_aware_batch_size's identical reasoning, which
+    this function mirrors."""
+    assert suggest_chunk_size(np, aa_seq_len=150) == 50_000

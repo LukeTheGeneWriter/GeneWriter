@@ -799,3 +799,35 @@ def test_run_ga_with_chunk_size_matches_without(aa_seq, analysis_objects, weight
     by_codons_chunked = {tuple(p.codons): p for p in pop_chunked}
     for key in by_codons_unchunked:
         assert by_codons_unchunked[key].number == by_codons_chunked[key].number
+
+
+def test_estimate_bytes_per_individual_is_positive_and_scales_with_length(analysis_objects):
+    """A real measured footprint, not a formula guess -- should at least be
+    positive, and a longer aa_seq (more codons, more per-position change-
+    vector floats) should cost more bytes than a shorter one."""
+    short_cost = ga.estimate_bytes_per_individual("MAVLDEFGHIK", analysis_objects)
+    long_cost = ga.estimate_bytes_per_individual("MAVLDEFGHIK" * 5, analysis_objects)
+    assert short_cost > 0
+    assert long_cost > short_cost
+
+
+def test_available_ram_bytes_returns_a_positive_number():
+    """Smoke test only -- the real value depends on the machine running the
+    tests, so there's nothing more specific to assert than "it worked and
+    returned something sane" (also covers the os.sysconf fallback path
+    implicitly succeeding rather than raising)."""
+    assert ga.available_ram_bytes() > 0
+
+
+def test_suggest_population_size_never_exceeds_the_sequence_space(analysis_objects):
+    """"MC": M has 1 synonymous codon, C has 2 -- only 2 distinct sequences
+    exist for this aa_seq at all, so the RAM-based half of the suggestion
+    (which has no way to know that ceiling on its own) must still be capped
+    by it, no matter how much RAM is actually available."""
+    assert ga.suggest_population_size("MC", analysis_objects) <= 2
+
+
+def test_suggest_population_size_subtracts_already_covered(analysis_objects):
+    """"MC" again: with 1 of its 2 total possible sequences already
+    covered, only 1 slot should remain regardless of RAM headroom."""
+    assert ga.suggest_population_size("MC", analysis_objects, already_covered=1) <= 1

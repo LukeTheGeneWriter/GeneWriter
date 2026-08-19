@@ -312,8 +312,29 @@ CONFIG = dict(
     #   flatten    {"recursion_limit"}                 -- breadth trade
     #   save       {}                                  -- checkpoint now
     #   repeat     {"times", "steps": [...]}            -- nested sub-schedule
+    #
+    # "input"'s count / "select"'s target_size are both OPTIONAL now -- omit
+    # either and ga.suggest_population_size() picks a hardware-aware default
+    # (RAM- and aa_seq-space-aware) instead of a fixed constant nobody tuned
+    # per-target. Flagged by Luke after a real Colab run's hardcoded numbers
+    # (2000/3000/2000 below, previously) turned out too small to show any
+    # real t-SNE neighborhood formation -- see
+    # memory/schedule_sequence_space_clamping.md. Omitted below for "input"
+    # and the FINAL "select" (the population that actually gets
+    # visualized), so both auto-size up to whatever this VM's RAM allows.
+    # The REPEAT loop's inner "select" target_size is deliberately kept
+    # explicit, not omitted: growth immediately fans a population out
+    # several-fold before the next select ever runs, so an
+    # unboundedly-large "input" auto-size feeding straight into growth with
+    # no cap in between could itself get RAM-heavy before this inner select
+    # ever gets a chance to trim it back down -- this fixed value is the
+    # per-iteration throughput governor keeping that first uncapped
+    # growth/kill_off window bounded. Tune it up if this VM has RAM to
+    # spare and the run feels too conservative; tune the input/final
+    # select back down to an explicit count if a real run shows the
+    # opposite problem (RAM pressure from the auto-sized ends).
     SCHEDULE=[
-        {"kind": "input", "count": 2000},
+        {"kind": "input"},
         {"kind": "growth", "rate": 4, "mutation_chance": 0.1, "directed_fraction": 0.5, "lookahead": True},
         {"kind": "kill_off", "percent_cut": 30},
         {"kind": "repeat", "times": 5, "steps": [
@@ -321,7 +342,7 @@ CONFIG = dict(
             {"kind": "select", "target_size": 3000},
         ]},
         {"kind": "flatten", "recursion_limit": 3},
-        {"kind": "select", "target_size": 2000},
+        {"kind": "select"},
     ],
     SCHEDULE_SAVE_DIR="/content/genewriter_runs",
     SCHEDULE_RUN_NAME="colab_stress_test_schedule",
@@ -663,14 +684,26 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
     seed_fn = _build_seed_fn(cfg, genes)
 
     if cfg["RUN_MODE"] == "run_ga":
-        from genewriter.ga import run_ga
+        from genewriter.ga import run_ga, suggest_population_size
 
         opts = dict(cfg["RUN_GA_OPTIONS"])
         opts["locvec"] = locvec  # override the placeholder None with the real tags
         opts["xp"] = xp
         opts["progress"] = cfg["PROGRESS"]
         opts["progress_every"] = cfg["PROGRESS_EVERY"]
-        num_seeds = opts.pop("num_seeds", 200)
+        # num_seeds isn't in RUN_GA_OPTIONS' documented keys above -- add it
+        # there to override. Omitted (the common case): suggest_population_
+        # size() picks a hardware-aware count (as many distinct seeds as
+        # available system RAM reasonably allows, capped by aa_seq's own
+        # finite synonymous-codon space) instead of a fixed constant that
+        # was never actually tuned per-target -- see
+        # memory/schedule_sequence_space_clamping.md and Luke's own
+        # follow-up flag that a hardcoded seed count under-tested a real
+        # run and never showed real neighborhood formation in the t-SNE
+        # visualization.
+        num_seeds = opts.pop("num_seeds", None)
+        if num_seeds is None:
+            num_seeds = suggest_population_size(aa_seq, analysis_objects, locvec=locvec)
         seeds = [seed_fn(aa_seq) for _ in range(num_seeds)]
 
         t0 = time.perf_counter()

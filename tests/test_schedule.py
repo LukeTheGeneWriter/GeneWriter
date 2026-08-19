@@ -72,6 +72,18 @@ def test_step_input_clamps_count_to_remaining_sequence_space(monkeypatch, analys
     assert _spy_seed_population.seen == 2
 
 
+def test_step_input_auto_sizes_count_when_omitted(analysis_objects, weights):
+    """No `count` in params -- ga.suggest_population_size() picks a
+    hardware-aware default instead of raising KeyError the way the
+    required-count behavior used to. "MC" (space of exactly 2) keeps this
+    fast and deterministic regardless of how much RAM the test machine
+    actually has -- the sequence-space ceiling is what should bind here,
+    not the RAM half of the suggestion."""
+    tiny_ctx = sched.ScheduleContext(aa_seq="MC", weights=weights, analysis_objects=analysis_objects)
+    result = sched.run_steps([], tiny_ctx, [{"kind": "input"}])
+    assert 0 < sum(p.number for p in result) <= 2
+
+
 def test_step_growth_reproduces_and_dedups_within_the_step(ctx):
     seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 1}])
     result = sched.run_steps(seeded, ctx, [{"kind": "growth", "rate": 5, "mutation_chance": 0.3}])
@@ -140,6 +152,17 @@ def test_step_select_clamps_target_size_to_sequence_space(monkeypatch, analysis_
     monkeypatch.setattr(sched, "select_survivors", _spy_select_survivors)
     sched.run_steps(seeded, tiny_ctx, [{"kind": "select", "target_size": 1000}])
     assert _spy_select_survivors.seen == 2
+
+
+def test_step_select_auto_sizes_target_size_when_omitted(analysis_objects, weights):
+    """No `target_size` in params -- ga.suggest_population_size() picks a
+    hardware-aware default. "MC" (space of exactly 2) keeps this fast and
+    deterministic regardless of test-machine RAM, same reasoning as the
+    matching "input" test above."""
+    tiny_ctx = sched.ScheduleContext(aa_seq="MC", weights=weights, analysis_objects=analysis_objects)
+    seeded = sched.run_steps([], tiny_ctx, [{"kind": "input", "count": 2}])
+    result = sched.run_steps(seeded, tiny_ctx, [{"kind": "select"}])
+    assert len(result) <= 2
 
 
 def test_step_flatten_collapses_everyone_to_one_copy(ctx):
@@ -379,6 +402,26 @@ def test_run_schedule_end_to_end_matches_the_spec_example_shape(aa_seq, analysis
     for p in result:
         assert isinstance(p, Proposed_Solution)
         assert len(p.codons) == len(aa_seq)
+
+
+def test_run_schedule_auto_computes_chunk_size_when_omitted_and_xp_is_set(monkeypatch, aa_seq, analysis_objects, weights):
+    """chunk_size=None used to mean "one unchunked batch forever" -- now
+    run_schedule() replaces it with gpu_change_vector.suggest_chunk_size()'s
+    VRAM-aware default whenever xp is set. Spy on the real function (still
+    calling through to it) to confirm it's actually invoked with this run's
+    aa_seq length, rather than asserting on a specific numeric chunk_size
+    (which depends on the test machine's free VRAM)."""
+    import numpy as np
+
+    real_suggest_chunk_size = sched.suggest_chunk_size
+
+    def _spy_suggest_chunk_size(xp, aa_seq_len, **kwargs):
+        _spy_suggest_chunk_size.seen = aa_seq_len
+        return real_suggest_chunk_size(xp, aa_seq_len, **kwargs)
+
+    monkeypatch.setattr(sched, "suggest_chunk_size", _spy_suggest_chunk_size)
+    sched.run_schedule(aa_seq, weights, analysis_objects, [{"kind": "input", "count": 2}], xp=np)
+    assert _spy_suggest_chunk_size.seen == len(aa_seq)
 
 
 def test_run_schedule_with_chunk_size_matches_without(aa_seq, analysis_objects, weights):

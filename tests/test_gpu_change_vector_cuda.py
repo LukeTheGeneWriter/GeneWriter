@@ -28,6 +28,7 @@ from genewriter.gpu_change_vector import (  # noqa: E402
     batch_kmer_term,
     batch_rare_codon_term,
     encode_population,
+    suggest_chunk_size,
     windowed_average_batched,
 )
 
@@ -165,3 +166,15 @@ def test_batch_calculate_change_vectors_gpu_matches_cpu(analysis_objects):
                     assert math.isinf(a) and math.isinf(b) and (a > 0) == (b > 0), f"{term}[{i}]: cpu={a}, gpu={b}"
                     continue
                 assert abs(a - b) <= 1e-9 + 1e-6 * max(abs(a), abs(b)), f"{term}[{i}]: cpu={a}, gpu={b}"
+
+
+def test_suggest_chunk_size_queries_real_vram_and_shrinks_for_a_longer_protein():
+    """Real GPU (not mocked mem_info): a positive chunk size that gets
+    smaller for a longer aa_seq against the same free-VRAM budget -- more
+    nucleotides per individual means a bigger per-row batch_kmer_term
+    intermediate, so fewer individuals fit in the same byte budget."""
+    short_chunk = suggest_chunk_size(cp, aa_seq_len=50)
+    long_chunk = suggest_chunk_size(cp, aa_seq_len=5000)
+    assert short_chunk > 0
+    assert long_chunk > 0
+    assert long_chunk < short_chunk

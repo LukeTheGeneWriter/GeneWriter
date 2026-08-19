@@ -481,6 +481,55 @@ def batch_kmer_term(xp, codon_idx, kmer, locvec: list, winsize: int = 15):
     return per_nt_total.reshape(P, N, 3).mean(axis=2)
 
 
+def _estimate_scoring_bytes_per_individual(seq_len_nt: int, max_k: int, safety_factor: int = 2) -> int:
+    """Conservative worst-case GPU bytes needed per POPULATION ROW (one
+    individual) for one batch_calculate_change_vectors() call -- dominated
+    by batch_kmer_term()'s own per-k `windows * powers` intermediate (see
+    that function's docstring): a (num_wins, max_k) int64 array per row,
+    num_wins ~= seq_len_nt - max_k. Same accounting shape as
+    gpu_kmer_count._estimate_bytes_per_nt() (that module's counting-side
+    counterpart), just priced per-individual here instead of per-corpus-
+    nucleotide -- P (population size) is this module's batch dimension,
+    not a flattened multi-gene nucleotide count. Doubled by safety_factor
+    for the same reason that function doubles: codes/majority/table-lookup
+    intermediates this rough accounting doesn't explicitly price, allocator
+    fragmentation, etc. -- better to under-batch a little than risk a real
+    OOM on whatever GPU tier happens to be attached."""
+    num_wins = max(seq_len_nt - max_k, 1)
+    return safety_factor * 8 * num_wins * max_k
+
+
+def suggest_chunk_size(xp, aa_seq_len: int, kmer_k_values=range(2, 11), vram_fraction: float = 0.5,
+                        default_cpu_chunk: int = 50_000, min_chunk: int = 100) -> int:
+    """VRAM-aware default for batch_calculate_change_vectors()'s chunk_size
+    -- gpu_corpus_batch.vram_aware_batch_size()'s exact free-memory-query
+    pattern (already proven on the baseline-counting side, see
+    gpu_kmer_count.py), applied here to the GA-SCORING side instead:
+    queries *actually free* GPU memory once (xp.cuda.Device().mem_info,
+    a property not a method) and budgets a fraction of it, so a bigger
+    GPU automatically gets a bigger chunk_size (fewer, bigger batched
+    calls -- higher throughput, no manual tuning) instead of a fixed
+    constant that either underutilizes a big GPU or risks the exact real
+    OOM this codebase already hit once on a small one (see
+    memory/colab_stress_test_stale_paste_oom.md) -- chunk_size=None used
+    to mean "one unchunked batch across the whole population," which is
+    the shape that OOM'd; run_schedule() now calls this instead of leaving
+    chunk_size at that unbounded default whenever xp is set.
+
+    aa_seq_len: codon-sequence length (residues), NOT nucleotides -- this
+    function itself converts (aa_seq_len * 3) before pricing.
+    On the numpy backend there's no VRAM ceiling to respect, so this just
+    returns default_cpu_chunk (still worth batching for fewer, bigger
+    Python-level dispatches, same reasoning as gpu_corpus_batch's own
+    default_cpu_batch)."""
+    if xp is np:
+        return default_cpu_chunk
+    free_bytes, _total_bytes = xp.cuda.Device().mem_info  # property, not a method -- no ()
+    budget = int(free_bytes * vram_fraction)
+    bytes_per_individual = _estimate_scoring_bytes_per_individual(aa_seq_len * 3, max(kmer_k_values))
+    return max(budget // bytes_per_individual, min_chunk)
+
+
 def batch_calculate_change_vectors(pop_codons: list, analysis_objects, locvec: list = None, xp=np, progress_every: int = None, chunk_size: int = None) -> list:
     """Compute change vectors for a whole population in one batched pass.
 
