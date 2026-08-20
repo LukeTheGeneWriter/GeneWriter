@@ -1,7 +1,7 @@
 import pytest
 
 from genewriter import change_vector
-from genewriter.change_vector import calculate_change_vector, register_term, registered_terms, score_changevec
+from genewriter.change_vector import calculate_change_vector, register_term, registered_terms, distance_from_optimal
 
 from conftest import random_solution
 
@@ -63,11 +63,11 @@ def test_registering_a_duplicate_name_raises():
         register_term('RareCodons')(lambda sol, ao, locvec: [0.0] * len(sol))
 
 
-def test_score_changevec_raises_a_clear_error_for_a_missing_weight(aa_seq, analysis_objects, temp_term):
+def test_distance_from_optimal_raises_a_clear_error_for_a_missing_weight(aa_seq, analysis_objects, temp_term):
     temp_term('Unweighted', lambda sol, ao, locvec: [1.0] * len(sol))
     sol = random_solution(aa_seq)
     vecs = calculate_change_vector(sol, analysis_objects)
     weights_missing_one = {'RareCodons': 1.0, 'CodonUsage': 1.0, 'CodonPairBias': 1.0, 'GC': 1.0, 'Kmer': 1.0}
 
     with pytest.raises(ValueError, match='Unweighted'):
-        score_changevec(vecs, weights_missing_one)
+        distance_from_optimal(vecs, weights_missing_one)

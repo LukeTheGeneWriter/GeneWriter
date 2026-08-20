@@ -12,8 +12,9 @@ would crash on first call:
     indexing it raises IndexError immediately.
   - Looks up `acobj.windowlength` on a CodonPairBiasAnalysis, whose actual
     field (per GeneClassesCloud.ipynb) is `windowsize`.
-  - Calls dist_from_optimal() on windows of plain codon strings, but that
-    function unpacks each element as a `(codon, location)` tuple.
+  - Calls optimal_usage_score() (named dist_from_optimal() at the time) on
+    windows of plain codon strings, but that function unpacks each element
+    as a `(codon, location)` tuple.
   - The k-mer term's `range(0, len(sol) - 1)` silently drops the sequence's
     last codon.
   - `.mean()` / `.std()` are called directly on dataclass fields that are
@@ -273,10 +274,17 @@ def require_weights(term_names, weights: dict) -> None:
         )
 
 
-def dist_from_optimal(codons: list) -> float:
+def optimal_usage_score(codons: list) -> float:
     """Average, over a window of codons, of the best synonymous-codon score
     available for each position's amino acid (i.e. what CAI-optimal usage
-    would have scored there)."""
+    would have scored there).
+
+    Named `dist_from_optimal()` until 2026-08-20, which was a misnomer: it
+    returns the *optimal* score itself, not a distance -- its only caller
+    (baseline.compute_codon_usage_analysis) is what subtracts the window's
+    actual score to get a distance. Renamed both to say what it does and to
+    free the name for distance_from_optimal() below, the population-level
+    metric, which really is a distance."""
     total = 0.0
     for codon in codons:
         aa = get_aa(codon)
@@ -677,7 +685,7 @@ def _uracil_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list) -
     remove a U here" count, consistent with every other term scoring "this
     position is worth mutating" rather than "this position is good" --
     same "positive weight = counts normally" convention documented on
-    WEIGHTS itself. kill_off()/select_survivors() use score_changevec()
+    WEIGHTS itself. kill_off()/select_survivors() use distance_from_optimal()
     directly as a death weight via _finite_nonneg() (ga.py), which clamps
     any negative score to ~0 -- so a *negative* weights['Uracil'] doesn't
     invert anything, it just floors a high-U individual's death pressure
@@ -804,6 +812,30 @@ def diff_change_vector(
     return result
 
 
-def score_changevec(changevecs: dict, weights: dict) -> float:
+def distance_from_optimal(changevecs: dict, weights: dict) -> float:
+    """This candidate's total distance from optimal: the weighted L1
+    magnitude of its change vector, sum_terms w_t * sum_positions v_t[i].
+
+    Every term is a "how much does this position need fixing" signal on a
+    common z-score-derived scale (see each term's docstring), so summing
+    across positions and weighting across terms gives one scalar saying how
+    far this whole candidate sits from what the natural-genome baselines
+    call ideal. LOWER IS BETTER, everywhere in this codebase -- 0 would be
+    a sequence no term wants to change at all.
+
+    Called score_changevec() until 2026-08-20, and referred to throughout
+    ga.py/schedule.py/visualize.py as "fitness". Both names were wrong in
+    the same direction: in a GA, "fitness" conventionally means higher is
+    better and is what selection maximizes, but this quantity is minimized
+    -- kill_off() weights its cull TOWARD high scorers. Calling it fitness
+    inverted the reader's expectation at every call site. It is also not a
+    fitness in the biological sense: nothing here measures reproductive
+    success, only distance from a set of baseline distributions.
+
+    No real sequence reaches 0 -- the terms genuinely conflict (see the
+    multi-objective discussion in HANDOFF_2026-08-20.md), so "optimal" is
+    an unreachable corner of the space, not a target. Interpret this number
+    relatively (against other candidates, or against natural CDSs scored
+    the same way), never as an absolute score out of zero."""
     require_weights(changevecs.keys(), weights)
     return sum(weights[key] * sum(changevecs[key]) for key in changevecs)

@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from genewriter import ga
-from genewriter.change_vector import calculate_change_vector, score_changevec
+from genewriter.change_vector import calculate_change_vector, distance_from_optimal
 from genewriter.classes import Proposed_Solution
 from genewriter.codon_tables import generate_codon_vec
 
@@ -142,7 +142,7 @@ def test_kill_off_protect_criteria_shields_without_setting_protected(aa_seq, wei
     unfit = [Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(unfit_vecs)) for _ in range(3)]
     pop = [fit] + unfit
 
-    result = ga.kill_off(pop, weights, percent_cut=100, protect_criteria=[("fitness", 0.25)])
+    result = ga.kill_off(pop, weights, percent_cut=100, protect_criteria=[("distance_from_optimal", 0.25)])
     kept = {tuple(p.codons): p for p in result}
     assert tuple(fit.codons) in kept
     assert kept[tuple(fit.codons)].number == 5
@@ -163,12 +163,12 @@ def test_kill_off_by_term_protect_criteria_shields_without_setting_protected(aa_
     bad = [Proposed_Solution(ga.generate_seed(aa_seq), 5, dict(bad_cpb)) for _ in range(3)]
     pop = [good] + bad
 
-    # protect_criteria targets fitness, not CodonPairBias -- confirms the
+    # protect_criteria targets distance_from_optimal, not CodonPairBias -- confirms the
     # exemption ranking is independent of what the cull itself is scored
-    # by. All-zero-everything `good` is also the best by "fitness" here.
+    # by. All-zero-everything `good` is also the best by "distance_from_optimal" here.
     weights = {'RareCodons': 1.0, 'CodonUsage': 1.0, 'CodonPairBias': 1.0, 'GC': 1.0, 'Kmer': 1.0}
     result = ga.kill_off_by_term(pop, 'CodonPairBias', percent_cut=100,
-                                  protect_criteria=[("fitness", 0.25)], weights=weights)
+                                  protect_criteria=[("distance_from_optimal", 0.25)], weights=weights)
     kept = {tuple(p.codons): p for p in result}
     assert tuple(good.codons) in kept
     assert kept[tuple(good.codons)].protected is False
@@ -212,14 +212,14 @@ def test_mark_protected_unions_multiple_criteria(aa_seq, weights):
         return {'RareCodons': [rare] * n, 'CodonUsage': [cu] * n, 'CodonPairBias': [cpb] * n,
                 'GC': [gc] * n, 'Kmer': [kmer] * n, 'Uracil': [uracil] * n}
 
-    fitness_best = Proposed_Solution(ga.generate_seed(aa_seq), 1, _vecs(0, 0, 0, 0, 0, 50))
+    distance_best = Proposed_Solution(ga.generate_seed(aa_seq), 1, _vecs(0, 0, 0, 0, 0, 50))
     uracil_best = Proposed_Solution(ga.generate_seed(aa_seq), 1, _vecs(100, 100, 100, 100, 100, 0))
     others = [Proposed_Solution(ga.generate_seed(aa_seq), 1, _vecs(100, 100, 100, 100, 100, 50)) for _ in range(3)]
-    pop = [fitness_best, uracil_best] + others
+    pop = [distance_best, uracil_best] + others
     weights_with_uracil = dict(weights, Uracil=1.0)
 
-    ga.mark_protected(pop, weights_with_uracil, criteria=[("fitness", 0.2), ("Uracil", 0.2)])
-    assert fitness_best.protected
+    ga.mark_protected(pop, weights_with_uracil, criteria=[("distance_from_optimal", 0.2), ("Uracil", 0.2)])
+    assert distance_best.protected
     assert uracil_best.protected
     assert not any(p.protected for p in others)
 
@@ -234,7 +234,7 @@ def test_mark_protected_does_not_unprotect_previously_protected_individuals(aa_s
     pop = [p1, p2]
     # A criterion nobody qualifies for (top_fraction=0) must still leave
     # p1's pre-existing protection intact rather than resetting it.
-    ga.mark_protected(pop, weights, criteria=[("fitness", 0.0)])
+    ga.mark_protected(pop, weights, criteria=[("distance_from_optimal", 0.0)])
     assert p1.protected
     assert not p2.protected
 
@@ -392,7 +392,7 @@ def test_directed_evolution_batch_picks_the_true_best_alternative(aa_seq, analys
         for alt in alternatives:
             candidate = codons.copy()
             candidate[position] = alt
-            scores[alt] = score_changevec(calculate_change_vector(candidate, analysis_objects), weights)
+            scores[alt] = distance_from_optimal(calculate_change_vector(candidate, analysis_objects), weights)
         assert scores[chosen_codon] == min(scores.values())
 
 

@@ -384,7 +384,8 @@ def _step_kill_off(pop: list, ctx: ScheduleContext, params: dict) -> list:
     as the "protect" step's `criteria` -- exempts qualifying individuals
     from THIS cull only, without permanently setting .protected the way
     the "protect" step does. e.g. {"kind": "kill_off", "percent_cut": 40,
-    "protect": [["fitness", 0.1]]} spares the top 10% by fitness from just
+    "protect": [["distance_from_optimal", 0.1]]} spares the top 10% by
+    distance from optimal from just
     this round's stochastic dying, but they're fair game again next time
     unless a separate "protect" step (or this same `protect` option on a
     later kill_off) says otherwise. See ga.kill_off()'s `protect_criteria`
@@ -425,9 +426,10 @@ def _step_protect(pop: list, ctx: ScheduleContext, params: dict) -> list:
     criteria, "lowest score = best", monotonic (never unprotects).
 
     `criteria` is required: a list of [metric, top_fraction] pairs, e.g.
-    {"kind": "protect", "criteria": [["fitness", 0.10], ["Uracil", 0.40]]}
-    protects the best 10% by overall weighted fitness UNION the best 40%
-    by Uracil depletion alone. `metric` is "fitness" or any registered
+    {"kind": "protect", "criteria": [["distance_from_optimal", 0.10], ["Uracil", 0.40]]}
+    protects the best 10% by overall weighted distance from optimal UNION
+    the best 40%
+    by Uracil depletion alone. `metric` is "distance_from_optimal" or any registered
     change-vector term name. Refreshes change vectors exactly first, same
     as "kill_off"/"select"/"flatten" -- a protection decision needs
     accurate scores, not growth's cheaper diffed approximation."""

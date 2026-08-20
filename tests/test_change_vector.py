@@ -4,7 +4,7 @@ import math
 import numpy as np
 import pytest
 
-from genewriter.change_vector import cached_mean_std, cached_stat, calculate_change_vector, score_changevec
+from genewriter.change_vector import cached_mean_std, cached_stat, calculate_change_vector, distance_from_optimal
 from genewriter.codon_tables import AA_CODONS, generate_codon_vec, get_aa
 
 from conftest import random_solution as _random_solution
@@ -12,7 +12,7 @@ from conftest import random_solution as _random_solution
 
 def test_calculate_change_vector_runs_and_covers_every_position(aa_seq, analysis_objects):
     """The original crashed before returning anything (ProposedSolution
-    NameError / empty cpbchangevec IndexError / dist_from_optimal tuple
+    NameError / empty cpbchangevec IndexError / optimal_usage_score tuple
     unpacking / windowlength AttributeError). This is the base smoke test:
     it must simply complete and produce one score per codon per term."""
     sol = _random_solution(aa_seq)
@@ -256,7 +256,7 @@ def test_kmer_term_penalizes_under_represented_kmers_more_than_over_represented(
 
 
 def test_dist_from_optimal_accepts_plain_codon_strings(aa_seq, analysis_objects):
-    """Original bug: dist_from_optimal() was called with windows of plain
+    """Original bug: optimal_usage_score() was called with windows of plain
     codon strings but its body did `for codon, location in codons`, which
     raises ValueError trying to unpack a 3-character string into 2 names.
     Covered implicitly by the smoke test above via the CodonUsage term, but
@@ -266,10 +266,10 @@ def test_dist_from_optimal_accepts_plain_codon_strings(aa_seq, analysis_objects)
     assert len(vecs['CodonUsage']) == len(sol)
 
 
-def test_score_changevec_is_a_plain_float(aa_seq, analysis_objects, weights):
+def test_distance_from_optimal_is_a_plain_float(aa_seq, analysis_objects, weights):
     sol = _random_solution(aa_seq)
     vecs = calculate_change_vector(sol, analysis_objects)
-    score = score_changevec(vecs, weights)
+    score = distance_from_optimal(vecs, weights)
     assert isinstance(score, float)
 
 
@@ -294,7 +294,7 @@ def test_rare_codon_term_never_produces_nan_from_unobserved_window(aa_seq, analy
     rare-codon count was never observed in the baseline, its score is
     float('inf'); at any position that isn't itself a rare codon, the
     original `scorevec[i] * rvec[i] * zscore` computed inf * 0, which is NaN
-    under IEEE 754 -- not 0 as intended. NaN then poisons score_changevec
+    under IEEE 754 -- not 0 as intended. NaN then poisons distance_from_optimal
     and crashes the GA's random.choices() calls downstream. Every non-rare
     position must score exactly 0.0 for this term when its window is
     unobserved, never NaN."""

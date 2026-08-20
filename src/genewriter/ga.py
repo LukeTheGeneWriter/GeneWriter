@@ -59,7 +59,7 @@ import sys
 
 import numpy as np
 
-from .change_vector import AnalysisObjects, calculate_change_vector, diff_change_vector, require_weights, score_changevec
+from .change_vector import AnalysisObjects, calculate_change_vector, diff_change_vector, require_weights, distance_from_optimal
 from .classes import Proposed_Solution
 from .codon_tables import generate_codon_vec, sequence_space_size
 from .gpu_change_vector import batch_calculate_change_vectors
@@ -473,7 +473,7 @@ def directed_evolution(
             candidate = sol.copy()
             candidate[position] = alt
             candidate_vecs = diff_change_vector(sol, changevecs, candidate, analysis_objects, locvec)
-            candidate_score = score_changevec(candidate_vecs, weights)
+            candidate_score = distance_from_optimal(candidate_vecs, weights)
             if best_score is None or candidate_score < best_score:
                 best_codon, best_score = alt, candidate_score
 
@@ -616,7 +616,7 @@ def directed_evolution_batch(
 
     best_alt = {}  # (key, position) -> (best_alt, best_score, vecs)
     for (key, position, alt), vecs in zip(candidate_owner, vecs_list):
-        score = score_changevec(vecs, weights)
+        score = distance_from_optimal(vecs, weights)
         current = best_alt.get((key, position))
         if current is None or score < current[1]:
             best_alt[(key, position)] = (alt, score, vecs)
@@ -692,7 +692,7 @@ def select_survivors(pop: list, weights: dict, target_size: int) -> list:
     num_to_remove = min(num_to_remove, len(removable))
     if num_to_remove <= 0:
         return pop
-    die_weights = [_finite_nonneg(score_changevec(pop[i].change_vecs, weights)) for i in removable]
+    die_weights = [_finite_nonneg(distance_from_optimal(pop[i].change_vecs, weights)) for i in removable]
     keys = [math.log(max(random.random(), 1e-300)) / w for w in die_weights]
     victims = {removable[j] for j in heapq.nlargest(num_to_remove, range(len(removable)), key=lambda j: keys[j])}
     return [p for i, p in enumerate(pop) if i not in victims]
@@ -808,17 +808,26 @@ def flatten_generation(
 
 
 def _score_by_metric(pop: list, weights: dict, metric: str) -> list:
-    """One score per individual for `metric` -- "fitness" (score_changevec(),
-    the full weighted aggregate) or a single registered change-vector term
-    name (summed the same way score_changevec() reduces each term before
-    weighting: sum(), not mean, for a directly comparable scale). Shared by
-    mark_protected()/_top_fraction_indices() and kill_off_by_term(). Raises
-    ValueError naming the valid options for an unrecognized term, rather
-    than a bare KeyError."""
-    if metric == "fitness":
-        return [_finite_nonneg(score_changevec(p.change_vecs, weights)) for p in pop]
+    """One score per individual for `metric` -- "distance_from_optimal"
+    (change_vector.distance_from_optimal(), the full weighted aggregate) or
+    a single registered change-vector term name (summed the same way
+    distance_from_optimal() reduces each term before weighting: sum(), not
+    mean, for a directly comparable scale). Shared by mark_protected()/
+    _top_fraction_indices() and kill_off_by_term(). Raises ValueError naming
+    the valid options for an unrecognized term, rather than a bare KeyError.
+
+    "distance_from_optimal" was called "fitness" until 2026-08-20 -- that
+    exact string is special-cased in the error below, since saved schedules
+    and pasted Colab configs predating the rename will still carry it."""
+    if metric == "distance_from_optimal":
+        return [_finite_nonneg(distance_from_optimal(p.change_vecs, weights)) for p in pop]
     if pop and metric not in pop[0].change_vecs:
-        raise ValueError(f"Unknown metric {metric!r} -- must be 'fitness' or one of {sorted(pop[0].change_vecs)}.")
+        hint = (" -- 'fitness' was renamed to 'distance_from_optimal' on 2026-08-20"
+                if metric == "fitness" else "")
+        raise ValueError(
+            f"Unknown metric {metric!r}{hint} -- must be 'distance_from_optimal' "
+            f"or one of {sorted(pop[0].change_vecs)}."
+        )
     return [_finite_nonneg(sum(p.change_vecs[metric])) for p in pop]
 
 
@@ -849,7 +858,7 @@ def _kill_off_by_scores(pop: list, scores: list, percent_cut: int, immune: set =
     individual needs mutation", whatever the caller's `scores` measures),
     one unit at a time; an individual whose count reaches 0 is dropped.
     The two callers differ only in what "most in need" means -- kill_off()'s
-    weighted aggregate score_changevec() vs. kill_off_by_term()'s single
+    weighted aggregate distance_from_optimal() vs. kill_off_by_term()'s single
     term.
 
     Individuals with .protected == True, OR whose index is in `immune`
@@ -887,7 +896,8 @@ def kill_off(pop: list, weights: dict, percent_cut: int = 30, protect_criteria: 
     shape/semantics as mark_protected()'s `criteria` -- individuals that
     qualify are exempt from THIS cull only (see _top_fraction_indices()),
     without ever setting .protected. Use this for "don't let this
-    particular stochastic cull touch the top 10% by fitness" as a one-off,
+    particular stochastic cull touch the top 10% by distance from optimal"
+    as a one-off,
     vs. mark_protected()/the "protect" schedule step's permanent-until-
     replaced version of the same ranking. None (default): unchanged, only
     .protected individuals are exempt.
@@ -901,7 +911,7 @@ def kill_off(pop: list, weights: dict, percent_cut: int = 30, protect_criteria: 
     number can reach 0, dead individuals are dropped, and the loop stops
     once nothing is left to kill.
     """
-    scores = _score_by_metric(pop, weights, "fitness")
+    scores = _score_by_metric(pop, weights, "distance_from_optimal")
     immune = _top_fraction_indices(pop, weights, protect_criteria) if protect_criteria else None
     return _kill_off_by_scores(pop, scores, percent_cut, immune=immune)
 
@@ -921,7 +931,7 @@ def kill_off_by_term(pop: list, term: str, percent_cut: int = 30, protect_criter
 
     protect_criteria/weights: same one-off exemption as kill_off()'s
     `protect_criteria` -- see its docstring. `weights` is only actually
-    read if protect_criteria includes a "fitness" entry (term-only
+    read if protect_criteria includes a "distance_from_optimal" entry (term-only
     criteria never need it); required in that case, ignored otherwise."""
     scores = _score_by_metric(pop, weights, term)
     immune = _top_fraction_indices(pop, weights, protect_criteria) if protect_criteria else None
@@ -933,12 +943,13 @@ def mark_protected(pop: list, weights: dict, criteria: list) -> list:
     `top_fraction` (best -- i.e. lowest score, "needs the least mutation")
     for ANY of the given (metric, top_fraction) pairs in `criteria` -- a
     UNION across criteria, not an intersection (see _top_fraction_indices(),
-    the shared ranking step this uses). e.g. criteria=[("fitness", 0.10),
+    the shared ranking step this uses). e.g. criteria=[("distance_from_optimal", 0.10),
     ("Uracil", 0.40)] protects whichever individuals are in the best 10% by
-    overall weighted fitness, PLUS whichever are in the best 40% by Uracil
+    overall weighted distance from optimal, PLUS whichever are in the best
+    40% by Uracil
     depletion alone, even if those two groups barely overlap.
 
-    metric is "fitness" (score_changevec(), the same weighted aggregate
+    metric is "distance_from_optimal" (distance_from_optimal(), the same weighted aggregate
     kill_off()/select_survivors() rank by) or any single registered
     change-vector term name, summed the same way kill_off_by_term() does.
     "Lowest score = best" throughout this codebase's convention (every
@@ -977,8 +988,8 @@ def kill_off_outside_natural_range(pop: list, analysis_objects: AnalysisObjects,
     the worst overall weighted score, but never guarantees any individual
     genotype survives or dies. This one is an absolute guardrail -- "no
     candidate this far outside nature's own observed range for any single
-    metric survives," independent of how good its overall weighted fitness
-    looks. An individual's entire replicate count is dropped (not
+    metric survives," independent of how good its overall weighted distance
+    from optimal looks. An individual's entire replicate count is dropped (not
     proportionally reduced like kill_off()) -- the cut is a property of the
     genotype itself, not something a fraction of its copies can be exempt
     from.

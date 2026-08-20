@@ -1,5 +1,6 @@
 """t-SNE visualization of a GA population's codon-choice ("genotype")
-neighborhoods, colored by fitness or any individual change-vector term --
+neighborhoods, colored by distance from optimal or any individual
+change-vector term --
 literally see hotspots: clusters of genotypes the GA converged on, colored
 by why they're doing well (or badly).
 
@@ -24,7 +25,7 @@ but "how much of the population sits within X% nucleotide identity of one
 fixed reference sequence" (e.g. a patent attorney's actual filing
 candidate). Reuses the same t-SNE embedding machinery for spatial layout,
 but colors by discrete similarity band to that one reference instead of a
-continuous fitness/term scale.
+continuous distance-from-optimal/term scale.
 """
 
 import glob
@@ -35,7 +36,7 @@ import re
 
 import numpy as np
 
-from .change_vector import calculate_change_vector, registered_terms, score_changevec
+from .change_vector import calculate_change_vector, registered_terms, distance_from_optimal
 from .classes import Proposed_Solution
 from .codon_tables import encode_codons
 
@@ -266,12 +267,14 @@ def plot_population_similarity_to_reference(
     return fig, band_counts, identities
 
 
-def fitness_color_values(pop: list, weights: dict, color_by: str) -> np.ndarray:
+def metric_color_values(pop: list, weights: dict, color_by: str) -> np.ndarray:
     """Per-individual color value for one color_by mode:
 
-    - 'fitness': the same weighted score_changevec() total ga.kill_off()/
-      ga.select_survivors() actually use to decide who dies -- the real
-      selection pressure driving the run, not a separate ad-hoc metric.
+    - 'distance_from_optimal': the same weighted aggregate (change_vector.
+      distance_from_optimal()) that ga.kill_off()/ga.select_survivors()
+      actually use to decide who dies -- the real selection pressure
+      driving the run, not a separate ad-hoc metric. Called 'fitness'
+      until 2026-08-20.
     - a registered change-vector term name (e.g. 'GC', 'RareCodons',
       'Uracil'): that term's own raw (unweighted) per-individual sum --
       deliberately NOT multiplied by weights[term], so a term configured
@@ -281,21 +284,26 @@ def fitness_color_values(pop: list, weights: dict, color_by: str) -> np.ndarray:
     Non-finite values are clamped to the finite extremes before returning
     -- see _sanitize_for_color()'s docstring for why this matters (caught
     on a real render against real sample gene data: RareCodons -- and, by
-    summation, 'fitness' -- came back all-inf and every point silently
-    vanished from that panel).
+    summation, 'distance_from_optimal' -- came back all-inf and every point
+    silently vanished from that panel).
     """
-    if color_by == 'fitness':
-        values = np.asarray([score_changevec(p.change_vecs, weights) for p in pop], dtype=float)
+    if color_by == 'distance_from_optimal':
+        values = np.asarray([distance_from_optimal(p.change_vecs, weights) for p in pop], dtype=float)
     else:
         terms = registered_terms()
         if color_by not in terms:
-            raise ValueError(f"Unknown color_by {color_by!r} -- must be 'fitness' or one of {sorted(terms)}")
+            hint = (" -- 'fitness' was renamed to 'distance_from_optimal' on 2026-08-20"
+                    if color_by == 'fitness' else "")
+            raise ValueError(
+                f"Unknown color_by {color_by!r}{hint} -- must be "
+                f"'distance_from_optimal' or one of {sorted(terms)}"
+            )
         values = np.asarray([sum(p.change_vecs[color_by]) for p in pop], dtype=float)
     return _sanitize_for_color(values)
 
 
 def _percentile_rank(values: np.ndarray) -> np.ndarray:
-    """Raw color values (fitness_color_values()'s output) rescaled to
+    """Raw color values (metric_color_values()'s output) rescaled to
     percentile rank in [0, 100] -- fixes the "everything looks the same
     shade" problem a raw min/max-normalized colormap has whenever a few
     outliers (e.g. an inf-clamped RareCodons score -- see
@@ -333,8 +341,8 @@ def _sanitize_for_color(values: np.ndarray) -> np.ndarray:
     defaults to float('inf') for a window composition never observed in
     the baseline (a small/local baseline -- exactly what real sample gene
     data or a quick synthetic test corpus gives you -- hits this far more
-    than a real genome-wide Standards baseline would). 'fitness' inherits
-    it via score_changevec()'s summation across terms. Passing an array
+    than a real genome-wide Standards baseline would). 'distance_from_optimal' inherits
+    it via distance_from_optimal()'s summation across terms. Passing an array
     containing inf as a matplotlib scatter `c=` value produces NaN after
     color normalization (min/max-based), which matplotlib then silently
     does not draw -- no error, no warning, just missing points. Caught by
@@ -358,7 +366,7 @@ def _sanitize_for_color(values: np.ndarray) -> np.ndarray:
 def plot_population_tsne(
     pop: list,
     weights: dict,
-    color_by=('fitness',),
+    color_by=('distance_from_optimal',),
     max_points: int = 4000,
     perplexity: float = 30.0,
     random_state: int = 0,
@@ -372,11 +380,11 @@ def plot_population_tsne(
 
     pop: list of Proposed_Solution -- a live run's population (e.g.
         ga.run_ga()'s return value) or load_population_json()'s output.
-    weights: only consulted for color_by='fitness' -- same weights dict
+    weights: only consulted for color_by='distance_from_optimal' -- same weights dict
         passed to run_ga()/run_schedule().
-    color_by: iterable of 'fitness' and/or any registered change-vector
+    color_by: iterable of 'distance_from_optimal' and/or any registered change-vector
         term name (see change_vector.registered_terms()) -- one subplot
-        per entry. Each mode's raw score (fitness_color_values()) is
+        per entry. Each mode's raw score (metric_color_values()) is
         rescaled to percentile rank (see _percentile_rank()) before
         coloring, so contrast stays spread across the full colormap
         instead of collapsing toward one shade whenever the raw
@@ -425,7 +433,7 @@ def plot_population_tsne(
     axes = axes[0]
 
     for ax, mode in zip(axes, color_by):
-        ranks = _percentile_rank(fitness_color_values(sampled, weights, mode))
+        ranks = _percentile_rank(metric_color_values(sampled, weights, mode))
         scatter = ax.scatter(coords[:, 0], coords[:, 1], c=ranks, s=sizes, cmap='viridis', vmin=0, vmax=100)
         ax.set_title(mode)
         ax.set_xticks([])
@@ -507,7 +515,7 @@ def plot_population_trajectory(
     analysis_objects=None,
     natural_codons: list = None,
     locvec: list = None,
-    color_by=('fitness',),
+    color_by=('distance_from_optimal',),
     max_points_per_gen: int = 500,
     perplexity: float = 30.0,
     random_state: int = 0,
@@ -535,10 +543,11 @@ def plot_population_trajectory(
     its generation number (sequential colormap), with each generation's
     centroid connected by a line -- the actual "did the population move,
     and which way" signal this function exists for. One further panel is
-    drawn per color_by entry (same fitness/term semantics as
+    drawn per color_by entry (same distance-from-optimal/term semantics as
     plot_population_tsne, including the percentile-rank color rescaling --
     see _percentile_rank()), on the identical embedding, so you can check
-    whether the migration in panel 1 lines up with a real fitness/term
+    whether the migration in panel 1 lines up with a real
+    distance-from-optimal/term
     improvement rather than random drift.
 
     natural_codons: the real target gene's own codon list (list[str]), if
@@ -592,7 +601,7 @@ def plot_population_trajectory(
                     label='generation centroid')
             ax.set_title('generation (trajectory)')
         else:
-            ranks = _percentile_rank(fitness_color_values(pooled, weights, mode))
+            ranks = _percentile_rank(metric_color_values(pooled, weights, mode))
             scatter = ax.scatter(coords[:, 0], coords[:, 1], c=ranks, s=sizes, cmap='viridis', vmin=0, vmax=100)
             fig.colorbar(scatter, ax=ax, shrink=0.8, label='percentile rank')
             ax.set_title(mode)
@@ -621,7 +630,7 @@ def animate_population_trajectory(
     analysis_objects=None,
     natural_codons: list = None,
     locvec: list = None,
-    color_by=('fitness',),
+    color_by=('distance_from_optimal',),
     max_points_per_gen: int = 500,
     perplexity: float = 30.0,
     random_state: int = 0,
@@ -644,7 +653,7 @@ def animate_population_trajectory(
     move rather than staring at one frozen superposition of every
     generation at once.
 
-    color_by: iterable of 'fitness' and/or any registered change-vector
+    color_by: iterable of 'distance_from_optimal' and/or any registered change-vector
         term name (see change_vector.registered_terms()) -- one column of
         panels per entry. Each mode's raw score is rescaled to percentile
         rank (see _percentile_rank()) ONCE, up front, so the color scale
@@ -695,7 +704,7 @@ def animate_population_trajectory(
     sizes = _size_by_count(pooled, size_range) if size_by_count else np.full(len(pooled), sum(size_range) / 2.0)
 
     color_by = list(color_by)
-    rank_colors = {mode: _percentile_rank(fitness_color_values(pooled, weights, mode)) for mode in color_by}
+    rank_colors = {mode: _percentile_rank(metric_color_values(pooled, weights, mode)) for mode in color_by}
 
     nrows, ncols = len(trail_variants), len(color_by)
     fig, axes = plt.subplots(

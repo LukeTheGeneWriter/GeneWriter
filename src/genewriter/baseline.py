@@ -22,7 +22,7 @@ import os
 
 from .classes import CodonAnalysis, CodonPairBiasAnalysis, GCAnalysis, KmerAnalysis, RareCodonAnalysis
 from .codon_tables import CODON_FREQS_LIT, RARE_CODONS_LIT, TAG_TO_BUCKET, TAG_TO_WINDOW_BUCKET, codon_choices_for_aa, get_aa
-from .change_vector import AnalysisObjects, dist_from_optimal
+from .change_vector import AnalysisObjects, optimal_usage_score
 from .gene_io import protein_coding_isoforms
 
 
@@ -149,7 +149,7 @@ def compute_codon_usage_analysis(genes: list, organism: str = "human", winsize: 
             window = just_codons[i:i + winsize]
             window_score = sum(CODON_FREQS_LIT[c] for c in window) / winsize
             window_scores.append(window_score)
-            window_dist_from_optimal.append(abs(dist_from_optimal(window) - window_score))
+            window_dist_from_optimal.append(abs(optimal_usage_score(window) - window_score))
 
     return CodonAnalysis(
         organism=organism,

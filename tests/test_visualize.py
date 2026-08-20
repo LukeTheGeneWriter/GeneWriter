@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from genewriter import ga
-from genewriter.change_vector import calculate_change_vector, score_changevec
+from genewriter.change_vector import calculate_change_vector, distance_from_optimal
 from genewriter.classes import Proposed_Solution
 from genewriter.visualize import (
     _assign_similarity_band,
@@ -17,7 +17,7 @@ from genewriter.visualize import (
     _size_by_count,
     animate_population_trajectory,
     codon_distance_matrix,
-    fitness_color_values,
+    metric_color_values,
     load_population_json,
     load_population_trajectory,
     nucleotide_identity_to_reference,
@@ -70,23 +70,23 @@ def test_codon_distance_matrix_handles_single_individual():
     assert dist[0, 0] == 0.0
 
 
-def test_fitness_color_values_fitness_mode_matches_score_changevec(aa_seq, analysis_objects, weights):
+def test_metric_color_values_aggregate_mode_matches_distance_from_optimal(aa_seq, analysis_objects, weights):
     pop = _population(aa_seq, analysis_objects)
-    colors = fitness_color_values(pop, weights, 'fitness')
-    expected = [score_changevec(p.change_vecs, weights) for p in pop]
+    colors = metric_color_values(pop, weights, 'distance_from_optimal')
+    expected = [distance_from_optimal(p.change_vecs, weights) for p in pop]
     assert colors.tolist() == pytest.approx(expected)
 
 
-def test_fitness_color_values_term_mode_is_raw_unweighted_sum(aa_seq, analysis_objects, weights):
+def test_metric_color_values_term_mode_is_raw_unweighted_sum(aa_seq, analysis_objects, weights):
     """Deliberately NOT multiplied by weights[term] -- a term at weight 0
     (Uracil defaults to 0.0) must still show its real signal, not an
     all-zero color axis."""
     pop = _population(aa_seq, analysis_objects)
-    colors = fitness_color_values(pop, weights, 'GC')
+    colors = metric_color_values(pop, weights, 'GC')
     expected = [sum(p.change_vecs['GC']) for p in pop]
     assert colors.tolist() == pytest.approx(expected)
 
-    uracil_colors = fitness_color_values(pop, weights, 'Uracil')
+    uracil_colors = metric_color_values(pop, weights, 'Uracil')
     expected_uracil = [sum(p.change_vecs['Uracil']) for p in pop]
     assert uracil_colors.tolist() == pytest.approx(expected_uracil)
     # weights['Uracil'] is 0.0 in the shared fixture -- if this were
@@ -94,10 +94,10 @@ def test_fitness_color_values_term_mode_is_raw_unweighted_sum(aa_seq, analysis_o
     assert any(v != 0.0 for v in uracil_colors)
 
 
-def test_fitness_color_values_unknown_mode_raises(aa_seq, analysis_objects, weights):
+def test_metric_color_values_unknown_mode_raises(aa_seq, analysis_objects, weights):
     pop = _population(aa_seq, analysis_objects)
     with pytest.raises(ValueError, match="Unknown color_by"):
-        fitness_color_values(pop, weights, 'NotARealTerm')
+        metric_color_values(pop, weights, 'NotARealTerm')
 
 
 def test_sanitize_for_color_clamps_posinf_to_finite_max():
@@ -120,16 +120,16 @@ def test_sanitize_for_color_falls_back_to_zeros_when_nothing_is_finite():
     assert out.tolist() == [0.0, 0.0, 0.0]
 
 
-def test_fitness_color_values_never_returns_non_finite(aa_seq, analysis_objects, weights):
+def test_metric_color_values_never_returns_non_finite(aa_seq, analysis_objects, weights):
     """Real bug, caught by actually rendering a figure against real sample
     gene data (not by the smoke tests alone, whose small synthetic
     baselines never happened to trigger it): change_vector._rare_codon_term
     legitimately returns float('inf') for a window composition never
     observed in the baseline (see that function's own docstring) -- and
-    'fitness' inherits it via score_changevec()'s summation across terms.
+    'distance_from_optimal' inherits it via distance_from_optimal()'s summation across terms.
     An inf-valued matplotlib scatter `c=` array silently drops those
     points instead of erroring, so this must never leak through
-    fitness_color_values(). Forces the same all-inf scenario
+    metric_color_values(). Forces the same all-inf scenario
     test_rare_codon_term_never_produces_nan_from_unobserved_window
     (test_change_vector.py) does."""
     import math
@@ -139,8 +139,8 @@ def test_fitness_color_values_never_returns_non_finite(aa_seq, analysis_objects,
     assert any(math.isinf(sum(p.change_vecs['RareCodons'])) for p in pop), \
         "test setup didn't actually force an inf RareCodons score -- test is meaningless"
 
-    for mode in ('fitness', 'RareCodons'):
-        colors = fitness_color_values(pop, weights, mode)
+    for mode in ('distance_from_optimal', 'RareCodons'):
+        colors = metric_color_values(pop, weights, mode)
         assert np.isfinite(colors).all(), f"{mode} color values contained a non-finite entry"
 
 
@@ -192,7 +192,7 @@ def test_load_population_json_defaults_protected_false_for_old_checkpoints(tmp_p
 
 def test_plot_population_tsne_returns_figure_with_one_subplot_per_mode(aa_seq, analysis_objects, weights):
     pop = _population(aa_seq, analysis_objects, n=12)
-    fig = plot_population_tsne(pop, weights, color_by=['fitness', 'GC', 'Uracil'], max_points=100)
+    fig = plot_population_tsne(pop, weights, color_by=['distance_from_optimal', 'GC', 'Uracil'], max_points=100)
     assert len(fig.axes) == 3 + 3  # 3 scatter axes + 3 colorbar axes
     import matplotlib.pyplot as plt
     plt.close(fig)
@@ -200,7 +200,7 @@ def test_plot_population_tsne_returns_figure_with_one_subplot_per_mode(aa_seq, a
 
 def test_plot_population_tsne_subsamples_large_populations(aa_seq, analysis_objects, weights):
     pop = _population(aa_seq, analysis_objects, n=30)
-    fig = plot_population_tsne(pop, weights, color_by=['fitness'], max_points=10)
+    fig = plot_population_tsne(pop, weights, color_by=['distance_from_optimal'], max_points=10)
     assert "10 of 30" in fig._suptitle.get_text()
     import matplotlib.pyplot as plt
     plt.close(fig)
@@ -231,8 +231,8 @@ def test_load_population_trajectory_raises_when_nothing_matches(tmp_path):
 
 def test_plot_population_trajectory_returns_figure_with_generation_and_mode_panels(tmp_path, aa_seq, analysis_objects, weights):
     _save_generations(tmp_path, aa_seq, analysis_objects)
-    fig = plot_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness', 'GC'])
-    # 3 scatter axes (generation, fitness, GC) + 3 colorbar axes
+    fig = plot_population_trajectory(str(tmp_path), "traj", weights, color_by=['distance_from_optimal', 'GC'])
+    # 3 scatter axes (generation, distance_from_optimal, GC) + 3 colorbar axes
     assert len(fig.axes) == 6
     import matplotlib.pyplot as plt
     plt.close(fig)
@@ -294,7 +294,7 @@ def test_plot_population_trajectory_includes_natural_cds_reference_point(tmp_pat
 
 def test_animate_population_trajectory_both_trail_variants_makes_two_rows(tmp_path, aa_seq, analysis_objects, weights):
     _save_generations(tmp_path, aa_seq, analysis_objects)
-    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness', 'GC'], trail='both')
+    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['distance_from_optimal', 'GC'], trail='both')
     fig = anim._fig
     # 2 trail variants x 2 color_by modes = 4 scatter axes, each with its own colorbar axis
     assert len(fig.axes) == 8
@@ -304,7 +304,7 @@ def test_animate_population_trajectory_both_trail_variants_makes_two_rows(tmp_pa
 
 def test_animate_population_trajectory_current_only_makes_one_row(tmp_path, aa_seq, analysis_objects, weights):
     _save_generations(tmp_path, aa_seq, analysis_objects)
-    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness'], trail='current')
+    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['distance_from_optimal'], trail='current')
     fig = anim._fig
     assert len(fig.axes) == 2  # 1 scatter axis + 1 colorbar axis
     import matplotlib.pyplot as plt
@@ -321,7 +321,7 @@ def test_animate_population_trajectory_frame_only_shows_that_generations_points(
     """Core ask this function exists for: each frame is ONE generation on
     the shared embedding, not every generation overlaid at once."""
     _save_generations(tmp_path, aa_seq, analysis_objects, gens=(0, 1, 2), n_per_gen=6)
-    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['fitness'], trail='current')
+    anim = animate_population_trajectory(str(tmp_path), "traj", weights, color_by=['distance_from_optimal'], trail='current')
     fig = anim._fig
     ax = fig.axes[0]
     scatter = ax.collections[0]
@@ -412,7 +412,7 @@ def test_animate_population_trajectory_saves_gif(tmp_path, aa_seq, analysis_obje
     _save_generations(tmp_path, aa_seq, analysis_objects)
     out_path = tmp_path / "trajectory.gif"
     anim = animate_population_trajectory(
-        str(tmp_path), "traj", weights, color_by=['fitness'], out_path=str(out_path), fps=5,
+        str(tmp_path), "traj", weights, color_by=['distance_from_optimal'], out_path=str(out_path), fps=5,
     )
     assert out_path.exists()
     assert out_path.stat().st_size > 0

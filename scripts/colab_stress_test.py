@@ -315,7 +315,7 @@ CONFIG = dict(
     #   kill_off_by_term {"term", "percent_cut", "protect"} -- proportional
     #               cull, one term's score only; same optional "protect"
     #   protect    {"criteria": [[metric, top_fraction], ...]} -- PERMANENTLY
-    #               shield the best top_fraction by "fitness" or one term
+    #               shield the best top_fraction by "distance_from_optimal" or one term
     #               (union across criteria) from kill_off/kill_off_by_term/
     #               select until a new genotype replaces the individual
     #   select     {"target_size"}                     -- cap distinct pop
@@ -790,7 +790,8 @@ if __name__ == "__main__":
 #   final_pop = run_pipeline(CONFIG, aa_seq, locvec, analysis_objects, xp_gpu, genes)
 #
 #   # cell 3 (seconds -- t-SNE over codon-choice neighborhoods, colored by
-#   # fitness/any change-vector term -- see genewriter.visualize's module
+#   # distance from optimal/any change-vector term -- see
+#   # genewriter.visualize's module
 #   # docstring). Needs final_pop from cell 2 -- if that wasn't captured
 #   # (e.g. you ran main() directly instead), reload the latest saved
 #   # generation from RUN_GA_OPTIONS['save_dir'] instead (see that dict's
@@ -799,7 +800,7 @@ if __name__ == "__main__":
 #   # finished to visualize its most recent generation).
 #   from genewriter.visualize import plot_population_tsne
 #   import matplotlib.pyplot as plt
-#   fig = plot_population_tsne(final_pop, CONFIG["WEIGHTS"], color_by=["fitness", "GC", "RareCodons", "Uracil"])
+#   fig = plot_population_tsne(final_pop, CONFIG["WEIGHTS"], color_by=["distance_from_optimal", "GC", "RareCodons", "Uracil"])
 #   plt.show()
 #
 #   # cell 4 (generation-over-time trajectory across every checkpoint
@@ -814,6 +815,6 @@ if __name__ == "__main__":
 #   fig = plot_population_trajectory(
 #       CONFIG["RUN_GA_OPTIONS"]["save_dir"], CONFIG["RUN_GA_OPTIONS"]["run_name"], CONFIG["WEIGHTS"],
 #       analysis_objects=analysis_objects, natural_codons=natural_codons, locvec=locvec,
-#       color_by=["fitness", "GC"],
+#       color_by=["distance_from_optimal", "GC"],
 #   )
 #   plt.show()

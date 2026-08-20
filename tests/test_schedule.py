@@ -134,11 +134,11 @@ def test_step_kill_off_by_term_requires_term_param(ctx):
 def test_step_kill_off_inline_protect_shields_without_setting_protected(ctx):
     """The `protect` option on a "kill_off" step is a one-cull-only
     exemption, not the permanent "protect" step's flag -- the top 20% by
-    fitness must survive a 100% cut here, but come out with .protected
+    distance from optimal must survive a 100% cut here, but come out with .protected
     still False (a later plain kill_off can still remove them)."""
     seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 20}])
     result = sched.run_steps(seeded, ctx, [
-        {"kind": "kill_off", "percent_cut": 100, "protect": [["fitness", 0.2]]},
+        {"kind": "kill_off", "percent_cut": 100, "protect": [["distance_from_optimal", 0.2]]},
     ])
     assert len(result) > 0
     assert all(not p.protected for p in result)
@@ -147,7 +147,7 @@ def test_step_kill_off_inline_protect_shields_without_setting_protected(ctx):
 def test_step_kill_off_by_term_inline_protect_shields_without_setting_protected(ctx):
     seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 20}])
     result = sched.run_steps(seeded, ctx, [
-        {"kind": "kill_off_by_term", "term": "CodonPairBias", "percent_cut": 100, "protect": [["fitness", 0.2]]},
+        {"kind": "kill_off_by_term", "term": "CodonPairBias", "percent_cut": 100, "protect": [["distance_from_optimal", 0.2]]},
     ])
     assert len(result) > 0
     assert all(not p.protected for p in result)
@@ -158,7 +158,7 @@ def test_step_protect_shields_everyone_when_top_fraction_is_one(ctx):
     protected -- a subsequent kill_off must then remove nothing at all."""
     seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
     total_before = sum(p.number for p in seeded)
-    protected = sched.run_steps(seeded, ctx, [{"kind": "protect", "criteria": [["fitness", 1.0]]}])
+    protected = sched.run_steps(seeded, ctx, [{"kind": "protect", "criteria": [["distance_from_optimal", 1.0]]}])
     assert all(p.protected for p in protected)
 
     result = sched.run_steps(protected, ctx, [{"kind": "kill_off", "percent_cut": 100}])
