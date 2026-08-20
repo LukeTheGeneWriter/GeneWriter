@@ -7,7 +7,14 @@ byte-for-byte verified against the same genes).
 
 import dataclasses
 
-from .baseline_shard_util import atomic_write_json, concat_lists, load_json_shards, sum_nested_dict_by_key, sum_scalar_by_key
+from .baseline_shard_util import (
+    atomic_write_json,
+    concat_lists,
+    concat_nested_dict_of_lists,
+    load_json_shards,
+    sum_nested_dict_by_key,
+    sum_scalar_by_key,
+)
 from .classes import CodonAnalysis
 from .gpu_codon_usage_count import count_codon_usage_for_chunk
 from .gpu_corpus_batch import select_backend
@@ -38,4 +45,5 @@ def finalize(shard_dir: str, organism: str = "human", **_unused_kwargs) -> Codon
         windowsize=shards[0]['windowsize'],
         windowscores=concat_lists(s['windowscores'] for s in shards),
         windowdistancesfromoptimal=concat_lists(s['windowdistancesfromoptimal'] for s in shards),
+        codonUsagePercentByAA=concat_nested_dict_of_lists(s['codonUsagePercentByAA'] for s in shards),
     )

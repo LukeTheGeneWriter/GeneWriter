@@ -337,44 +337,57 @@ def _rare_codon_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: lis
 
 
 @register_term('CodonUsage')
-def _codon_usage_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list, winsize: int = 15) -> list:
+def _codon_usage_term(sol: list, analysis_objects: 'AnalysisObjects', locvec: list) -> list:
+    """Whole-sequence, per-amino-acid codon-choice PERCENTAGE comparison --
+    redesigned 2026-08-19 (Luke's explicit spec) to replace the previous
+    formula, which scored codon choices against CODON_FREQS_LIT (a fixed,
+    amino-acid-agnostic literature frequency table) rather than against
+    how real genes actually split their USE of each amino acid's own
+    synonyms. See CodonAnalysis.codonUsagePercentByAA's docstring for the
+    baseline this scores against, and memory/codon_usage_term_percentage_
+    redesign.md for the full before/after.
+
+    For every amino acid actually present in `sol`: compute what fraction
+    of THIS candidate's occurrences of that amino acid use each of its
+    synonymous codons (the same per-gene percentage
+    accumulate_codon_usage_percent_by_aa() computes for a real gene), then
+    z-score each synonym's percentage against the pooled natural
+    distribution for that exact (amino acid, codon) pair, squared (higher
+    score = more unusual, exactly like every other term -- explicitly
+    symmetric per Luke's spec: under-using a common codon and over-using a
+    rare one are both flagged). Summed across all of that amino acid's
+    synonyms into one deviation score, then broadcast to every position
+    using that amino acid -- there is no local/windowed layer, since a
+    percentage only means something aggregated over multiple occurrences,
+    not at a single position (deliberate, confirmed with Luke rather than
+    assumed).
+
+    A single-codon amino acid (Met, Trp) trivially always sits at 100% --
+    its pooled baseline distribution is a single repeated value, which
+    distribution_fit.py's degenerate-transform fallback already reduces to
+    z=0 always, so it contributes nothing here without needing an explicit
+    gate the way _gc_term's `mutable` flag does.
+    """
     ca = analysis_objects.codon_usage
-    cuvec = np.fromiter((ca.codonFreqsLit[c] for c in sol), dtype=float, count=len(sol))
-    # dist_from_optimal's per-codon term (best synonymous-codon score for
-    # that position's amino acid) depends only on the AA, not which codon
-    # was actually chosen there -- precompute once per position instead of
-    # letting dist_from_optimal() redundantly recompute it inside every
-    # overlapping window that touches that position.
-    best_freq = np.fromiter(
-        (max(CODON_FREQS_LIT[c] for c in codon_choices_for_aa(get_aa(codon))) for codon in sol),
-        dtype=float, count=len(sol),
-    )
 
-    span = max(ca.windowsize - 1, 1)
-    # Matches the original's window count exactly: range(0, len(sol) -
-    # ca.windowsize) -- note that's windowsize, not span, as the bound,
-    # even though each window itself has length span=windowsize-1, so
-    # sliding_window_view's own window count (len(sol)-span+1) is trimmed
-    # down to match rather than "corrected" to the seemingly-intended count.
-    num_windows = max(len(sol) - ca.windowsize, 0)
-    if num_windows > 0:
-        cuwinscores = (sliding_window_view(cuvec, span)[:num_windows].sum(axis=1) / ca.windowsize).tolist()
-        cudists = sliding_window_view(best_freq, span)[:num_windows].mean(axis=1).tolist()
-    else:
-        cuwinscores = []
-        cudists = []
+    counts_by_aa: dict = {}
+    for codon in sol:
+        aa = get_aa(codon)
+        counts_by_aa.setdefault(aa, {})
+        counts_by_aa[aa][codon] = counts_by_aa[aa].get(codon, 0) + 1
 
-    dist_transform = cached_normal_transform(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
-    score_transform = cached_normal_transform(ca, 'windowscores', ca.windowscores)
-    dist_vals = _windowed_average(cudists, len(sol), winsize)
-    score_vals = _windowed_average(cuwinscores, len(sol), winsize)
-    dist_zs = [dist_transform.transform(v) ** 2 for v in dist_vals]
-    score_zs = [score_transform.transform(v) ** 2 for v in score_vals]
+    z2_by_aa = {}
+    for aa, counts_by_codon in counts_by_aa.items():
+        n_aa = sum(counts_by_codon.values())
+        total_z2 = 0.0
+        for codon in codon_choices_for_aa(aa):
+            pct = counts_by_codon.get(codon, 0) / n_aa
+            samples = ca.codonUsagePercentByAA.get(aa, {}).get(codon, [])
+            transform = cached_normal_transform(ca, ('codonUsagePercentByAA', aa, codon), samples)
+            total_z2 += transform.transform(pct) ** 2
+        z2_by_aa[aa] = total_z2
 
-    gene_transform = cached_normal_transform(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
-    straight_z = [gene_transform.transform(o) / 2 for o in cuvec]
-
-    return [straight_z[i] * score_zs[i] + straight_z[i] * dist_zs[i] for i in range(len(sol))]
+    return [z2_by_aa[get_aa(codon)] for codon in sol]
 
 
 @register_term('CodonPairBias')

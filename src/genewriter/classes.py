@@ -93,6 +93,30 @@ class CodonAnalysis:
     windowsize: int
     windowscores: list
     windowdistancesfromoptimal: list
+    # Per-amino-acid, per-synonymous-codon usage-PERCENTAGE distribution,
+    # pooled across the whole gene corpus -- {aa: {codon: [percentage
+    # samples]}}. Each gene contributes its own "what fraction of this
+    # gene's occurrences of this amino acid used this codon" value,
+    # repeated in the pooled list proportional to how many times that
+    # amino acid actually occurs in that gene -- weights toward genes with
+    # more (hence more reliable) observations, rather than counting every
+    # gene's percentage equally regardless of sample size. See
+    # baseline.compute_codon_usage_analysis()'s matching comment for the
+    # full reasoning.
+    #
+    # This is what change_vector._codon_usage_term's 2026-08-19 redesign
+    # z-scores a candidate's own usage-% against -- NOT
+    # codonUsageScoreByGene/windowscores/windowdistancesfromoptimal above,
+    # which are now vestigial for scoring purposes (still computed,
+    # unchanged, because weight_calibration.py's intolerance-weight
+    # calibration still reads codonUsageScoreByGene as CodonUsage's
+    # per-gene aggregate -- a deliberate scope limit, not an oversight;
+    # see memory/codon_usage_term_percentage_redesign.md).
+    #
+    # Trailing default (not a positional field) so existing
+    # CodonAnalysis(...) construction call sites that predate this field
+    # keep working unchanged.
+    codonUsagePercentByAA: dict = field(default_factory=dict)
 
 
 @dataclass

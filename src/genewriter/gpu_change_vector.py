@@ -50,6 +50,7 @@ from .codon_tables import (
     NT_BASE4_BY_CODON_INDEX,
     NT_TO_BASE4,
     RARE_CODON_INDICES,
+    STANDARD_AMINO_ACIDS,
     TAG_TO_WINDOW_BUCKET,
     VARIABLE_FLAGS_BY_INDEX,
     encode_codons,
@@ -68,11 +69,27 @@ _WINDOW_BUCKET_NAMES = ('ExonL50', 'Exon', 'ExonR50')
 _NATIVELY_BATCHED_TERMS = frozenset({'RareCodons', 'CodonUsage', 'CodonPairBias', 'GC', 'Kmer'})
 
 # Per-codon-index "best synonym frequency for this codon's amino acid" --
-# the batched counterpart of change_vector.dist_from_optimal(), which only
-# depends on the amino acid, not the specific codon (see its per-individual
-# use in change_vector._codon_usage_term for the same observation).
+# kept for gpu_codon_usage_count.py's baseline-COUNTING side, which still
+# imports BEST_FREQ_BY_INDEX for its own (now scoring-vestigial, see
+# CodonAnalysis.codonUsagePercentByAA's docstring) windowdistancesfromoptimal
+# computation. No longer used by batch_codon_usage_term() itself as of the
+# 2026-08-19 percentage-based redesign.
 _BEST_FREQ_BY_AA = {aa: max(CODON_FREQ_BY_INDEX[CODON_TO_INDEX[c]] for c in codons) for aa, codons in AA_CODONS.items()}
 BEST_FREQ_BY_INDEX = [_BEST_FREQ_BY_AA[CODON_TO_AA[codon]] for codon in CODON_LIST]
+
+# Codon-index -> "which standard amino acid" index, for
+# batch_codon_usage_term()'s per-(individual, amino acid, codon)
+# percentage reduction. _AA_LIST's order is arbitrary but fixed (sorted)
+# -- it's only ever used as an internal array axis, never exposed. Codons
+# for '*' (stop codons) map to the overflow slot len(_AA_LIST) -- a real
+# `sol` should never contain one (codon_tables.validate_aa_sequence
+# rejects '*'), this only exists so building/indexing the lookup table
+# itself can never raise if it somehow did.
+_AA_LIST = sorted(STANDARD_AMINO_ACIDS)
+_AA_INDEX = {aa: i for i, aa in enumerate(_AA_LIST)}
+_AA_INDEX_BY_CODON_INDEX = np.asarray(
+    [_AA_INDEX.get(CODON_TO_AA[codon], len(_AA_LIST)) for codon in CODON_LIST], dtype=np.int64,
+)
 
 
 def _sliding_window_view(xp, arr, window, axis):
@@ -188,39 +205,57 @@ def batch_rare_codon_term(xp, codon_idx, rc, winsize: int = 15):
     return xp.where(rvec.astype(bool), scorevec * zscore.reshape(P, 1), 0.0)
 
 
-def batch_codon_usage_term(xp, codon_idx, ca, winsize: int = 15):
-    """codon_idx: (P, N) int array. ca: CodonAnalysis. Returns (P, N)."""
+def batch_codon_usage_term(xp, codon_idx, ca):
+    """codon_idx: (P, N) int array. ca: CodonAnalysis. Returns (P, N).
+
+    Batched counterpart of change_vector._codon_usage_term() -- see its
+    docstring for the whole-sequence, per-amino-acid usage-percentage
+    design this mirrors exactly (no windowing -- retired from this term's
+    scoring 2026-08-19, see CodonAnalysis.codonUsagePercentByAA's
+    docstring for why CODON_FREQ_BY_INDEX/BEST_FREQ_BY_INDEX above are no
+    longer read here even though they're still module-level names, kept
+    only for gpu_codon_usage_count.py's now scoring-vestigial fields).
+    """
     P, N = codon_idx.shape
-    freq_table = xp.asarray(np.asarray(CODON_FREQ_BY_INDEX, dtype=float))
-    best_freq_table = xp.asarray(np.asarray(BEST_FREQ_BY_INDEX, dtype=float))
-    cuvec = freq_table[codon_idx]  # (P, N)
-    best_freq = best_freq_table[codon_idx]  # (P, N)
+    num_aa = len(_AA_LIST)
+    num_codons = len(CODON_LIST)
 
-    span = max(ca.windowsize - 1, 1)
-    num_windows = max(N - ca.windowsize, 0)
-    if num_windows > 0:
-        cuwinscores = _sliding_window_view(xp, cuvec, span, axis=1)[:, :num_windows].sum(axis=2) / ca.windowsize
-        cudists = _sliding_window_view(xp, best_freq, span, axis=1)[:, :num_windows].mean(axis=2)
-    else:
-        cuwinscores = xp.zeros((P, 0), dtype=float)
-        cudists = xp.zeros((P, 0), dtype=float)
+    aa_table = xp.asarray(_AA_INDEX_BY_CODON_INDEX)
+    aa_idx = aa_table[codon_idx]  # (P, N), in [0, num_aa] -- num_aa itself is the unused stop-codon overflow
 
-    dist_transform = cached_normal_transform(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
-    score_transform = cached_normal_transform(ca, 'windowscores', ca.windowscores)
-    dist_vals = windowed_average_batched(xp, cudists, N, winsize)
-    score_vals = windowed_average_batched(xp, cuwinscores, N, winsize)
-    # transform_array() always returns a real xp array shaped like its
-    # input (the degenerate-baseline case still returns an all-zero array
-    # of that shape, not a bare Python 0.0), so anything feeding back into
-    # windowed_average_batched() below always gets a real array with a
-    # .shape -- see distribution_fit.FittedDistribution's docstring.
-    dist_zs = dist_transform.transform_array(dist_vals, xp=xp) ** 2
-    score_zs = score_transform.transform_array(score_vals, xp=xp) ** 2
+    # Per-individual, per-(amino acid, codon) occurrence counts via one
+    # batched bincount over a flattened (row, amino acid, codon) composite
+    # index -- same portable-to-cupy idiom gpu_corpus_batch.segment_mean()
+    # already uses (real ufunc.reduceat isn't reliably supported there).
+    composite = aa_idx * num_codons + codon_idx  # (P, N), in [0, (num_aa+1)*num_codons)
+    row_stride = (num_aa + 1) * num_codons
+    row_offset = (xp.arange(P) * row_stride).reshape(P, 1)
+    flat = (composite + row_offset).reshape(-1)
+    counts_flat = xp.bincount(flat, minlength=P * row_stride)
+    # Drop the stop-codon overflow row (index num_aa) -- real amino acids only.
+    codon_counts = counts_flat.reshape(P, num_aa + 1, num_codons)[:, :num_aa, :]  # (P, num_aa, 64)
 
-    gene_transform = cached_normal_transform(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
-    straight_z = gene_transform.transform_array(cuvec, xp=xp) / 2
+    aa_counts = codon_counts.sum(axis=2)  # (P, num_aa)
+    pct = xp.where(aa_counts[:, :, None] > 0, codon_counts / xp.maximum(aa_counts[:, :, None], 1), 0.0)  # (P, num_aa, 64)
 
-    return straight_z * score_zs + straight_z * dist_zs
+    # z2 is sized (P, num_aa+1), not (P, num_aa): aa_idx can (defensively,
+    # never in practice) equal the num_aa overflow slot, and z2 gets
+    # indexed by the full aa_idx array below -- that extra column just
+    # always stays 0, cheap insurance against an out-of-bounds gather
+    # rather than a real code path.
+    z2 = xp.zeros((P, num_aa + 1), dtype=float)
+    for aa in _AA_LIST:
+        aa_i = _AA_INDEX[aa]
+        for codon in AA_CODONS[aa]:
+            cod_i = CODON_TO_INDEX[codon]
+            samples = ca.codonUsagePercentByAA.get(aa, {}).get(codon, [])
+            transform = cached_normal_transform(ca, ('codonUsagePercentByAA', aa, codon), samples)
+            z2[:, aa_i] += transform.transform_array(pct[:, aa_i, cod_i], xp=xp) ** 2
+
+    # Broadcast each individual's own per-amino-acid deviation score to
+    # every position sharing that amino acid.
+    row_idx = xp.arange(P).reshape(P, 1)
+    return z2[row_idx, aa_idx]
 
 
 def batch_codon_pair_bias_term(xp, codon_idx, cpb):

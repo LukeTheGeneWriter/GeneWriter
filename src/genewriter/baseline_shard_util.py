@@ -96,3 +96,17 @@ def concat_dict_of_lists(dicts) -> dict:
         for k, v in d.items():
             out.setdefault(k, []).extend(v)
     return out
+
+
+def concat_nested_dict_of_lists(dicts) -> dict:
+    """dicts: iterable of {key1: {key2: [items...]}}. Union of keys at both
+    levels, concatenated lists at the leaf (e.g.
+    CodonAnalysis.codonUsagePercentByAA: amino acid -> codon -> per-gene
+    usage-percentage samples, pooled across every chunk's shard)."""
+    out = {}
+    for d in dicts:
+        for k1, inner in d.items():
+            bucket = out.setdefault(k1, {})
+            for k2, v in inner.items():
+                bucket.setdefault(k2, []).extend(v)
+    return out

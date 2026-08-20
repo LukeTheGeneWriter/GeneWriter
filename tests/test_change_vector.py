@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from genewriter.change_vector import cached_mean_std, cached_stat, calculate_change_vector, score_changevec
-from genewriter.codon_tables import generate_codon_vec
+from genewriter.codon_tables import AA_CODONS, generate_codon_vec, get_aa
 
 from conftest import random_solution as _random_solution
 
@@ -22,6 +22,53 @@ def test_calculate_change_vector_runs_and_covers_every_position(aa_seq, analysis
     for term, values in vecs.items():
         assert len(values) == len(sol), f"{term} produced {len(values)} scores for {len(sol)} codons"
         assert all(isinstance(v, float) for v in values)
+
+
+def test_codon_usage_term_broadcasts_the_same_score_to_every_position_of_an_amino_acid(aa_seq, analysis_objects):
+    """Whole-sequence design (2026-08-19 redesign, no windowing) -- every
+    position sharing an amino acid must carry the identical score, since
+    the term is computed once per amino acid and broadcast."""
+    sol = _random_solution(aa_seq)
+    vecs = calculate_change_vector(sol, analysis_objects)['CodonUsage']
+    by_aa: dict = {}
+    for i, codon in enumerate(sol):
+        by_aa.setdefault(get_aa(codon), []).append(vecs[i])
+    for aa, scores in by_aa.items():
+        assert len(set(scores)) == 1, f"{aa}: expected one shared score across all its positions, got {set(scores)}"
+
+
+def test_codon_usage_term_single_codon_amino_acids_always_score_zero(aa_seq, analysis_objects):
+    """Met/Trp have exactly one codon each -- always 100% usage, a
+    degenerate baseline distribution_fit.py reduces to z=0 always, so
+    these contribute nothing without needing an explicit gate."""
+    sol = _random_solution(aa_seq)
+    vecs = calculate_change_vector(sol, analysis_objects)['CodonUsage']
+    for i, codon in enumerate(sol):
+        if get_aa(codon) in ('M', 'W'):
+            assert vecs[i] == 0.0
+
+
+def test_codon_usage_term_flags_over_use_and_under_use_of_a_codon_symmetrically(analysis_objects):
+    """Luke's explicit requirement: this must be symmetric -- a candidate
+    using ONLY the rare synonym for an amino acid, and one using ONLY the
+    common synonym, should both score worse than a candidate matching
+    nature's typical split, not just one direction."""
+    ca = analysis_objects.codon_usage
+    c1, c2 = AA_CODONS['E']  # Glutamate: exactly 2 synonyms
+    baseline_c1 = sum(ca.codonUsagePercentByAA['E'][c1]) / len(ca.codonUsagePercentByAA['E'][c1])
+
+    n = 20
+    mid = max(1, min(n - 1, round(baseline_c1 * n)))  # clamp away from either degenerate extreme
+    all_c1 = [c1] * n
+    all_c2 = [c2] * n
+    typical = [c1] * mid + [c2] * (n - mid)
+
+    score_all_c1 = calculate_change_vector(all_c1, analysis_objects)['CodonUsage'][0]
+    score_all_c2 = calculate_change_vector(all_c2, analysis_objects)['CodonUsage'][0]
+    score_typical = calculate_change_vector(typical, analysis_objects)['CodonUsage'][0]
+
+    assert score_all_c1 > score_typical
+    assert score_all_c2 > score_typical
 
 
 def test_codon_pair_bias_term_is_not_empty(aa_seq, analysis_objects):

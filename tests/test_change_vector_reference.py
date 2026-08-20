@@ -81,21 +81,28 @@ def _ref_rare_codon_term(sol, rc, winsize=15):
     return [(scorevec[i] * zscore) if rvec[i] else 0.0 for i in range(len(sol))]
 
 
-def _ref_codon_usage_term(sol, ca, winsize=15):
-    cuvec = [ca.codonFreqsLit[c] for c in sol]
-    span = max(ca.windowsize - 1, 1)
-    cuwins = [sol[i:i + span] for i in range(0, max(len(sol) - ca.windowsize, 0))]
-    cuwinscores = [sum(ca.codonFreqsLit[c] for c in win) / ca.windowsize for win in cuwins]
-    cudists = [_ref_dist_from_optimal(win) for win in cuwins]
-    dist_fit = cached_normal_transform(ca, 'windowdistancesfromoptimal', ca.windowdistancesfromoptimal)
-    score_fit = cached_normal_transform(ca, 'windowscores', ca.windowscores)
-    dist_vals = _ref_windowed_average(cudists, len(sol), winsize)
-    score_vals = _ref_windowed_average(cuwinscores, len(sol), winsize)
-    dist_zs = [dist_fit.transform(v) ** 2 for v in dist_vals]
-    score_zs = [score_fit.transform(v) ** 2 for v in score_vals]
-    gene_fit = cached_normal_transform(ca, 'codonUsageScoreByGene', ca.codonUsageScoreByGene)
-    straight_z = [gene_fit.transform(o) / 2 for o in cuvec]
-    return [straight_z[i] * score_zs[i] + straight_z[i] * dist_zs[i] for i in range(len(sol))]
+def _ref_codon_usage_term(sol, ca):
+    # Whole-sequence, per-amino-acid codon-choice percentage vs.
+    # ca.codonUsagePercentByAA -- see change_vector._codon_usage_term's
+    # docstring for the design this independently re-derives.
+    counts_by_aa = {}
+    for codon in sol:
+        aa = get_aa(codon)
+        counts_by_aa.setdefault(aa, {})
+        counts_by_aa[aa][codon] = counts_by_aa[aa].get(codon, 0) + 1
+
+    z2_by_aa = {}
+    for aa, counts_by_codon in counts_by_aa.items():
+        n_aa = sum(counts_by_codon.values())
+        total_z2 = 0.0
+        for codon in codon_choices_for_aa(aa):
+            pct = counts_by_codon.get(codon, 0) / n_aa
+            samples = ca.codonUsagePercentByAA.get(aa, {}).get(codon, [])
+            transform = cached_normal_transform(ca, ('codonUsagePercentByAA', aa, codon), samples)
+            total_z2 += transform.transform(pct) ** 2
+        z2_by_aa[aa] = total_z2
+
+    return [z2_by_aa[get_aa(codon)] for codon in sol]
 
 
 def _ref_codon_pair_bias_term(sol, cpb):

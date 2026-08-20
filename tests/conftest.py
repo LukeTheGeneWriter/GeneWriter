@@ -13,7 +13,7 @@ from genewriter.classes import (
     RareCodonAnalysis,
 )
 from genewriter.change_vector import AnalysisObjects
-from genewriter.codon_tables import CODON_FREQS_LIT, CODON_TO_AA, generate_codon_vec
+from genewriter.codon_tables import AA_CODONS, CODON_FREQS_LIT, CODON_TO_AA, generate_codon_vec
 
 AA_SEQ = "MAVLDEFGHIKPQRSTWYCN" * 2  # 40 residues, all 20 standard amino acids twice
 
@@ -106,6 +106,44 @@ def rare_codon_analysis():
 @pytest.fixture
 def codon_usage_analysis():
     rng = random.Random(2)
+
+    # Per-amino-acid, per-codon usage-percentage baseline (see
+    # CodonAnalysis.codonUsagePercentByAA's docstring) -- a random "true"
+    # preference split per amino acid, then synthetic per-gene samples
+    # jittered around it, so the pooled distribution has real spread to
+    # z-score against rather than a degenerate single point. Deliberately
+    # ~61 separate distributions (one per real (aa, codon) pair, not one
+    # shared array the way every other baseline fixture in this file only
+    # needs) -- 15 samples each, not 200: distribution_fit.py only tries
+    # its 3 iterative-optimizer families (gamma/lognorm/skewnorm) at 20+
+    # samples, so staying under that threshold keeps every one of these
+    # ~61 fits on the cheap closed-form (normal/expon) path. This function-
+    # scoped fixture (like every fixture in this file) refits from scratch
+    # for every single test that uses it -- at 200 samples x 61 pairs this
+    # measured 220s for one test module; a real GA run pays this cost once
+    # per run (cached via change_vector.cached_stat), so it's a test-speed
+    # concern specific to fixture rebuilding, not a production one.
+    codon_usage_percent_by_aa: dict = {}
+    for aa, codons in AA_CODONS.items():
+        if aa == '*':
+            continue
+        if len(codons) == 1:
+            # A single-codon amino acid (Met, Trp) has no real choice --
+            # every real gene's own percentage for it is exactly 1.0,
+            # always, so the true pooled distribution is genuinely
+            # degenerate (not jittered) -- matches
+            # accumulate_codon_usage_percent_by_aa()'s actual output on
+            # real data exactly, which is what change_vector._codon_usage_
+            # term's degenerate-transform-relies-on-z=0 behavior assumes.
+            codon_usage_percent_by_aa[aa] = {codons[0]: [1.0] * 15}
+            continue
+        base = [rng.uniform(0.1, 1.0) for _ in codons]
+        total = sum(base)
+        base = [b / total for b in base]
+        for codon, p in zip(codons, base):
+            samples = [max(0.0, min(1.0, p + rng.uniform(-0.05, 0.05))) for _ in range(15)]
+            codon_usage_percent_by_aa.setdefault(aa, {})[codon] = samples
+
     return CodonAnalysis(
         organism="test",
         transcriptome="test",
@@ -117,6 +155,7 @@ def codon_usage_analysis():
         windowsize=15,
         windowscores=[rng.uniform(10, 30) for _ in range(500)],
         windowdistancesfromoptimal=[rng.uniform(0, 10) for _ in range(500)],
+        codonUsagePercentByAA=codon_usage_percent_by_aa,
     )
 
 

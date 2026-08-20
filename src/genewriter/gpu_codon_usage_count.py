@@ -14,6 +14,7 @@ winsize, one aggregate value appended per window, not smeared).
 
 import numpy as np
 
+from .baseline import accumulate_codon_usage_percent_by_aa
 from .classes import CodonAnalysis
 from .codon_tables import CODON_FREQS_LIT, CODON_LIST, TAG_TO_BUCKET, encode_codons
 from .gene_io import protein_coding_isoforms
@@ -112,12 +113,22 @@ def count_codon_usage_for_chunk(xp, genes: list, organism: str = "human",
     """One in-memory chunk of NaturalGene objects -- same accumulation shape
     as gpu_rare_codon_count.count_rare_codons_for_chunk. AAFreqs stays a
     plain Python dict accumulation over aaSeq strings (cheap, string-based,
-    not GPU-shaped work)."""
+    not GPU-shaped work) -- codonUsagePercentByAA's accumulation
+    (accumulate_codon_usage_percent_by_aa(), imported from baseline.py) is
+    the same shape: a per-gene Python-level pass over that gene's own
+    codons, not GPU-batched. Deliberate, not an oversight -- this stat
+    scales with total gene count * amino acid count (tens of thousands),
+    not with total corpus nucleotide/codon count the way the VRAM-batched
+    window/frequency stats below do (millions), so it's nowhere near the
+    scale that motivated GPU-batching those in the first place; a plain
+    Python loop here is fast enough, and reuses the exact same per-isoform
+    iteration this function already does for aa_freqs."""
     aa_freqs: dict = {}
     codon_freqs_by_location = {c: {name: 0 for name in _BUCKET_NAMES_4WAY} for c in CODON_LIST}
     usage_score_by_gene: list = []
     window_scores: list = []
     window_dist_from_optimal: list = []
+    codon_usage_percent_by_aa: dict = {}
     total_codons = 0
 
     max_batch_codons = vram_aware_batch_size(
@@ -144,6 +155,7 @@ def count_codon_usage_for_chunk(xp, genes: list, organism: str = "human",
     for _gene, iso in protein_coding_isoforms(genes):
         for aa in iso.associatedProtein.aaSeq:
             aa_freqs[aa] = aa_freqs.get(aa, 0) + 1
+        accumulate_codon_usage_percent_by_aa(iso.codons, codon_usage_percent_by_aa)
         encoded = encode_isoform_codons(xp, iso)
         n = int(encoded[0].shape[0])
         if batch and batch_codons + n > max_batch_codons:
@@ -165,4 +177,5 @@ def count_codon_usage_for_chunk(xp, genes: list, organism: str = "human",
         windowsize=winsize,
         windowscores=window_scores,
         windowdistancesfromoptimal=window_dist_from_optimal,
+        codonUsagePercentByAA=codon_usage_percent_by_aa,
     )

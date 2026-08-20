@@ -21,9 +21,52 @@ import json
 import os
 
 from .classes import CodonAnalysis, CodonPairBiasAnalysis, GCAnalysis, KmerAnalysis, RareCodonAnalysis
-from .codon_tables import CODON_FREQS_LIT, RARE_CODONS_LIT, TAG_TO_BUCKET, TAG_TO_WINDOW_BUCKET
+from .codon_tables import CODON_FREQS_LIT, RARE_CODONS_LIT, TAG_TO_BUCKET, TAG_TO_WINDOW_BUCKET, codon_choices_for_aa, get_aa
 from .change_vector import AnalysisObjects, dist_from_optimal
 from .gene_io import protein_coding_isoforms
+
+
+def accumulate_codon_usage_percent_by_aa(codons: list, accum: dict) -> None:
+    """One gene's contribution to CodonAnalysis.codonUsagePercentByAA (see
+    that field's own docstring for the full design) -- mutates `accum`
+    ({aa: {codon: [percentage samples]}}) in place. Shared between
+    compute_codon_usage_analysis() (this module, the small-scale reference/
+    smoke-test path) and gpu_codon_usage_count.py's real GPU-batched
+    counting module, which imports this directly rather than duplicating
+    it -- same precedent as this module's own _load_cpb_lit(), which
+    gpu_codon_pair_bias_count.py already imports for the identical reason.
+
+    codons: list of (codon, location_tag) pairs, i.e. one gene's iso.codons.
+
+    For each amino acid actually present in this gene, and for EVERY one
+    of its synonymous codons (not just the ones this gene happens to use --
+    a codon this gene never chose for this amino acid is a real,
+    informative 0% data point, not an absence to skip), computes this
+    gene's own percentage and appends it to the pooled list once per
+    occurrence of that amino acid in this gene. A gene with 40 occurrences
+    of Glutamate contributes 40 identical copies of its own Glu-codon-A
+    percentage to the pool, a gene with 2 occurrences contributes only 2 --
+    weighting the eventual pooled distribution toward genes whose estimate
+    of "how does this gene use synonyms for this amino acid" is actually
+    based on enough observations to trust, without needing to invent a
+    weighted variant of distribution_fit.fit_normal_transform() (every
+    other baseline stat in this codebase feeds that same unweighted
+    array-fitting pipeline unchanged; repeating samples achieves the same
+    weighting effect for free). A gene with zero occurrences of some amino
+    acid contributes nothing for it, correctly -- no division by zero, no
+    fabricated data point.
+    """
+    counts_by_aa: dict = {}
+    for cod, _loc in codons:
+        aa = get_aa(cod)
+        counts_by_aa.setdefault(aa, {})
+        counts_by_aa[aa][cod] = counts_by_aa[aa].get(cod, 0) + 1
+
+    for aa, counts_by_codon in counts_by_aa.items():
+        n_aa = sum(counts_by_codon.values())
+        for cod in codon_choices_for_aa(aa):
+            pct = counts_by_codon.get(cod, 0) / n_aa
+            accum.setdefault(aa, {}).setdefault(cod, []).extend([pct] * n_aa)
 
 _CPB_LIT_PATH = os.path.join(os.path.dirname(__file__), 'data', 'cpb_lit.json')
 
@@ -76,6 +119,7 @@ def compute_codon_usage_analysis(genes: list, organism: str = "human", winsize: 
     usage_score_by_gene = []
     window_scores = []
     window_dist_from_optimal = []
+    codon_usage_percent_by_aa: dict = {}
     total_codons = 0
 
     for _gene, iso in protein_coding_isoforms(genes):
@@ -86,6 +130,7 @@ def compute_codon_usage_analysis(genes: list, organism: str = "human", winsize: 
         total_codons += len(codons)
         score = sum(CODON_FREQS_LIT[cod] for cod, _loc in codons) / len(codons)
         usage_score_by_gene.append(score)
+        accumulate_codon_usage_percent_by_aa(codons, codon_usage_percent_by_aa)
 
         for cod, loc in codons:
             bucket = TAG_TO_BUCKET.get(loc)
@@ -117,6 +162,7 @@ def compute_codon_usage_analysis(genes: list, organism: str = "human", winsize: 
         windowsize=winsize,
         windowscores=window_scores,
         windowdistancesfromoptimal=window_dist_from_optimal,
+        codonUsagePercentByAA=codon_usage_percent_by_aa,
     )
 
 
