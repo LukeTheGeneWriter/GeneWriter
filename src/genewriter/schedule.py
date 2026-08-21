@@ -88,6 +88,7 @@ from .ga import (
     merge_replicate_exact,
     merge_replicates_batch,
     refresh_change_vectors,
+    release_protection,
     replicate_and_mutate_random,
     save_gen,
     seed_population,
@@ -201,10 +202,21 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     _remaining_space(ctx.aa_seq, len(pop)) as before -- can't usefully
     generate more distinct seeds than the protein's space has left
     uncovered, whether that number came from the caller or from the
-    auto-sized default."""
+    auto-sized default.
+
+    `peak_multiplier` (optional, default 1.0 = off) is passed through to
+    suggest_population_size() and only does anything when `count` is
+    omitted: it shrinks the auto-sized default by however much this
+    schedule's population transiently EXCEEDS its steady-state size later
+    on (an explore/exploit alternation inflates mid-cycle -- see
+    explore()/default_schedule()). Ignored when `count` is given
+    explicitly, since then the caller has already decided."""
     requested = params.get("count")
     if requested is None:
-        requested = suggest_population_size(ctx.aa_seq, ctx.analysis_objects, already_covered=len(pop), locvec=ctx.locvec)
+        requested = suggest_population_size(
+            ctx.aa_seq, ctx.analysis_objects, already_covered=len(pop), locvec=ctx.locvec,
+            peak_multiplier=params.get("peak_multiplier", 1.0),
+        )
     count = min(requested, _remaining_space(ctx.aa_seq, len(pop)))
     seed_fn = ctx.seed_fn or generate_seed
     new_seeds = [seed_fn(ctx.aa_seq) for _ in range(count)]
@@ -438,6 +450,28 @@ def _step_protect(pop: list, ctx: ScheduleContext, params: dict) -> list:
     return mark_protected(pop, ctx.weights, criteria)
 
 
+@register_step("release_protection")
+def _step_release_protection(pop: list, ctx: ScheduleContext, params: dict) -> list:
+    """Clear .protected on every individual -- the counterpart to
+    "protect", and the step that makes a CYCLIC schedule possible at all.
+    See ga.release_protection() for why mark_protected()'s monotonicity
+    (never unprotects) turns any protect-once-per-cycle schedule into one
+    where the whole population eventually becomes immortal, selection
+    stops working, and the population grows without bound.
+
+    No params. No pre-step exact refresh -- like
+    "natural_range_cutoff" and unlike "protect"/"kill_off"/"select"/
+    "flatten", this makes no decision that consults change_vecs at all, so
+    there is nothing for accurate scores to change.
+
+    Placement is the entire semantics: this is what sets how long a grace
+    period lasts. exploit() puts it AFTER its directed_growth steps and
+    BEFORE its select, making the grace exactly "one descent" -- long
+    enough for a kick colonist to reach the bottom of its new basin, short
+    enough that it then faces selection like everything else."""
+    return release_protection(pop)
+
+
 @register_step("natural_range_cutoff")
 def _step_natural_range_cutoff(pop: list, ctx: ScheduleContext, params: dict) -> list:
     """Hard cutoff, not a survival-pressure step like kill_off/select/
@@ -467,10 +501,20 @@ def _step_select(pop: list, ctx: ScheduleContext, params: dict) -> list:
     "input"'s `count`. An explicit `target_size` is still clamped to
     codon_tables.sequence_space_size(ctx.aa_seq) as before -- a population
     can never usefully hold more distinct individuals than the protein's
-    finite synonymous-codon space contains in total."""
+    finite synonymous-codon space contains in total.
+
+    `peak_multiplier` (optional, default 1.0 = off): same pass-through to
+    suggest_population_size() as "input"'s, and equally only consulted
+    when `target_size` is omitted. In an explore/exploit alternation this
+    step is the one that DEFINES the steady-state size the peak is a
+    multiple of, so it and "input" should carry the same value -- which is
+    what default_schedule() does."""
     requested = params.get("target_size")
     if requested is None:
-        requested = suggest_population_size(ctx.aa_seq, ctx.analysis_objects, locvec=ctx.locvec)
+        requested = suggest_population_size(
+            ctx.aa_seq, ctx.analysis_objects, locvec=ctx.locvec,
+            peak_multiplier=params.get("peak_multiplier", 1.0),
+        )
     target_size = min(requested, sequence_space_size(ctx.aa_seq))
     pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
     return select_survivors(pop, ctx.weights, target_size)

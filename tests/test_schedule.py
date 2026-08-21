@@ -17,7 +17,7 @@ def ctx(aa_seq, analysis_objects, weights):
 def test_registered_steps_includes_the_builtin_kinds():
     assert set(sched.registered_steps()) == {
         'input', 'growth', 'directed_growth', 'kill_off', 'kill_off_by_term', 'protect',
-        'natural_range_cutoff', 'select', 'flatten', 'save', 'repeat',
+        'release_protection', 'natural_range_cutoff', 'select', 'flatten', 'save', 'repeat',
     }
 
 

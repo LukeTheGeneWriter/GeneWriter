@@ -340,22 +340,80 @@ def estimate_bytes_per_individual(aa_seq: str, analysis_objects: AnalysisObjects
     return _deep_sizeof(Proposed_Solution(sol, 1, vecs))
 
 
+def _cgroup_ram_headroom_bytes():
+    """Bytes still available inside THIS PROCESS'S cgroup memory limit
+    (limit - current usage), or None if there is no enforced limit or the
+    cgroup files aren't readable.
+
+    Why this exists: os.sysconf('SC_AVPHYS_PAGES') reports free pages as
+    the *kernel* sees them, which in a container is the host's view, not
+    the limit the container will actually be OOM-killed at. A Colab
+    runtime is exactly that shape -- a cgroup-limited sandbox -- so
+    sysconf alone can happily report far more free RAM than the process is
+    permitted to touch, and sizing a population against it produces a run
+    that dies partway through instead of one that never started. Same
+    reasoning as gpu_change_vector.suggest_chunk_size() querying *actually
+    free* VRAM rather than total VRAM, applied to the host side.
+
+    Checks cgroup v2 first (the unified /sys/fs/cgroup/memory.max +
+    memory.current), then v1 (/sys/fs/cgroup/memory/memory.limit_in_bytes
+    + memory.usage_in_bytes). Both report "no limit" differently: v2 uses
+    the literal string "max", v1 uses a sentinel near 2**63 -- both are
+    treated as None (unlimited) rather than as an absurdly large budget.
+    """
+    for limit_path, usage_path in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            with open(limit_path) as f:
+                raw_limit = f.read().strip()
+            if raw_limit == "max":
+                return None
+            limit = int(raw_limit)
+            if limit >= 2 ** 62:
+                return None
+            with open(usage_path) as f:
+                usage = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        return max(limit - usage, 0)
+    return None
+
+
 def available_ram_bytes(default: int = 2 * 1024 ** 3) -> int:
-    """Free system RAM in bytes, queried via os.sysconf (SC_AVPHYS_PAGES *
-    SC_PAGE_SIZE) -- works with no extra dependency on any POSIX system,
-    which covers every environment this codebase actually runs GA work on
-    (WSL, Colab -- see memory/dev_environment.md: no native Windows Python
-    at all). Falls back to `default` (2GB, a conservative guess) if
-    sysconf isn't available or doesn't expose these keys, rather than
-    raising and blocking sizing entirely on an unexpected platform."""
+    """RAM in bytes this process can actually still allocate -- the smaller
+    of what the kernel reports free (os.sysconf, SC_AVPHYS_PAGES *
+    SC_PAGE_SIZE) and what's left inside its cgroup memory limit
+    (_cgroup_ram_headroom_bytes()).
+
+    sysconf works with no extra dependency on any POSIX system, which
+    covers every environment this codebase actually runs GA work on (WSL,
+    Colab -- see memory/dev_environment.md: no native Windows Python at
+    all). But inside a container it describes the *host*, not the limit
+    this process gets OOM-killed at, which is why the cgroup headroom is
+    taken as a second, usually tighter ceiling -- see
+    _cgroup_ram_headroom_bytes() for why that distinction is the one that
+    actually kills long Colab runs.
+
+    Falls back to `default` (2GB, a conservative guess) if sysconf isn't
+    available or doesn't expose these keys, rather than raising and
+    blocking sizing entirely on an unexpected platform. A readable cgroup
+    limit still applies on top of that fallback.
+    """
     try:
-        return os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+        free = os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
     except (ValueError, OSError, AttributeError):
-        return default
+        free = default
+    cgroup_headroom = _cgroup_ram_headroom_bytes()
+    if cgroup_headroom is not None:
+        return min(free, cgroup_headroom)
+    return free
 
 
 def suggest_population_size(aa_seq: str, analysis_objects: AnalysisObjects, already_covered: int = 0,
-                             locvec: list = None, ram_fraction: float = 0.5) -> int:
+                             locvec: list = None, ram_fraction: float = 0.5,
+                             peak_multiplier: float = 1.0) -> int:
     """How many distinct individuals it's reasonable to seed/hold for
     aa_seq, maximizing use of available hardware instead of a hand-picked
     fixed constant -- the smaller of two real ceilings:
@@ -377,10 +435,40 @@ def suggest_population_size(aa_seq: str, analysis_objects: AnalysisObjects, alre
     vram_aware_batch_size()'s vram_fraction already uses on the VRAM side
     -- other things (the interpreter itself, gene corpus data still
     resident, Colab's own overhead) already share that RAM.
+
+    peak_multiplier (default 1.0, i.e. off) divides the RAM budget by the
+    factor a schedule's population is expected to TRANSIENTLY exceed its
+    steady-state size by. This function otherwise answers "how many
+    individuals fit in RAM," which is only the right question when the
+    steady-state size IS the peak -- true for run_ga() (one growth step
+    per selection step) and for a schedule whose every growth step is
+    immediately followed by a select. It is NOT true for an explore/exploit
+    alternation: schedule.explore() deliberately inflates the population
+    (flatten multiplies distinct individuals, kick adds colonists) and does
+    not select, so the peak lands in the middle of the cycle at some
+    multiple of the size select() later returns it to. Sizing the
+    steady state to fill RAM and then tripling it mid-cycle is precisely
+    how a long run dies partway through instead of never starting.
+    schedule.default_schedule() passes its own DEFAULT_PEAK_MULTIPLIER
+    through to the "input"/"select" steps for exactly this reason; measure
+    the real factor for your schedule rather than trusting the default.
+
+    Raises ValueError for peak_multiplier < 1.0 -- a population that peaks
+    *below* its steady-state size is not a thing, and silently accepting
+    the value would quietly hand back a LARGER budget than the un-adjusted
+    call, which is the opposite of what anyone reaching for this parameter
+    wants.
     """
+    if peak_multiplier < 1.0:
+        raise ValueError(
+            f"peak_multiplier must be >= 1.0 (got {peak_multiplier!r}) -- it divides the RAM "
+            "budget by how far the population transiently EXCEEDS its steady-state size; a "
+            "value below 1.0 would enlarge the budget instead of shrinking it."
+        )
     space_ceiling = max(sequence_space_size(aa_seq) - already_covered, 0)
     bytes_per_individual = max(estimate_bytes_per_individual(aa_seq, analysis_objects, locvec), 1)
-    ram_ceiling = int(available_ram_bytes() * ram_fraction) // bytes_per_individual
+    ram_budget = int(available_ram_bytes() * ram_fraction / peak_multiplier)
+    ram_ceiling = ram_budget // bytes_per_individual
     return min(space_ceiling, ram_ceiling)
 
 
@@ -972,6 +1060,43 @@ def mark_protected(pop: list, weights: dict, criteria: list) -> list:
     convention."""
     for i in _top_fraction_indices(pop, weights, criteria):
         pop[i].protected = True
+    return pop
+
+
+def release_protection(pop: list) -> list:
+    """Clear .protected on every individual, returning pop.
+
+    The counterpart mark_protected() deliberately does not have:
+    mark_protected() is monotonic (only ever sets True), which is correct
+    for a one-shot "shield the best of this population" call but makes any
+    *cyclic* schedule structurally non-viable. A schedule that protects
+    once per cycle -- which is exactly what an explore/exploit alternation
+    needs, both to preserve the incumbent across a destructive explore
+    phase and to give kick colonists a grace period -- would otherwise grow
+    the immortal set every cycle until every individual is protected,
+    select_survivors()/kill_off() become no-ops (both skip protected
+    individuals unconditionally, and select_survivors() exceeds
+    target_size rather than remove one), and the population grows without
+    bound. See schedule.explore()/schedule.exploit(), which pair every
+    protect with exactly one release.
+
+    Blunt on purpose: it clears everything, with no notion of *why* an
+    individual was protected or how long its grace was meant to last. The
+    schedule controls the lifetime by *where* it places the release --
+    which is why schedule.exploit() puts it after its descent steps and
+    before its selection step, making the grace period exactly "one
+    descent," the semantically meaningful unit for a kick colonist (it is
+    worse than its parent by construction and needs to descend into its
+    new basin before anything judges it).
+
+    A richer per-individual TTL (Proposed_Solution.protected_until compared
+    against a step counter) would allow overlapping grace periods of
+    different lengths and is the natural upgrade if grace periods longer
+    than one descent turn out to matter; it touches both cull paths and
+    every existing reader of .protected, which this does not.
+    """
+    for p in pop:
+        p.protected = False
     return pop
 
 
