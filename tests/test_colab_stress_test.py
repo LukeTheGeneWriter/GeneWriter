@@ -190,3 +190,63 @@ def test_resolve_weights_calibrates_when_enabled(colab_script, analysis_objects,
     )
     cfg = _base_cfg(colab_script, USE_INTOLERANCE_WEIGHTS=True)
     assert colab_script._resolve_weights(cfg, analysis_objects) == calibrated
+
+
+def test_config_schedule_uses_only_registered_step_kinds(colab_script):
+    """The shipped SCHEDULE is meant to be pasted into Colab and run as-is,
+    so a step kind that was renamed (or never existed) should fail here, not
+    30 minutes into a real run after the gene corpus finished loading."""
+    from genewriter.schedule import registered_steps
+
+    kinds = set(registered_steps())
+
+    def walk(steps):
+        for step in steps:
+            assert step["kind"] in kinds, f"unregistered step kind {step['kind']!r}"
+            if step["kind"] == "repeat":
+                walk(step["steps"])
+
+    walk(colab_script.CONFIG["SCHEDULE"])
+
+
+def test_config_caps_the_population_before_the_first_growth_step(colab_script):
+    """Regression guard for a real Colab finding: seeding auto-sizes to as
+    many individuals as RAM holds, which is right for coverage and far too
+    many to hand straight to a growth step that multiplies it. Both run
+    modes must cap the population between seeding and the first growth --
+    "input"'s `keep` for the schedule, `target_size` for run_ga (which
+    applies it right after seeding too). Either one left unset is the exact
+    shape that had to be patched by hand mid-run."""
+    schedule = colab_script.CONFIG["SCHEDULE"]
+    assert schedule[0]["kind"] == "input"
+    assert schedule[0].get("keep"), "SCHEDULE's 'input' step has no keep -- seeding is uncapped into growth"
+    assert colab_script.CONFIG["RUN_GA_OPTIONS"]["target_size"], (
+        "RUN_GA_OPTIONS['target_size'] is None -- run_ga would take the auto-sized seed count "
+        "as its steady-state population size"
+    )
+
+
+def test_config_budgets_host_ram_for_the_expansion_steps(colab_script):
+    """RAM_FRACTION is what stops a growth step from allocating
+    len(pop) * rate new solutions past what the VM holds -- the crash this
+    script is most likely to hit at real scale, and the one CHUNK_SIZE does
+    NOT cover (that bounds the GPU side; this bounds the host side, where
+    the population itself lives). A driver shipped without it silently
+    reverts to the unbounded behavior."""
+    ram_fraction = colab_script.CONFIG["RAM_FRACTION"]
+    assert ram_fraction is None or 0 < ram_fraction <= 1, (
+        f"RAM_FRACTION={ram_fraction!r} is not a usable share of free RAM"
+    )
+
+
+def test_config_ram_fraction_reaches_both_run_modes(colab_script):
+    """Both call sites have to thread it: an unwired knob reads as working
+    (no error, sensible-looking value in CONFIG) while the run it is
+    supposed to protect keeps the library default instead of the one the
+    config says."""
+    import inspect
+
+    source = inspect.getsource(colab_script.run_pipeline)
+    assert source.count('cfg["RAM_FRACTION"]') == 2, (
+        "RAM_FRACTION must be passed to both run_ga and run_schedule"
+    )

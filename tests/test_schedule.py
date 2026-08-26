@@ -3,6 +3,7 @@ import os
 
 import pytest
 
+from genewriter import ga
 from genewriter import schedule as sched
 from genewriter.classes import Proposed_Solution
 from genewriter.change_vector import calculate_change_vector
@@ -83,6 +84,59 @@ def test_step_input_auto_sizes_count_when_omitted(analysis_objects, weights):
     tiny_ctx = sched.ScheduleContext(aa_seq="MC", weights=weights, analysis_objects=analysis_objects)
     result = sched.run_steps([], tiny_ctx, [{"kind": "input"}])
     assert 0 < sum(p.number for p in result) <= 2
+
+
+def test_step_input_keep_caps_the_surviving_population(ctx):
+    """Seed wide, keep narrow: `keep` cuts the freshly-seeded population
+    down the same way a following "select" step would, so the next "growth"
+    step multiplies a working-sized population rather than every seed RAM
+    could hold (see _step_input's docstring)."""
+    result = sched.run_steps([], ctx, [{"kind": "input", "count": 60, "keep": 10}])
+    assert len(result) == 10
+
+
+def test_step_input_without_keep_retains_every_distinct_seed(ctx):
+    """`keep` is opt-in -- omitting it must leave the original
+    keep-everything behavior untouched, since every existing schedule in
+    the repo (and every saved one) relies on it."""
+    result = sched.run_steps([], ctx, [{"kind": "input", "count": 60}])
+    assert len(result) == 60, "seeds collided or were culled without a keep"
+
+
+def test_step_input_keep_does_not_refresh_change_vectors(ctx, monkeypatch):
+    """The reason `keep` lives on "input" instead of being a separate
+    "select" step after it: seed_population() has just computed exact
+    change vectors for every seed, and a "select" step would immediately
+    recompute all of them (refresh-first convention). Over the largest
+    population a run ever holds, that redundant refresh is the single most
+    expensive thing `keep` exists to avoid -- so assert it doesn't happen,
+    rather than trusting the reading."""
+    calls = []
+    real_refresh = sched.refresh_change_vectors
+    monkeypatch.setattr(sched, "refresh_change_vectors",
+                        lambda *a, **k: (calls.append(1), real_refresh(*a, **k))[1])
+
+    sched.run_steps([], ctx, [{"kind": "input", "count": 20, "keep": 5}])
+    assert not calls, "input's keep refreshed change vectors seed_population had already computed"
+
+    # ...and the contrast that makes the point: the separate select step
+    # this replaces does refresh, which is exactly the cost being skipped.
+    sched.run_steps([], ctx, [{"kind": "input", "count": 20}, {"kind": "select", "target_size": 5}])
+    assert calls
+
+
+def test_step_input_keep_is_clamped_to_sequence_space(analysis_objects, weights):
+    # "MC": only 2 distinct sequences exist at all, so keeping "the best
+    # 1000" can only ever mean keeping both -- same ceiling the "select"
+    # step's target_size is clamped to.
+    tiny_ctx = sched.ScheduleContext(aa_seq="MC", weights=weights, analysis_objects=analysis_objects)
+    result = sched.run_steps([], tiny_ctx, [{"kind": "input", "count": 50, "keep": 1000}])
+    assert 0 < len(result) <= 2
+
+
+def test_step_input_keep_below_one_raises(ctx):
+    with pytest.raises(ValueError, match="keep must be >= 1"):
+        sched.run_steps([], ctx, [{"kind": "input", "count": 10, "keep": 0}])
 
 
 def test_step_growth_reproduces_and_dedups_within_the_step(ctx):
@@ -506,3 +560,155 @@ def test_run_schedule_with_chunk_size_matches_without(aa_seq, analysis_objects, 
     by_codons_unchunked = {tuple(p.codons): p.number for p in pop_unchunked}
     by_codons_chunked = {tuple(p.codons): p.number for p in pop_chunked}
     assert by_codons_unchunked == by_codons_chunked
+
+
+# ---------------------------------------------------------------------------
+# RAM-aware expansion steps. available_ram_bytes() and the measured
+# per-individual footprint are both pinned in each test so the arithmetic is
+# exact; the real machine's free RAM never enters into it.
+#
+# Note which module each patch targets: schedule.py imports
+# estimate_bytes_per_individual by name, so ctx.bytes_per_individual()
+# resolves it through sched's namespace, while clamp_growth_rate_to_ram()
+# reaches available_ram_bytes through ga's.
+# ---------------------------------------------------------------------------
+
+
+def _pin_ram(monkeypatch, total_bytes):
+    monkeypatch.setattr(ga, "available_ram_bytes", lambda *a, **k: total_bytes)
+
+
+def _pin_footprint(monkeypatch, bytes_per_individual=1000):
+    monkeypatch.setattr(sched, "estimate_bytes_per_individual", lambda *a, **k: bytes_per_individual)
+    return bytes_per_individual
+
+
+def _budget_for(pop_size, rate, bytes_per_individual, ram_fraction=0.5):
+    return int(pop_size * rate * bytes_per_individual / ram_fraction)
+
+
+def _ram_warnings(recwarn):
+    return [w for w in recwarn if issubclass(w.category, ga.PopulationRamWarning)]
+
+
+def test_growth_step_reduces_its_rate_to_what_ram_allows(ctx, monkeypatch):
+    """The user-facing shape of the whole feature: a schedule asking for
+    rate 5 on a machine with room for 4.5 runs at 4 and says so. Asserted
+    on the resulting population too, not just the warning -- 10 individuals
+    at rate 4 cannot exceed 50 distinct, where rate 5 could reach 60."""
+    bpi = _pin_footprint(monkeypatch)
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
+    _pin_ram(monkeypatch, _budget_for(pop_size=len(seeded), rate=4.5, bytes_per_individual=bpi))
+
+    with pytest.warns(ga.PopulationRamWarning, match=r"\[growth\].*Reducing rate 5 -> 4"):
+        result = sched.run_steps(seeded, ctx, [{"kind": "growth", "rate": 5, "mutation_chance": 0.3}])
+
+    assert len(result) <= len(seeded) * (1 + 4)
+
+
+def test_directed_growth_step_reduces_its_rate_too(ctx, monkeypatch):
+    """Both growth kinds route through _do_growth but pass their own
+    step_label -- and this is the one likelier to hit the ceiling, since
+    every individual reproduces rather than a directed_fraction subset."""
+    bpi = _pin_footprint(monkeypatch)
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
+    _pin_ram(monkeypatch, _budget_for(pop_size=len(seeded), rate=2.5, bytes_per_individual=bpi))
+
+    with pytest.warns(ga.PopulationRamWarning, match=r"\[directed_growth\].*Reducing rate 8 -> 2"):
+        sched.run_steps(seeded, ctx, [{"kind": "directed_growth", "rate": 8}])
+
+
+def test_growth_step_is_a_no_op_when_ram_has_no_headroom(ctx, monkeypatch):
+    """Degrade to doing nothing rather than to an OOM kill. The population
+    comes back unchanged, and step_count still advances so a saved run's
+    generation numbering does not silently shift under it."""
+    bpi = _pin_footprint(monkeypatch)
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
+    _pin_ram(monkeypatch, _budget_for(pop_size=len(seeded), rate=0.5, bytes_per_individual=bpi))
+    before_steps = ctx.step_count
+
+    with pytest.warns(ga.PopulationRamWarning, match="SKIPPED"):
+        result = sched.run_steps(seeded, ctx, [{"kind": "growth", "rate": 5, "mutation_chance": 0.3}])
+
+    assert {tuple(p.codons) for p in result} == {tuple(p.codons) for p in seeded}
+    assert ctx.step_count == before_steps + 1
+
+
+def test_growth_step_ram_fraction_none_opts_out(ctx, monkeypatch, recwarn):
+    """Per-step escape hatch, and it must be distinguishable from "not
+    specified": the key present with a None value disables the clamp even
+    though ctx.ram_fraction is set."""
+    _pin_footprint(monkeypatch)
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
+    _pin_ram(monkeypatch, 1)
+
+    sched.run_steps(seeded, ctx, [{"kind": "growth", "rate": 5, "mutation_chance": 0.3,
+                                   "ram_fraction": None}])
+    assert not _ram_warnings(recwarn)
+
+
+def test_context_ram_fraction_none_opts_the_whole_run_out(analysis_objects, weights, aa_seq, monkeypatch, recwarn):
+    _pin_footprint(monkeypatch)
+    _pin_ram(monkeypatch, 1)
+    loose_ctx = sched.ScheduleContext(aa_seq=aa_seq, weights=weights,
+                                      analysis_objects=analysis_objects, ram_fraction=None)
+    sched.run_steps([], loose_ctx, [{"kind": "input", "count": 5},
+                                    {"kind": "growth", "rate": 3, "mutation_chance": 0.3}])
+    assert not _ram_warnings(recwarn)
+
+
+def test_step_ram_fraction_overrides_the_context_default(ctx, monkeypatch, recwarn):
+    """A tighter budget on one step than on the run as a whole, since the
+    peak is usually one specific step rather than the whole schedule."""
+    bpi = _pin_footprint(monkeypatch)
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 10}])
+    # Exactly comfortable at the ctx default of 0.5; far too tight at 0.05.
+    _pin_ram(monkeypatch, _budget_for(pop_size=len(seeded), rate=5, bytes_per_individual=bpi))
+
+    sched.run_steps(seeded, ctx, [{"kind": "growth", "rate": 5, "mutation_chance": 0.3}])
+    assert not _ram_warnings(recwarn), "clamped at a budget that exactly fits"
+
+    sched.run_steps(seeded, ctx, [{"kind": "growth", "rate": 5, "mutation_chance": 0.3,
+                                   "ram_fraction": 0.05}])
+    assert _ram_warnings(recwarn), "the step's own ram_fraction did not override ctx's"
+
+
+def test_context_measures_the_per_individual_footprint_only_once(ctx, monkeypatch):
+    """A schedule with several growth steps must not pay for a throwaway
+    seed-and-score on each -- the number depends on aa_seq and the
+    registered terms, neither of which moves during a run."""
+    calls = []
+    real = sched.estimate_bytes_per_individual
+    monkeypatch.setattr(sched, "estimate_bytes_per_individual",
+                        lambda *a, **k: (calls.append(1), real(*a, **k))[1])
+
+    sched.run_steps([], ctx, [{"kind": "input", "count": 5},
+                              {"kind": "growth", "rate": 2, "mutation_chance": 0.3},
+                              {"kind": "growth", "rate": 2, "mutation_chance": 0.3},
+                              {"kind": "directed_growth", "rate": 2}])
+    assert len(calls) == 1, f"measured {len(calls)} times across 3 growth steps"
+
+
+def test_flatten_step_warns_but_still_runs_when_it_overruns_ram(ctx, monkeypatch):
+    """flatten expands too, but has no rate to turn down -- its ceiling is
+    the replicate mass already accumulated. So it reports and proceeds,
+    rather than silently doing less than it was asked to."""
+    bpi = _pin_footprint(monkeypatch)
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 5}])
+    for p in seeded:
+        p.number = 40
+    _pin_ram(monkeypatch, 10 * bpi)  # room for ~5 of the up-to-200 new genotypes
+
+    with pytest.warns(ga.PopulationRamWarning, match=r"\[flatten\]"):
+        result = sched.run_steps(seeded, ctx, [{"kind": "flatten", "recursion_limit": 1}])
+
+    assert len(result) >= len(seeded), "flatten was silently prevented from running"
+
+
+def test_flatten_step_is_silent_when_the_projection_fits(ctx, monkeypatch, recwarn):
+    bpi = _pin_footprint(monkeypatch)
+    seeded = sched.run_steps([], ctx, [{"kind": "input", "count": 5}])
+    _pin_ram(monkeypatch, 10 ** 6 * bpi)
+
+    sched.run_steps(seeded, ctx, [{"kind": "flatten", "recursion_limit": 1}])
+    assert not _ram_warnings(recwarn)

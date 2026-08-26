@@ -258,12 +258,45 @@ CONFIG = dict(
     PROGRESS=True,
     PROGRESS_EVERY=100,
 
+    # Share of the host RAM that is FREE when a step runs which that step
+    # may spend on the individuals it creates. Both run modes read it.
+    #
+    # This is the OOM guard for the transient, which is the one that
+    # actually kills a Colab session: a growth step allocates
+    # len(pop) * rate new solutions all at once, before any kill_off or
+    # select gets to cull them, so the peak is several times the
+    # steady-state population every knob above is expressed in. Before
+    # reproducing, each "growth"/"directed_growth" step (and each run_ga
+    # generation) now prices that peak against free RAM and lowers its own
+    # rate to what fits -- rate 5 on a machine with room for 4.5 runs at 4,
+    # and says so with a ga.PopulationRamWarning naming the step and both
+    # rates. If not even one replicate each fits, the step is skipped
+    # rather than allowed to OOM; the following cull then makes the next
+    # one affordable again. "flatten" gets a warning but no clamp, having
+    # no rate to lower (it cashes in accumulated replicate mass).
+    #
+    # Treat a warning as a signal to lower target_size/keep, not as the fix
+    # itself: a quietly reduced rate is a narrower search per generation,
+    # which is a different run, not just a slower one. 0.5 leaves headroom
+    # for the interpreter, the resident gene corpus, and Colab's own
+    # overhead. None disables the whole mechanism.
+    RAM_FRACTION=0.5,
+
     # --- options used when RUN_MODE == "run_ga" (ga.run_ga signature) ---
     RUN_GA_OPTIONS=dict(
         num_gens=10,                # generations to run
-        target_size=None,           # cap population to this many distinct
-                                     # individuals after each generation
-                                     # (None = defaults to initial seed count)
+        target_size=3000,           # cap population to this many distinct
+                                     # individuals, applied once right after
+                                     # seeding and then after every
+                                     # generation. Deliberately NOT None
+                                     # (= "default to the initial seed
+                                     # count"): num_seeds auto-sizes to as
+                                     # many seeds as RAM holds, and taking
+                                     # THAT as the steady-state size leaves
+                                     # no headroom for the generation's
+                                     # up-to-10x growth. This is run_ga's
+                                     # equivalent of the SCHEDULE's
+                                     # "input" step `keep` below.
         locvec=None,                # per-position 'F'/'T'/'I'/'S' exon tags;
                                      # None here means "use the real gene's
                                      # tags" -- filled in below from the
@@ -304,7 +337,10 @@ CONFIG = dict(
 
     # --- schedule used when RUN_MODE == "schedule" (schedule.run_schedule)
     # Each dict's "kind" must be one of schedule.registered_steps():
-    #   input      {"count": N}                       -- add N random seeds
+    #   input      {"count": N, "keep": M}            -- add N random seeds,
+    #               then immediately cut back to the best M distinct
+    #               (see the paragraph below -- "keep" is why there's no
+    #               hand-written "select" step right after "input")
     #   growth     {"rate", "mutation_chance",         -- reproduce every
     #               "directed_fraction", "lookahead"}     individual
     #   kill_off   {"percent_cut", "protect"}          -- proportional cull,
@@ -329,22 +365,31 @@ CONFIG = dict(
     # per-target. Flagged by Luke after a real Colab run's hardcoded numbers
     # (2000/3000/2000 below, previously) turned out too small to show any
     # real t-SNE neighborhood formation -- see
-    # memory/schedule_sequence_space_clamping.md. Omitted below for "input"
-    # and the FINAL "select" (the population that actually gets
-    # visualized), so both auto-size up to whatever this VM's RAM allows.
-    # The REPEAT loop's inner "select" target_size is deliberately kept
-    # explicit, not omitted: growth immediately fans a population out
-    # several-fold before the next select ever runs, so an
-    # unboundedly-large "input" auto-size feeding straight into growth with
-    # no cap in between could itself get RAM-heavy before this inner select
-    # ever gets a chance to trim it back down -- this fixed value is the
-    # per-iteration throughput governor keeping that first uncapped
-    # growth/kill_off window bounded. Tune it up if this VM has RAM to
-    # spare and the run feels too conservative; tune the input/final
-    # select back down to an explicit count if a real run shows the
-    # opposite problem (RAM pressure from the auto-sized ends).
+    # memory/schedule_sequence_space_clamping.md. Both are omitted below --
+    # "input"'s count, and the FINAL "select"'s target_size (that's the
+    # population which actually gets visualized) -- so each auto-sizes up to
+    # whatever this VM's RAM allows.
+    #
+    # That auto-sized seed count is deliberately huge for a real protein
+    # (it fills RAM's half -- see ga.suggest_population_size), which is
+    # right for SEEDING and wrong for everything after it: the very next
+    # "growth" step multiplies the population by `rate` before any "select"
+    # runs. On a real Colab run that first uncapped input -> growth window
+    # is exactly where the pressure showed up, and hand-adding a "select"
+    # step right after "input" was the fix. "input"'s `keep` IS that fix,
+    # rolled in: seed as wide as RAM allows, keep only the best `keep`
+    # distinct, and skip the full exact refresh a separate "select" step
+    # would have redundantly run over the largest population of the whole
+    # run (see schedule._step_input's docstring).
+    #
+    # `keep` and the REPEAT loop's inner "select" target_size are the same
+    # number on purpose -- together they're the working-population governor
+    # for this run. Tune both up if this VM has RAM to spare and the run
+    # feels too conservative; tune them down if a real run shows memory
+    # pressure. The FINAL "select" stays auto-sized: nothing grows after
+    # it, so it can safely take everything RAM allows.
     SCHEDULE=[
-        {"kind": "input"},
+        {"kind": "input", "keep": 3000},
         {"kind": "growth", "rate": 4, "mutation_chance": 0.1, "directed_fraction": 0.5, "lookahead": True},
         {"kind": "kill_off", "percent_cut": 30},
         {"kind": "repeat", "times": 5, "steps": [
@@ -701,6 +746,7 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
         opts["xp"] = xp
         opts["progress"] = cfg["PROGRESS"]
         opts["progress_every"] = cfg["PROGRESS_EVERY"]
+        opts.setdefault("ram_fraction", cfg["RAM_FRACTION"])
         # num_seeds isn't in RUN_GA_OPTIONS' documented keys above -- add it
         # there to override. Omitted (the common case): suggest_population_
         # size() picks a hardware-aware count (as many distinct seeds as
@@ -728,6 +774,7 @@ def run_pipeline(cfg, aa_seq, locvec, analysis_objects, xp_gpu, genes):
             aa_seq, weights, analysis_objects, cfg["SCHEDULE"],
             locvec=locvec, save_dir=cfg["SCHEDULE_SAVE_DIR"], run_name=cfg["SCHEDULE_RUN_NAME"], xp=xp,
             progress=cfg["PROGRESS"], progress_every=cfg["PROGRESS_EVERY"], seed_fn=seed_fn,
+            ram_fraction=cfg["RAM_FRACTION"],
         )
         elapsed = time.perf_counter() - t0
 

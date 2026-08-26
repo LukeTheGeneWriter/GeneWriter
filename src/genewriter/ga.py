@@ -56,6 +56,7 @@ import math
 import os
 import random
 import sys
+import warnings
 
 import numpy as np
 
@@ -334,8 +335,22 @@ def estimate_bytes_per_individual(aa_seq: str, analysis_objects: AnalysisObjects
     (calculate_change_vector(), the cheap per-individual path -- this is a
     single call, not a batch), then walks the result with _deep_sizeof()
     rather than an analytical guess. Used by suggest_population_size() to
-    size "input"/"select" defaults against available system RAM."""
-    sol = generate_seed(aa_seq)
+    size "input"/"select" defaults against available system RAM, and by
+    suggest_growth_rate() to size a growth step's `rate` against it.
+
+    Leaves the global `random` stream exactly as it found it. The throwaway
+    seed this builds is a measurement, not part of the search, and a
+    measurement must not change what the run then does -- without the
+    save/restore, merely *asking* how big an individual is would shift
+    every subsequent draw, so a seeded run would produce different results
+    depending on whether a sizing default happened to be consulted. That
+    matters more now than when this was only called once from
+    suggest_population_size(): the growth clamp calls it every step."""
+    state = random.getstate()
+    try:
+        sol = generate_seed(aa_seq)
+    finally:
+        random.setstate(state)
     vecs = calculate_change_vector(sol, analysis_objects, locvec)
     return _deep_sizeof(Proposed_Solution(sol, 1, vecs))
 
@@ -470,6 +485,209 @@ def suggest_population_size(aa_seq: str, analysis_objects: AnalysisObjects, alre
     ram_budget = int(available_ram_bytes() * ram_fraction / peak_multiplier)
     ram_ceiling = ram_budget // bytes_per_individual
     return min(space_ceiling, ram_ceiling)
+
+
+DEFAULT_GROWTH_RATE = 10
+"""Replicates per individual that growth asks for when nothing says
+otherwise -- the value directed_evolution()/directed_evolution_batch()/
+replicate_and_mutate_random() have always defaulted `nreplicates` to, and
+what run_ga() used to pass implicitly by not passing it at all. Named here
+so the RAM clamp below has a "requested rate" to report having reduced."""
+
+DEFAULT_GROWTH_RAM_FRACTION = 0.5
+"""Fraction of currently-free host RAM a single expansion step is allowed
+to spend on the individuals it creates. Same reasoning (and same value) as
+suggest_population_size()'s ram_fraction and gpu_corpus_batch.
+vram_aware_batch_size()'s vram_fraction: leave headroom rather than plan to
+consume every free byte, since the interpreter, the resident gene corpus,
+the transient pre-merge replicate lists, and (on Colab) the notebook
+runtime itself all share it."""
+
+
+class PopulationRamWarning(UserWarning):
+    """A population-expansion step was projected to allocate more host RAM
+    than is free, and was reduced (or flagged) rather than allowed to run
+    into an OOM kill.
+
+    Its own category, not a bare UserWarning, so a caller who genuinely
+    wants the unclamped behavior can silence exactly this
+    (`warnings.filterwarnings("ignore", category=ga.PopulationRamWarning)`)
+    without also silencing everything else, and so tests can assert on it.
+    Note that it goes through the normal `warnings` machinery, whose
+    default filter shows a given warning once per call site per unique
+    message -- the messages below embed the population size and the rates
+    involved precisely so that a *changing* situation keeps reporting
+    rather than being deduplicated into silence after the first cycle."""
+
+
+def _fmt_bytes(n: float) -> str:
+    """Human-readable byte count for warning text -- these messages are
+    read by someone deciding whether to shrink a population or move to a
+    bigger machine, and '3.4 GB' supports that decision in a way
+    '3650722202' does not."""
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1024.0 or unit == "GB":
+            return f"{n:.0f} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+
+
+def expansion_ram_budget_bytes(ram_fraction: float = DEFAULT_GROWTH_RAM_FRACTION) -> int:
+    """Bytes a single expansion step may spend on NEW individuals.
+
+    Deliberately measured against available_ram_bytes() -- what is still
+    free right now -- and NOT reduced by the resident population's own
+    footprint, because that footprint is already excluded: the population
+    is allocated, so the RAM it occupies is not in the free figure to begin
+    with. Subtracting it again would double-count it and shrink every
+    growth step by the size of the very thing being grown.
+
+    Reading it fresh per step (rather than computing one budget at the top
+    of a run) is also what makes this self-correcting: a schedule whose
+    earlier steps left more memory resident sees a smaller budget on the
+    next growth step automatically, which is the behavior wanted."""
+    return int(available_ram_bytes() * ram_fraction)
+
+
+def suggest_growth_rate(pop_size: int, aa_seq: str, analysis_objects: AnalysisObjects,
+                        locvec: list = None, ram_fraction: float = DEFAULT_GROWTH_RAM_FRACTION,
+                        bytes_per_individual: int = None) -> int:
+    """Highest replicates-per-individual rate whose offspring still fit in
+    free host RAM, for a population of `pop_size` distinct individuals.
+
+    A growth step creates up to `pop_size * rate` brand-new
+    Proposed_Solution objects before anything culls them -- collisions
+    dedup some away, but a run cannot be sized on the hope that they will.
+    So:
+
+        rate <= (available RAM * ram_fraction) / bytes_per_individual / pop_size
+
+    floored to an int, which is the whole calculation. The floor is the
+    point: this is the "there is headroom for 4.5, so take 4" rounding, and
+    rounding the other way is exactly the OOM being avoided.
+
+    Returns 0 when not even one replicate each fits. That is a real answer,
+    not an error case -- see clamp_growth_rate_to_ram(), which reports it
+    loudly, and the growth steps, which then skip reproduction for that
+    step rather than crashing. It is also self-correcting inside a
+    schedule: the following kill_off/select shrinks the population, and the
+    next growth step finds headroom again.
+
+    bytes_per_individual: measured via estimate_bytes_per_individual() when
+    omitted. That measurement builds and scores one real seed, so a caller
+    in a loop (every growth step of a long schedule) should measure once
+    and pass it in -- schedule.ScheduleContext.bytes_per_individual()
+    caches it for exactly this reason. It is a property of aa_seq and the
+    registered change-vector terms, neither of which moves during a run.
+
+    Not modelled here, and covered by ram_fraction's headroom instead: the
+    transient raw-replicate lists growth builds before merging (lists of
+    codon strings, roughly an order of magnitude smaller per replicate than
+    the scored Proposed_Solution they become) and any device-side memory,
+    which is bounded separately by
+    gpu_change_vector.suggest_chunk_size()."""
+    if pop_size <= 0:
+        return 0
+    if bytes_per_individual is None:
+        bytes_per_individual = estimate_bytes_per_individual(aa_seq, analysis_objects, locvec)
+    bytes_per_individual = max(bytes_per_individual, 1)
+    affordable_new = expansion_ram_budget_bytes(ram_fraction) // bytes_per_individual
+    return max(affordable_new // pop_size, 0)
+
+
+def clamp_growth_rate_to_ram(requested_rate: int, pop_size: int, aa_seq: str,
+                             analysis_objects: AnalysisObjects, locvec: list = None,
+                             ram_fraction: float = DEFAULT_GROWTH_RAM_FRACTION,
+                             bytes_per_individual: int = None,
+                             step_label: str = "growth") -> int:
+    """suggest_growth_rate() applied as a ceiling on `requested_rate`,
+    warning (PopulationRamWarning) whenever it actually binds.
+
+    The warning is the feature, not a side effect. A silently-reduced rate
+    would change what the run searches -- fewer offspring per individual is
+    a different algorithm, not a slower one -- and whoever reads the output
+    needs to know their schedule asked for more population than the machine
+    has, because the durable fix is a smaller select/keep target_size (or a
+    bigger machine), not a rate the library quietly picked for them.
+
+    ram_fraction=None disables the clamp entirely and returns
+    `requested_rate` untouched, for a caller who has measured their own
+    headroom or is deliberately running to the edge.
+
+    step_label names the step in the warning text ("growth",
+    "directed_growth", "run_ga growth"), since a schedule has several and
+    "which one" is the first thing anyone tuning will want to know."""
+    if ram_fraction is None:
+        return requested_rate
+    affordable = suggest_growth_rate(
+        pop_size, aa_seq, analysis_objects, locvec,
+        ram_fraction=ram_fraction, bytes_per_individual=bytes_per_individual,
+    )
+    if affordable >= requested_rate:
+        return requested_rate
+
+    if bytes_per_individual is None:
+        bytes_per_individual = estimate_bytes_per_individual(aa_seq, analysis_objects, locvec)
+    budget = expansion_ram_budget_bytes(ram_fraction)
+    projected = pop_size * requested_rate * max(bytes_per_individual, 1)
+    common = (
+        f"[{step_label}] replicating {pop_size:,} individuals at rate {requested_rate} would "
+        f"allocate ~{_fmt_bytes(projected)} of new solutions, but only ~{_fmt_bytes(budget)} "
+        f"of free host RAM is budgeted for it (ram_fraction={ram_fraction}, "
+        f"~{_fmt_bytes(bytes_per_individual)} per individual)."
+    )
+    if affordable <= 0:
+        warnings.warn(
+            f"{common} Not even one replicate each fits, so this step is being SKIPPED "
+            f"(rate {requested_rate} -> 0). The population is already too large for this "
+            f"machine to grow at all -- lower the preceding select/keep target_size. If the "
+            f"schedule culls after this step, the next growth step will have room again.",
+            PopulationRamWarning, stacklevel=3,
+        )
+    else:
+        warnings.warn(
+            f"{common} Reducing rate {requested_rate} -> {affordable} to stay inside it. "
+            f"The run continues, but it is searching less broadly per generation than the "
+            f"schedule asked for -- the durable fix is a smaller select/keep target_size (or "
+            f"more RAM), not this rate.",
+            PopulationRamWarning, stacklevel=3,
+        )
+    return affordable
+
+
+def warn_if_expansion_exceeds_ram(projected_new: int, aa_seq: str, analysis_objects: AnalysisObjects,
+                                  locvec: list = None,
+                                  ram_fraction: float = DEFAULT_GROWTH_RAM_FRACTION,
+                                  bytes_per_individual: int = None,
+                                  step_label: str = "expansion", remedy: str = "") -> bool:
+    """Warning-only counterpart of clamp_growth_rate_to_ram(), for an
+    expansion step that has no rate to turn down -- flatten_generation()
+    being the one that matters: how far it expands is bounded by the
+    population's accumulated replicate mass, not by any parameter, and
+    recursion_limit does not change that bound (each round conserves the
+    total count; only the final collapse-to-1 changes it). There is nothing
+    to clamp, so this reports the projection and leaves the decision with
+    the caller.
+
+    Returns whether it warned, so a caller can branch on it."""
+    if ram_fraction is None or projected_new <= 0:
+        return False
+    if bytes_per_individual is None:
+        bytes_per_individual = estimate_bytes_per_individual(aa_seq, analysis_objects, locvec)
+    budget = expansion_ram_budget_bytes(ram_fraction)
+    projected_bytes = projected_new * max(bytes_per_individual, 1)
+    if projected_bytes <= budget:
+        return False
+    warnings.warn(
+        f"[{step_label}] could create up to {projected_new:,} new solutions "
+        f"(~{_fmt_bytes(projected_bytes)}), more than the ~{_fmt_bytes(budget)} of free host "
+        f"RAM budgeted for it (ram_fraction={ram_fraction}). This step has no rate to turn "
+        f"down -- how far it expands is set by the population's accumulated replicate mass -- "
+        f"so it is running as asked and may exhaust memory."
+        + (f" {remedy}" if remedy else ""),
+        PopulationRamWarning, stacklevel=3,
+    )
+    return True
 
 
 def codvec_to_str(codvecs: list) -> list:
@@ -1166,6 +1384,8 @@ def run_ga(
     progress: bool = False,
     progress_every: int = None,
     chunk_size: int = None,
+    growth_rate: int = DEFAULT_GROWTH_RATE,
+    ram_fraction: float = DEFAULT_GROWTH_RAM_FRACTION,
 ) -> list:
     """Run the genetic algorithm and return the final population.
 
@@ -1177,7 +1397,11 @@ def run_ga(
         reproduction step. Reproduction can add far more than target_size
         candidates per generation (each individual can spawn up to 10), so
         without this the population grows unboundedly. Defaults to the
-        number of distinct seed genotypes.
+        number of distinct seed genotypes. When it is set *below* the seed
+        count -- the normal case now that callers seed as wide as RAM
+        allows (suggest_population_size()) -- the cut is applied once
+        immediately after seeding as well, so generation 0's growth
+        multiplies the capped population rather than every seed drawn.
     flatten_every: if set, run flatten_generation() every this-many
         generations (before selection) instead of straightforward
         reproduction that generation -- trades replicate-count
@@ -1235,6 +1459,21 @@ def run_ga(
         what it bounds and why. None (default): unchanged, each call still
         batches its whole input in one xp pass. Only relevant when xp is
         set; ignored by the per-individual path.
+    growth_rate: replicates each individual is asked for per generation.
+        Defaults to DEFAULT_GROWTH_RATE (10), which is the value this loop
+        always used -- it just used it implicitly, by not passing
+        `nreplicates` to directed_evolution()/directed_evolution_batch()/
+        replicate_and_mutate_random() at all. Now named, because
+        ram_fraction below needs something to clamp.
+    ram_fraction: fraction of currently-free host RAM one generation's
+        offspring may occupy. Before each generation grows, `growth_rate`
+        is cut to whatever actually fits (clamp_growth_rate_to_ram(), which
+        warns with PopulationRamWarning whenever it binds) -- growth is
+        where a run allocates len(pop) * rate new solutions at once, and at
+        real scale that, not the steady-state population, is what runs a
+        Colab VM out of memory. Re-evaluated every generation rather than
+        once, since both the population size and the free RAM move.
+        None disables the clamp and restores the old unbounded behavior.
     """
     import time as _time
 
@@ -1248,6 +1487,28 @@ def run_ga(
 
     if target_size is None:
         target_size = len(pop)
+    elif len(pop) > target_size:
+        # Enforce the cap BEFORE generation 0's growth, not after it.
+        # Seeding is drawn as wide as RAM allows for a real protein
+        # (suggest_population_size(), which is what the drivers pass to
+        # `seeds`), and generation 0 would otherwise multiply every one of
+        # those seeds by up to 10 replicates before this cap first applies
+        # -- a peak an order of magnitude past the size the caller asked
+        # for, in the one generation where the population is largest and
+        # least selected. Same reasoning as schedule.py's "input" step
+        # `keep` param, which is this step for a schedule.
+        pop = select_survivors(pop, weights, target_size)
+        if progress:
+            print(f"[run_ga] seed population cut to target_size={target_size} before generation 0", flush=True)
+
+    # One measurement for the whole run: it depends on aa_seq and the
+    # registered change-vector terms, neither of which moves mid-run, and
+    # taking it per generation would mean building and scoring a throwaway
+    # seed on every pass. Skipped entirely when the clamp is off.
+    bytes_per_individual = (
+        None if ram_fraction is None
+        else estimate_bytes_per_individual(aa_seq, analysis_objects, locvec)
+    )
 
     for gen in range(num_gens):
         if progress:
@@ -1256,6 +1517,18 @@ def run_ga(
         if flatten_every and gen > 0 and gen % flatten_every == 0:
             if progress:
                 _t0 = _time.perf_counter()
+            # Flatten has no rate to turn down -- it cashes in whatever
+            # replicate mass the population has accumulated, and
+            # flatten_recursion_limit does not change that ceiling (each
+            # round conserves the total count). So this reports and
+            # proceeds, rather than silently reducing something.
+            warn_if_expansion_exceeds_ram(
+                sum(p.number for p in pop), aa_seq, analysis_objects, locvec,
+                ram_fraction=ram_fraction, bytes_per_individual=bytes_per_individual,
+                step_label="run_ga flatten",
+                remedy="Lower target_size so less replicate mass accumulates between flattens, "
+                       "or raise flatten_every so it happens when the population is smaller.",
+            )
             pop = refresh_change_vectors(pop, analysis_objects, locvec, xp=xp, progress_every=progress_every, chunk_size=chunk_size)
             pop = flatten_generation(pop, aa_seq, analysis_objects, locvec, flatten_recursion_limit, xp=xp, chunk_size=chunk_size)
             if progress:
@@ -1271,9 +1544,25 @@ def run_ga(
         # side effect of switching to a dict keyed by codons).
         if progress:
             _t0 = _time.perf_counter()
+
+        # The generation's rate, decided against the RAM that is free right
+        # now and the population size this generation actually starts from
+        # -- both of which move over a run, which is why this is here and
+        # not hoisted out of the loop.
+        rate = clamp_growth_rate_to_ram(
+            growth_rate, len(pop), aa_seq, analysis_objects, locvec,
+            ram_fraction=ram_fraction, bytes_per_individual=bytes_per_individual,
+            step_label="run_ga growth",
+        )
         pop_index = {tuple(p.codons): p for p in pop}
 
-        if xp is not None and lookahead:
+        if rate <= 0:
+            # No headroom for even one replicate each (already warned
+            # about, loudly). Skip reproduction rather than OOM: select
+            # below still runs, shrinks the population, and the next
+            # generation finds room again.
+            pass
+        elif xp is not None and lookahead:
             # Batched growth path -- see directed_evolution_batch()'s
             # docstring and Handoff.md sec 6 for why this exists: lookahead
             # scoring, not anything else in the loop, was the measured
@@ -1295,13 +1584,13 @@ def run_ga(
 
             random_reps = []
             for p in random_individuals:
-                random_reps.extend(replicate_and_mutate_random(p.codons, aa_seq))
+                random_reps.extend(replicate_and_mutate_random(p.codons, aa_seq, nreplicates=rate))
             merge_replicates_batch(pop_index, random_reps, analysis_objects, locvec, xp, progress_every=progress_every, chunk_size=chunk_size)
 
             vecs_out = {}
             batch_reps = directed_evolution_batch(
-                directed_individuals, weights, aa_seq, analysis_objects, locvec, xp=xp, progress_every=progress_every,
-                vecs_out=vecs_out, chunk_size=chunk_size,
+                directed_individuals, weights, aa_seq, analysis_objects, locvec, nreplicates=rate, xp=xp,
+                progress_every=progress_every, vecs_out=vecs_out, chunk_size=chunk_size,
             )
             for p in directed_individuals:
                 for rep in batch_reps[id(p)]:
@@ -1309,10 +1598,11 @@ def run_ga(
         else:
             for i, p in enumerate(pop):
                 if random.random() < 0.5:
-                    reps = replicate_and_mutate_random(p.codons, aa_seq)
+                    reps = replicate_and_mutate_random(p.codons, aa_seq, nreplicates=rate)
                 else:
                     reps = directed_evolution(
-                        p.codons, p.change_vecs, weights, aa_seq, analysis_objects, locvec, lookahead=lookahead,
+                        p.codons, p.change_vecs, weights, aa_seq, analysis_objects, locvec,
+                        nreplicates=rate, lookahead=lookahead,
                     )
                 for rep in reps:
                     merge_replicate(pop_index, rep, analysis_objects, locvec, parent=p)
@@ -1321,7 +1611,7 @@ def run_ga(
 
         pop = list(pop_index.values())
         if progress:
-            print(f"[run_ga]   growth: pop={len(pop)} in {_time.perf_counter() - _t0:.2f}s", flush=True)
+            print(f"[run_ga]   growth: rate={rate} pop={len(pop)} in {_time.perf_counter() - _t0:.2f}s", flush=True)
 
         if refresh_every and gen % refresh_every == 0:
             if progress:

@@ -1,3 +1,5 @@
+import random
+
 import numpy as np
 import pytest
 
@@ -630,6 +632,30 @@ def test_run_ga_population_stays_bounded_across_generations(aa_seq, analysis_obj
     assert len(final_pop) <= target_size
 
 
+def test_run_ga_cuts_the_seed_population_before_the_first_growth(aa_seq, analysis_objects, weights, monkeypatch):
+    """target_size below the seed count must bind BEFORE generation 0's
+    growth, not one growth step later. Callers now seed as wide as RAM
+    allows (suggest_population_size()), so growing every seed once "for
+    free" is an order-of-magnitude peak in the least-selected generation of
+    the run. Asserted on the population growth() actually receives, since
+    the final population would look identical either way."""
+    seen = []
+    real_replicate = ga.replicate_and_mutate_random
+
+    def _spy(sol, aa_seq_, *args, **kwargs):
+        seen.append(sol)
+        return real_replicate(sol, aa_seq_, *args, **kwargs)
+
+    monkeypatch.setattr(ga, "replicate_and_mutate_random", _spy)
+
+    seeds = [ga.generate_seed(aa_seq) for _ in range(30)]
+    ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=1, target_size=5, lookahead=False)
+
+    # Generation 0 grows at most the 5 survivors (fewer -- roughly half take
+    # the directed branch instead), never all 30 seeds.
+    assert len(seen) <= 5
+
+
 def test_run_ga_with_flatten_every_does_not_crash(aa_seq, analysis_objects, weights):
     seeds = [ga.generate_seed(aa_seq) for _ in range(4)]
     final_pop = ga.run_ga(
@@ -1021,3 +1047,215 @@ def test_suggest_population_size_subtracts_already_covered(analysis_objects):
     """"MC" again: with 1 of its 2 total possible sequences already
     covered, only 1 slot should remain regardless of RAM headroom."""
     assert ga.suggest_population_size("MC", analysis_objects, already_covered=1) <= 1
+
+
+# ---------------------------------------------------------------------------
+# RAM-aware growth: sizing one expansion step against free host memory.
+# Every test here pins available_ram_bytes() to a chosen number rather than
+# reading the real machine's, so the arithmetic is exact and the assertions
+# mean the same thing on a laptop, in CI, and on a Colab VM.
+# ---------------------------------------------------------------------------
+
+
+def _pin_ram(monkeypatch, total_bytes):
+    monkeypatch.setattr(ga, "available_ram_bytes", lambda *a, **k: total_bytes)
+
+
+def _budget_for(pop_size, rate, bytes_per_individual, ram_fraction=0.5):
+    """Free-RAM figure that makes exactly `rate` replicates each affordable
+    for `pop_size` individuals -- the inverse of suggest_growth_rate()'s
+    arithmetic, so a test can say what it wants to be true instead of
+    carrying a hand-computed magic constant."""
+    return int(pop_size * rate * bytes_per_individual / ram_fraction)
+
+
+def _spy_growth_rates(monkeypatch):
+    """Record the `nreplicates` every reproduction call actually receives,
+    across BOTH branches. Spying on only the random-mutation branch would
+    make the assertion depend on the coin flip that routes each individual,
+    which is a flake waiting to happen."""
+    seen = []
+    real_random = ga.replicate_and_mutate_random
+    real_directed = ga.directed_evolution
+
+    def _random_spy(sol, aa_seq_, nreplicates=ga.DEFAULT_GROWTH_RATE, **kwargs):
+        seen.append(nreplicates)
+        return real_random(sol, aa_seq_, nreplicates=nreplicates, **kwargs)
+
+    def _directed_spy(*args, nreplicates=ga.DEFAULT_GROWTH_RATE, **kwargs):
+        seen.append(nreplicates)
+        return real_directed(*args, nreplicates=nreplicates, **kwargs)
+
+    monkeypatch.setattr(ga, "replicate_and_mutate_random", _random_spy)
+    monkeypatch.setattr(ga, "directed_evolution", _directed_spy)
+    return seen
+
+
+def test_suggest_growth_rate_floors_a_fractional_allowance(aa_seq, analysis_objects, monkeypatch):
+    """The headline case: room for 4.5 replicates each means a rate of 4,
+    not 5. Rounding the other way is the OOM this exists to prevent."""
+    bpi = 1000
+    _pin_ram(monkeypatch, _budget_for(pop_size=100, rate=4.5, bytes_per_individual=bpi))
+    assert ga.suggest_growth_rate(100, aa_seq, analysis_objects, bytes_per_individual=bpi) == 4
+
+
+def test_suggest_growth_rate_returns_zero_when_one_each_does_not_fit(aa_seq, analysis_objects, monkeypatch):
+    """0 is a real answer, not an error -- the callers below turn it into a
+    skipped growth step, which a following cull then makes affordable
+    again."""
+    bpi = 1000
+    _pin_ram(monkeypatch, _budget_for(pop_size=100, rate=0.5, bytes_per_individual=bpi))
+    assert ga.suggest_growth_rate(100, aa_seq, analysis_objects, bytes_per_individual=bpi) == 0
+
+
+def test_suggest_growth_rate_shrinks_as_the_population_grows(aa_seq, analysis_objects, monkeypatch):
+    """Same machine, bigger population -> smaller affordable rate. That is
+    the whole dynamic: the budget is per-step, not per-individual."""
+    bpi = 1000
+    _pin_ram(monkeypatch, _budget_for(pop_size=100, rate=10, bytes_per_individual=bpi))
+    assert ga.suggest_growth_rate(100, aa_seq, analysis_objects, bytes_per_individual=bpi) == 10
+    assert ga.suggest_growth_rate(1000, aa_seq, analysis_objects, bytes_per_individual=bpi) == 1
+
+
+def test_suggest_growth_rate_handles_an_empty_population(aa_seq, analysis_objects):
+    # Guards the division: pop_size 0 must return 0, not raise.
+    assert ga.suggest_growth_rate(0, aa_seq, analysis_objects, bytes_per_individual=1000) == 0
+
+
+def test_clamp_growth_rate_to_ram_leaves_an_affordable_rate_untouched(aa_seq, analysis_objects, monkeypatch, recwarn):
+    bpi = 1000
+    _pin_ram(monkeypatch, _budget_for(pop_size=100, rate=50, bytes_per_individual=bpi))
+    assert ga.clamp_growth_rate_to_ram(5, 100, aa_seq, analysis_objects, bytes_per_individual=bpi) == 5
+    assert not [w for w in recwarn if issubclass(w.category, ga.PopulationRamWarning)], (
+        "warned about a rate that fits -- the warning must mean something when it appears"
+    )
+
+
+def test_clamp_growth_rate_to_ram_reduces_and_warns(aa_seq, analysis_objects, monkeypatch):
+    """A reduced rate changes what the run searches, so it must never be
+    silent. The message has to carry both rates -- that is what someone
+    tuning a schedule acts on."""
+    bpi = 1000
+    _pin_ram(monkeypatch, _budget_for(pop_size=100, rate=4.5, bytes_per_individual=bpi))
+    with pytest.warns(ga.PopulationRamWarning, match=r"Reducing rate 5 -> 4"):
+        rate = ga.clamp_growth_rate_to_ram(5, 100, aa_seq, analysis_objects, bytes_per_individual=bpi)
+    assert rate == 4
+
+
+def test_clamp_growth_rate_to_ram_names_the_step_in_its_warning(aa_seq, analysis_objects, monkeypatch):
+    """A schedule has several growth steps; "which one overran" is the
+    first thing anyone tuning needs."""
+    bpi = 1000
+    _pin_ram(monkeypatch, _budget_for(pop_size=100, rate=4.5, bytes_per_individual=bpi))
+    with pytest.warns(ga.PopulationRamWarning, match=r"\[directed_growth\]"):
+        ga.clamp_growth_rate_to_ram(5, 100, aa_seq, analysis_objects,
+                                    bytes_per_individual=bpi, step_label="directed_growth")
+
+
+def test_clamp_growth_rate_to_ram_warns_differently_when_nothing_fits(aa_seq, analysis_objects, monkeypatch):
+    """Rate 0 is a categorically different situation from a reduced rate --
+    the step does nothing at all -- so it gets its own message saying so
+    and naming the real fix (a smaller population), not a quieter version
+    of the same one."""
+    bpi = 1000
+    _pin_ram(monkeypatch, _budget_for(pop_size=100, rate=0.5, bytes_per_individual=bpi))
+    with pytest.warns(ga.PopulationRamWarning, match="SKIPPED"):
+        assert ga.clamp_growth_rate_to_ram(5, 100, aa_seq, analysis_objects, bytes_per_individual=bpi) == 0
+
+
+def test_clamp_growth_rate_to_ram_is_disabled_by_ram_fraction_none(aa_seq, analysis_objects, monkeypatch, recwarn):
+    """The opt-out has to be a true no-op, including no measurement: a
+    caller who has sized their own run should not pay for a throwaway seed
+    on every growth step, nor be warned about a budget they opted out of."""
+    _pin_ram(monkeypatch, 1)
+    monkeypatch.setattr(ga, "estimate_bytes_per_individual",
+                        lambda *a, **k: pytest.fail("measured despite ram_fraction=None"))
+    assert ga.clamp_growth_rate_to_ram(5, 10 ** 6, aa_seq, analysis_objects, ram_fraction=None) == 5
+    assert not [w for w in recwarn if issubclass(w.category, ga.PopulationRamWarning)]
+
+
+def test_estimate_bytes_per_individual_leaves_the_random_stream_alone(aa_seq, analysis_objects):
+    """Measuring must not perturb the search. The growth clamp calls this
+    every step, so without the save/restore a seeded run would draw a
+    different sequence depending on whether sizing was consulted -- a
+    reproducibility bug, and (caught this way) enough to break the
+    batched-vs-reference growth equivalence test above."""
+    random.seed(99)
+    expected = [random.random() for _ in range(5)]
+
+    random.seed(99)
+    ga.estimate_bytes_per_individual(aa_seq, analysis_objects)
+    assert [random.random() for _ in range(5)] == expected
+
+
+def test_warn_if_expansion_exceeds_ram_is_silent_when_it_fits(aa_seq, analysis_objects, monkeypatch):
+    _pin_ram(monkeypatch, 100 * 1000 * 2)
+    assert ga.warn_if_expansion_exceeds_ram(50, aa_seq, analysis_objects, bytes_per_individual=1000) is False
+
+
+def test_warn_if_expansion_exceeds_ram_warns_without_clamping(aa_seq, analysis_objects, monkeypatch):
+    """Its whole contract: report, and let the caller proceed. flatten has
+    no rate to turn down, so silently doing less would be a lie about what
+    ran."""
+    _pin_ram(monkeypatch, 100 * 1000 * 2)
+    with pytest.warns(ga.PopulationRamWarning, match="no rate to turn down"):
+        assert ga.warn_if_expansion_exceeds_ram(5000, aa_seq, analysis_objects,
+                                                bytes_per_individual=1000) is True
+
+
+def test_run_ga_reduces_its_growth_rate_under_memory_pressure(aa_seq, analysis_objects, weights, monkeypatch):
+    """End to end in the run_ga path: the rate the reproduction functions
+    actually receive is the clamped one, not the requested one. Asserted on
+    nreplicates rather than on the final population size, since select
+    would mask the difference entirely."""
+    seen = _spy_growth_rates(monkeypatch)
+    monkeypatch.setattr(ga, "estimate_bytes_per_individual", lambda *a, **k: 1000)
+    seeds = [ga.generate_seed(aa_seq) for _ in range(10)]
+    _pin_ram(monkeypatch, _budget_for(pop_size=10, rate=2.5, bytes_per_individual=1000))
+
+    with pytest.warns(ga.PopulationRamWarning, match=r"\[run_ga growth\]"):
+        ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=1, lookahead=False)
+
+    assert seen, "growth never ran"
+    assert set(seen) == {2}, f"expected the clamped rate 2 everywhere, saw {sorted(set(seen))}"
+
+
+def test_run_ga_skips_growth_rather_than_dying_when_nothing_fits(aa_seq, analysis_objects, weights, monkeypatch):
+    """The population must come back intact and the call must return.
+    Degrading to a no-op generation is survivable; an OOM kill halfway
+    through a long Colab run is not."""
+    monkeypatch.setattr(ga, "replicate_and_mutate_random",
+                        lambda *a, **k: pytest.fail("reproduced with no RAM headroom"))
+    monkeypatch.setattr(ga, "directed_evolution",
+                        lambda *a, **k: pytest.fail("reproduced with no RAM headroom"))
+    monkeypatch.setattr(ga, "estimate_bytes_per_individual", lambda *a, **k: 1000)
+    seeds = [ga.generate_seed(aa_seq) for _ in range(10)]
+    _pin_ram(monkeypatch, _budget_for(pop_size=10, rate=0.5, bytes_per_individual=1000))
+
+    with pytest.warns(ga.PopulationRamWarning, match="SKIPPED"):
+        final_pop = ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=1, lookahead=False)
+
+    assert len(final_pop) == 10
+
+
+def test_run_ga_ram_fraction_none_restores_the_unclamped_rate(aa_seq, analysis_objects, weights, monkeypatch):
+    seen = _spy_growth_rates(monkeypatch)
+    monkeypatch.setattr(ga, "estimate_bytes_per_individual",
+                        lambda *a, **k: pytest.fail("measured despite ram_fraction=None"))
+    _pin_ram(monkeypatch, 1)  # would clamp to 0 if the clamp were consulted at all
+    seeds = [ga.generate_seed(aa_seq) for _ in range(6)]
+
+    ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=1, lookahead=False, ram_fraction=None)
+    assert set(seen) == {ga.DEFAULT_GROWTH_RATE}
+
+
+def test_run_ga_growth_rate_is_the_rate_that_gets_clamped(aa_seq, analysis_objects, weights, monkeypatch):
+    """growth_rate exists so the clamp has a named request to reduce; an
+    explicit one below the ceiling must pass through untouched."""
+    seen = _spy_growth_rates(monkeypatch)
+    monkeypatch.setattr(ga, "estimate_bytes_per_individual", lambda *a, **k: 1000)
+    _pin_ram(monkeypatch, _budget_for(pop_size=6, rate=50, bytes_per_individual=1000))
+    seeds = [ga.generate_seed(aa_seq) for _ in range(6)]
+
+    ga.run_ga(aa_seq, seeds, weights, analysis_objects, num_gens=1, lookahead=False, growth_rate=3)
+    assert set(seen) == {3}

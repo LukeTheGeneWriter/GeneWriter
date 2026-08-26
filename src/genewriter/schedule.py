@@ -3,7 +3,7 @@ population through generations, the way an ML training config drives a
 model through epochs.
 
     schedule = [
-        {"kind": "input", "count": 50000},
+        {"kind": "input", "count": 50000, "keep": 5000},
         {"kind": "growth", "rate": 4, "mutation_chance": 0.1},
         {"kind": "kill_off"},
         {"kind": "growth", "rate": 10, "mutation_chance": 0.1},
@@ -14,6 +14,23 @@ model through epochs.
         ]},
     ]
     final_pop = run_schedule(aa_seq, weights, analysis_objects, schedule)
+
+"input"'s `keep` above is the seed-wide-keep-narrow idiom: draw far more
+random seeds than the population should carry (coverage is the whole point
+of seeding, and the auto-sized default draws as many as RAM allows), then
+immediately cut back to a working size the following "growth" step can
+safely multiply. It replaces writing a separate "select" step right after
+"input", and is cheaper than one -- see _step_input()'s docstring.
+
+The steps that GROW the population -- "growth", "directed_growth" -- size
+themselves against the host RAM actually free when they run: a `rate` whose
+offspring would not fit is cut to one that does (5 -> 4 where there is only
+headroom for 4.5) and a ga.PopulationRamWarning says so, naming the step
+and the numbers, because a reduced rate searches less broadly and the
+durable fix is a smaller working population, not a rate the library picked.
+"flatten" grows too but has no rate to cut -- it cashes in accumulated
+replicate mass -- so it warns and runs as asked. See
+ScheduleContext.ram_fraction for the knob and how to turn it off.
 
 Every step is a plain dict (`"kind"` plus whatever params that kind takes) so
 a schedule can be written in a config file, saved alongside a run's results
@@ -76,6 +93,10 @@ from .change_vector import AnalysisObjects
 from .codon_tables import sequence_space_size
 from .gpu_change_vector import suggest_chunk_size
 from .ga import (
+    DEFAULT_GROWTH_RAM_FRACTION,
+    clamp_growth_rate_to_ram,
+    estimate_bytes_per_individual,
+    warn_if_expansion_exceeds_ram,
     directed_evolution,
     directed_evolution_batch,
     flatten_generation,
@@ -169,6 +190,19 @@ class ScheduleContext:
     # behavior.
     progress: bool = False
     progress_every: int = None
+    # Fraction of currently-free host RAM one expansion step may spend
+    # on the individuals it creates. Every "growth"/"directed_growth" step
+    # cuts its `rate` down to whatever actually fits before reproducing
+    # (ga.clamp_growth_rate_to_ram(), warning with ga.PopulationRamWarning
+    # whenever the cut binds), and "flatten" reports when its projected
+    # expansion overruns (it has no rate to cut -- see _step_flatten).
+    # A step's own "ram_fraction" param overrides this for that step;
+    # setting either to None disables the clamp there and restores the
+    # original unbounded behavior.
+    ram_fraction: float = DEFAULT_GROWTH_RAM_FRACTION
+    # Lazily-filled cache behind bytes_per_individual() below -- not a
+    # constructor argument anyone is expected to pass.
+    _bytes_per_individual: int = field(default=None, repr=False)
     # Callable aa_seq -> list[codon_str], used by the "input" step to
     # generate each new seed genotype. None (default) uses ga.generate_seed
     # -- unchanged behavior. Pass e.g.
@@ -176,6 +210,23 @@ class ScheduleContext:
     # to seed from a trained CodonNgramModel instead -- same opt-in pattern
     # as xp above.
     seed_fn: object = None
+
+    def bytes_per_individual(self) -> int:
+        """Measured RAM footprint of one Proposed_Solution for this run's
+        aa_seq (ga.estimate_bytes_per_individual()), measured once and
+        cached.
+
+        Cached rather than recomputed because the measurement builds and
+        scores a throwaway seed, and every growth step of a long schedule
+        needs the number -- but it is a property of aa_seq and the
+        registered change-vector terms, neither of which moves during a
+        run. A schedule with a "repeat" block asking for 5 growth steps
+        would otherwise pay for 5 identical measurements."""
+        if self._bytes_per_individual is None:
+            self._bytes_per_individual = estimate_bytes_per_individual(
+                self.aa_seq, self.analysis_objects, self.locvec
+            )
+        return self._bytes_per_individual
 
 
 @register_step("input")
@@ -210,7 +261,37 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
     schedule's population transiently EXCEEDS its steady-state size later
     on (an explore/exploit alternation inflates mid-cycle -- see
     explore()/default_schedule()). Ignored when `count` is given
-    explicitly, since then the caller has already decided."""
+    explicitly, since then the caller has already decided.
+
+    `keep` (optional) caps how many distinct individuals survive this step,
+    exactly the way a "select" step's `target_size` does (same soft,
+    weighted ga.select_survivors() cut, same absolute-population meaning,
+    same sequence_space_size clamp) -- seed WIDE, then keep only the best
+    of what was drawn. Omitted (default) keeps every distinct seed, the
+    original behavior.
+
+    This exists because seeding and the working population want opposite
+    sizes, which a real Colab run made obvious: for a biological-length
+    protein the auto-sized `count` is enormous (RAM's half, not the
+    protein's tiny finite space -- see suggest_population_size()), which is
+    exactly what you want from random seeding, since coverage of a 10**N
+    space is the one thing seeds are for. It is not what you want handed to
+    the next "growth" step, which multiplies it by `rate` before any
+    "select" runs -- the first uncapped input -> growth window was already
+    flagged as the likely next memory-pressure point when auto-sizing
+    landed (memory/hardware_aware_population_sizing.md), and it is.
+
+    Prefer this over writing a separate {"kind": "select"} step right after
+    "input": that select would call refresh_change_vectors() over the whole
+    freshly-seeded population first (see the module docstring's refresh
+    convention), recomputing exact change vectors that seed_population()
+    just computed -- the single most expensive redundant refresh in a run,
+    since the seed population is the largest the run ever gets. `keep`
+    cuts on the vectors already in hand instead. The one case where the
+    separate select is still the right call: seeding INTO an existing
+    evolved population whose vectors have drifted (several "growth" steps
+    since the last exact checkpoint), since `keep` scores those carried-over
+    individuals on whatever approximate vectors they arrived with."""
     requested = params.get("count")
     if requested is None:
         requested = suggest_population_size(
@@ -229,11 +310,22 @@ def _step_input(pop: list, ctx: ScheduleContext, params: dict) -> list:
             existing.number += new_sol.number
         else:
             pop_index[key] = new_sol
-    return list(pop_index.values())
+    pop = list(pop_index.values())
+
+    keep = params.get("keep")
+    if keep is None:
+        return pop
+    if keep < 1:
+        raise ValueError(
+            f"'input' step's keep must be >= 1 (got {keep!r}) -- keep is a cap on how many "
+            "distinct individuals survive seeding, and 0 would empty the population outright."
+        )
+    return select_survivors(pop, ctx.weights, min(keep, sequence_space_size(ctx.aa_seq)))
 
 
 def _do_growth(
     pop: list, ctx: ScheduleContext, rate: int, mutation_chance: float, directed_fraction: float, lookahead: bool,
+    ram_fraction: float = None, step_label: str = "growth",
 ) -> list:
     """Shared implementation behind the "growth" and "directed_growth" step
     kinds (see both registered functions' docstrings) -- every difference
@@ -249,18 +341,47 @@ def _do_growth(
     and because merge_replicates_batch()/replicate_and_mutate_random()
     have no useful work to do on an empty individual list anyway.
 
-    `rate` is clamped to _remaining_space(ctx.aa_seq, len(pop)) -- no
-    individual can be usefully asked for more replicates than there are
-    distinct codon sequences left uncovered in the whole protein's space,
-    since every replicate beyond that is guaranteed to land on a genotype
-    already in pop (deduped away for free by pop_index, but still a wasted
-    draw/score). Only binds for very short peptides in practice -- see
-    _remaining_space()'s docstring.
+    `rate` is clamped twice, against the two ceilings that are actually
+    real, in increasing order of how often they bind:
+
+      - _remaining_space(ctx.aa_seq, len(pop)) -- no individual can be
+        usefully asked for more replicates than there are distinct codon
+        sequences left uncovered in the whole protein's space, since every
+        replicate beyond that is guaranteed to land on a genotype already
+        in pop (deduped away for free by pop_index, but still a wasted
+        draw/score). Only binds for very short peptides in practice -- see
+        _remaining_space()'s docstring.
+      - ga.clamp_growth_rate_to_ram(..., ram_fraction) -- this step is
+        about to allocate up to len(pop) * rate new Proposed_Solution
+        objects in host memory *before* anything culls them, and at real
+        scale that transient, not the steady-state population, is what
+        kills a Colab VM. A rate the machine cannot hold is cut to one it
+        can (5 -> 4 when there is headroom for 4.5), with a
+        ga.PopulationRamWarning naming the step, the projection, and the
+        durable fix. ram_fraction=None skips this entirely.
+
+    A rate that lands at 0 -- either ceiling -- means there is nothing
+    useful (or nothing affordable) to reproduce, so the step returns the
+    population untouched instead of reproducing at rate 0. It still
+    advances ctx.step_count and checkpoints, so a no-op growth does not
+    silently shift the generation numbering a saved run is indexed by.
     """
     rate = min(rate, _remaining_space(ctx.aa_seq, len(pop)))
+    rate = clamp_growth_rate_to_ram(
+        rate, len(pop), ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
+        ram_fraction=ram_fraction,
+        bytes_per_individual=None if ram_fraction is None else ctx.bytes_per_individual(),
+        step_label=step_label,
+    )
     pop_index = {tuple(p.codons): p for p in pop}
 
-    if ctx.xp is not None and lookahead:
+    if rate <= 0:
+        # Nothing to reproduce: either the sequence space is exhausted or
+        # (far more likely at real scale) RAM has no room for even one
+        # replicate each, which clamp_growth_rate_to_ram() has already
+        # warned about. Fall through to the common tail below.
+        pass
+    elif ctx.xp is not None and lookahead:
         # Batched growth path -- see ga.directed_evolution_batch() and this
         # module's docstring. Classification keeps the same
         # one-random.random()-per-individual-in-pop-order sequence as the
@@ -346,13 +467,21 @@ def _step_growth(pop: list, ctx: ScheduleContext, params: dict) -> list:
     ga.merge_replicate_exact()/ga.merge_replicates_batch()) -- see module
     docstring.
 
+    `ram_fraction` (default: ctx.ram_fraction) is the share of free host
+    RAM this step's offspring may occupy. `rate` is cut to whatever fits
+    before any reproduction happens, warning when it binds -- see
+    _do_growth() and ga.clamp_growth_rate_to_ram(). Pass None to opt this
+    step out.
+
     See "directed_growth" for a step that skips the random-mutation
     branch entirely (100% directed) instead of mixing the two."""
     rate = params.get("rate", 10)
     mutation_chance = params.get("mutation_chance", 0.05)
     directed_fraction = params.get("directed_fraction", 0.5)
     lookahead = params.get("lookahead", True)
-    return _do_growth(pop, ctx, rate, mutation_chance, directed_fraction, lookahead)
+    return _do_growth(pop, ctx, rate, mutation_chance, directed_fraction, lookahead,
+                      ram_fraction=params.get("ram_fraction", ctx.ram_fraction),
+                      step_label="growth")
 
 
 @register_step("directed_growth")
@@ -379,10 +508,16 @@ def _step_directed_growth(pop: list, ctx: ScheduleContext, params: dict) -> list
     branch here to configure. Same xp-batching behavior as "growth" when
     ctx.xp is set and lookahead=True (see ga.directed_evolution_batch()
     and this module's docstring), just with every individual routed
-    through the directed/batched path instead of a random subset."""
+    through the directed/batched path instead of a random subset.
+
+    Takes `ram_fraction` on the same terms as "growth" -- this step is the
+    more likely of the two to need it, since every individual reproduces
+    here rather than a directed_fraction subset."""
     rate = params.get("rate", 10)
     lookahead = params.get("lookahead", True)
-    return _do_growth(pop, ctx, rate, mutation_chance=0.0, directed_fraction=1.0, lookahead=lookahead)
+    return _do_growth(pop, ctx, rate, mutation_chance=0.0, directed_fraction=1.0, lookahead=lookahead,
+                      ram_fraction=params.get("ram_fraction", ctx.ram_fraction),
+                      step_label="directed_growth")
 
 
 @register_step("kill_off")
@@ -529,8 +664,26 @@ def _step_flatten(pop: list, ctx: ScheduleContext, params: dict) -> list:
     batch_calculate_change_vectors() call instead of one
     calculate_change_vector() call each (see ga._flatten_round()'s
     docstring). Refreshes change vectors exactly first -- see module
-    docstring."""
+    docstring.
+
+    This is the other step that expands the population, but unlike
+    "growth" it has no rate to turn down: how far it expands is set by the
+    replicate mass the population has already accumulated (worst case,
+    every one of those copies cashes in for a brand-new genotype), and
+    `recursion_limit` does not move that ceiling -- each round conserves
+    the total count, only the final collapse-to-1 changes it. So
+    `ram_fraction` (default: ctx.ram_fraction) buys a warning here rather
+    than a clamp: the projection is reported and the step runs as asked."""
     recursion_limit = params.get("recursion_limit", 3)
+    ram_fraction = params.get("ram_fraction", ctx.ram_fraction)
+    warn_if_expansion_exceeds_ram(
+        sum(p.number for p in pop), ctx.aa_seq, ctx.analysis_objects, ctx.locvec,
+        ram_fraction=ram_fraction,
+        bytes_per_individual=None if ram_fraction is None else ctx.bytes_per_individual(),
+        step_label="flatten",
+        remedy="Put a kill_off/select step before this one so less replicate mass is "
+               "carried into it, or lower the preceding growth rate.",
+    )
     pop = refresh_change_vectors(pop, ctx.analysis_objects, ctx.locvec, xp=ctx.xp, progress_every=ctx.progress_every, chunk_size=ctx.chunk_size)
     return flatten_generation(pop, ctx.aa_seq, ctx.analysis_objects, ctx.locvec, recursion_limit, xp=ctx.xp, chunk_size=ctx.chunk_size)
 
@@ -590,6 +743,7 @@ def run_schedule(
     progress_every: int = None,
     seed_fn=None,
     chunk_size: int = None,
+    ram_fraction: float = DEFAULT_GROWTH_RAM_FRACTION,
 ) -> list:
     """Run a declarative schedule end to end and return the final population.
 
@@ -618,11 +772,21 @@ def run_schedule(
         so a bigger GPU automatically gets bigger (faster) batches with no
         manual tuning, while still bounding peak memory. Pass an explicit
         chunk_size to override this and get the old fixed-cap behavior.
+    ram_fraction: run-wide default for the share of free HOST RAM any one
+        expansion step may spend on the individuals it creates -- see
+        ScheduleContext.ram_fraction. chunk_size above bounds the GPU side
+        of a step; this bounds the host side, which is where the
+        population itself lives and where a too-high growth `rate` at real
+        scale takes the whole VM down. Every "growth"/"directed_growth"
+        step's rate is cut to what fits (warning when it binds); "flatten"
+        warns rather than clamping, having no rate to cut. An individual
+        step's own "ram_fraction" param overrides this; None disables the
+        whole mechanism and restores the original unbounded behavior.
     """
     if chunk_size is None and xp is not None:
         chunk_size = suggest_chunk_size(xp, len(aa_seq))
     ctx = ScheduleContext(aa_seq=aa_seq, weights=weights, analysis_objects=analysis_objects,
                            locvec=locvec, save_dir=save_dir, run_name=run_name, xp=xp,
                            progress=progress, progress_every=progress_every, seed_fn=seed_fn,
-                           chunk_size=chunk_size)
+                           chunk_size=chunk_size, ram_fraction=ram_fraction)
     return run_steps([], ctx, schedule)
