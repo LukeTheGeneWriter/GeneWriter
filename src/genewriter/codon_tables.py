@@ -60,8 +60,21 @@ TAG_TO_BUCKET = {'F': 'ExonL50', 'T': 'ExonR50', 'I': 'Exon', 'S': 'Splice'}
 TAG_TO_WINDOW_BUCKET = {'F': 'ExonL50', 'T': 'ExonR50', 'I': 'Exon', 'S': 'Exon'}
 
 
+def normalize_codon(codon: str) -> str:
+    """Uppercase DNA-alphabet form of one codon: 'gcu'/'GCU' -> 'GCT'. Every
+    table in this module is keyed by DNA codons, so RNA-alphabet (U) input --
+    e.g. an mRNA sequence pasted in, or a hand-written population file --
+    goes through here first."""
+    return codon.upper().replace('U', 'T')
+
+
+def normalize_codons(codons) -> list:
+    """normalize_codon() over an iterable of codons."""
+    return [normalize_codon(c) for c in codons]
+
+
 def get_aa(codon: str) -> str:
-    return CODON_TO_AA[codon.upper()]
+    return CODON_TO_AA[normalize_codon(codon)]
 
 
 def codon_choices_for_aa(aa: str) -> list:
@@ -211,8 +224,11 @@ def decode_base4_string(code: int, k: int) -> str:
 
 def encode_codons(codons) -> list:
     """Map an iterable of codon strings to their integer indices (see
-    CODON_TO_INDEX). The inverse of decode_codons()."""
-    return [CODON_TO_INDEX[c] for c in codons]
+    CODON_TO_INDEX). The inverse of decode_codons(). Accepts RNA-alphabet
+    or lowercase codons too (see normalize_codon()) -- only codons that miss
+    the direct lookup pay for normalizing, so DNA input stays as fast as a
+    plain dict lookup."""
+    return [CODON_TO_INDEX[c] if c in CODON_TO_INDEX else CODON_TO_INDEX[normalize_codon(c)] for c in codons]
 
 
 def decode_codons(indices) -> list:

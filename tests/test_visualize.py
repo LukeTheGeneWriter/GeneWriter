@@ -418,3 +418,9 @@ def test_animate_population_trajectory_saves_gif(tmp_path, aa_seq, analysis_obje
     assert out_path.stat().st_size > 0
     import matplotlib.pyplot as plt
     plt.close(anim._fig)
+
+
+def test_load_population_json_normalizes_rna_codons(tmp_path):
+    path = tmp_path / "gen0.json"
+    path.write_text(json.dumps([{'codons': ['AUG', 'gcu'], 'number': 1, 'change_vecs': {}}]))
+    assert load_population_json(str(path))[0].codons == ['ATG', 'GCT']

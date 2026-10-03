@@ -16,6 +16,9 @@ from genewriter.codon_tables import (
     VARIABLE_FLAGS_BY_INDEX,
     decode_codons,
     encode_codons,
+    get_aa,
+    normalize_codon,
+    normalize_codons,
     sequence_space_size,
     validate_aa_sequence,
 )
@@ -69,6 +72,18 @@ def test_encode_decode_round_trips():
 def test_encode_gives_indices_matching_codon_to_index():
     sol = ['ATG', 'GCT', 'TGG']
     assert encode_codons(sol) == [CODON_TO_INDEX[c] for c in sol]
+
+
+def test_normalize_codon_maps_rna_and_lowercase_to_dna():
+    assert normalize_codon('GCU') == 'GCT'
+    assert normalize_codon('ugg') == 'TGG'
+    assert normalize_codon('ATG') == 'ATG'
+    assert normalize_codons(['AUG', 'gcu']) == ['ATG', 'GCT']
+
+
+def test_encode_and_get_aa_accept_rna_alphabet():
+    assert encode_codons(['AUG', 'GCU', 'ugg']) == encode_codons(['ATG', 'GCT', 'TGG'])
+    assert get_aa('UUU') == get_aa('TTT')
 
 
 def test_index_tables_agree_with_their_dict_counterparts_for_every_codon():

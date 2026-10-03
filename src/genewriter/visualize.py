@@ -38,7 +38,7 @@ import numpy as np
 
 from .change_vector import calculate_change_vector, registered_terms, distance_from_optimal
 from .classes import Proposed_Solution
-from .codon_tables import encode_codons
+from .codon_tables import encode_codons, normalize_codons
 
 
 def load_population_json(path: str) -> list:
@@ -46,10 +46,12 @@ def load_population_json(path: str) -> list:
     at a previously-saved generation, not just an in-memory `pop` right
     after a live run_ga()/run_schedule() call. entry.get('protected',
     False) rather than entry['protected'] -- a checkpoint saved before
-    Proposed_Solution.protected existed has no such key at all."""
+    Proposed_Solution.protected existed has no such key at all. Codons are
+    normalized to the DNA alphabet (see codon_tables.normalize_codon()), so
+    a population file written with U instead of T loads the same."""
     with open(path) as f:
         data = json.load(f)
-    return [Proposed_Solution(entry['codons'], entry['number'], entry['change_vecs'], entry.get('protected', False)) for entry in data]
+    return [Proposed_Solution(normalize_codons(entry['codons']), entry['number'], entry['change_vecs'], entry.get('protected', False)) for entry in data]
 
 
 _GEN_FILENAME_RE = re.compile(r"gen(\d+)\.json$")
