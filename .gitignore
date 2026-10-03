@@ -7,4 +7,6 @@ venv/
 
 # Raw reference-gene data pulled from the Colab Drive folders -- large,
 # regenerable from NCBI, and not meant to live in git.
-Gene_Obj_Samples/
+# Trailing slash would match a real directory only -- this is also commonly
+# a symlink to a copy on another disk, which git sees as a file, so no slash.
+Gene_Obj_Samples
